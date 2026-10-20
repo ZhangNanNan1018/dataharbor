@@ -1,0 +1,44 @@
+{
+  "name": "dataharbor",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DataHarbor — independent cross-platform database client",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "licenses": "node scripts/generate-notices.mjs",
+    "tauri": "tauri"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@monaco-editor/react": "^4.7.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "antd": "^5.27.4",
+    "lucide-react": "^1.59.0",
+    "monaco-editor": "^0.52.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "recharts": "^3.10.1",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^18.3.24",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.9.2",
+    "vite": "^6.3.6"
+  }
+}

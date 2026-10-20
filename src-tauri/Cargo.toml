@@ -1,0 +1,62 @@
+[package]
+name = "dataharbor"
+version = "0.1.0"
+description = "DataHarbor — independent cross-platform database client"
+authors = ["DataHarbor contributors"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.94"
+
+[lib]
+name = "dataharbor"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+mysql = { version = "28", default-features = false, features = ["default-rust", "rustls-tls-ring"] }
+postgres = "0.19"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+keyring = "4"
+csv = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+ssh2 = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+mongodb = "2.8"
+redis = { version = "0.27", features = ["cluster", "sentinel"] }
+# winauth is target-gated inside tiberius: the SSPI crate is only built on Windows.
+# macOS and Linux still compile; those builds refuse Windows Authentication.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "winauth", "native-tls"] }
+dameng = "0.1"
+# lz4 is lz4_flex (pure Rust). zstd bundles its C sources with cc, the same toolchain Tauri already needs on Windows and macOS.
+parquet = { version = "59.3", default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "zstd", "lz4"] }
+arrow-array = "59.3"
+arrow-schema = "59.3"
+chrono = "0.4"
+ureq = "2"
+calamine = "0.31"
+rust_xlsxwriter = "0.79"
+quick-xml = "0.37"
+printpdf = "0.7"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

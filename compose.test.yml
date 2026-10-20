@@ -1,0 +1,26 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: dataharbor
+      MYSQL_DATABASE: demo
+    ports:
+      - "127.0.0.1:${DATAHARBOR_TEST_MYSQL_PORT:-13306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pdataharbor"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dataharbor
+      POSTGRES_DB: demo
+    ports:
+      - "127.0.0.1:${DATAHARBOR_TEST_POSTGRES_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
