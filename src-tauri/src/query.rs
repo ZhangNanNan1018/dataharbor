@@ -2,10 +2,20 @@ use std::time::Instant;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{ExecuteSqlRequest, ExecuteSqlResponse, QueryOutcome, StatementResult};
+use crate::operations::OperationContext;
 use crate::sqlutil::{is_pageable, paginate_query_sql, split_sql};
 use crate::state::AppState;
 
 pub fn execute_sql(state: &AppState, request: ExecuteSqlRequest) -> AppResult<ExecuteSqlResponse> {
+    execute_sql_with_operation(state, request, &OperationContext::detached())
+}
+
+pub fn execute_sql_with_operation(
+    state: &AppState,
+    request: ExecuteSqlRequest,
+    operation: &OperationContext,
+) -> AppResult<ExecuteSqlResponse> {
+    operation.checkpoint()?;
     let page = request.page.max(1);
     let page_size = request.page_size.clamp(1, 1000);
     let statements = split_sql(&request.sql);
@@ -24,6 +34,18 @@ pub fn execute_sql(state: &AppState, request: ExecuteSqlRequest) -> AppResult<Ex
         if request.only_statement.is_some_and(|only| only != index) {
             continue;
         }
+        operation.checkpoint()?;
+        let total = if request.only_statement.is_some() {
+            1
+        } else {
+            statements.len()
+        };
+        operation.report(
+            "执行 SQL",
+            results.len() as u64,
+            Some(total as u64),
+            "取消会停止当前支持中断的语句及后续语句，已完成的写入不会自动撤销",
+        );
         let started = Instant::now();
         match run_one(
             state,
@@ -32,14 +54,26 @@ pub fn execute_sql(state: &AppState, request: ExecuteSqlRequest) -> AppResult<Ex
             sql,
             page,
             page_size,
+            operation,
         ) {
             Ok(mut result) => {
                 result.index = index;
                 result.sql = sql.clone();
                 result.elapsed_ms = started.elapsed().as_millis() as u64;
                 results.push(result);
+                operation.report(
+                    "执行 SQL",
+                    results.len() as u64,
+                    Some(total as u64),
+                    "当前语句已完成；原始 SQL 可能处于显式事务，影响行数不等于已提交数量",
+                );
+                operation.checkpoint()?;
             }
             Err(err) => {
+                if matches!(err, AppError::Cancelled { .. }) {
+                    return Err(err);
+                }
+                operation.report_failure(err.to_string());
                 results.push(StatementResult {
                     index,
                     sql: sql.clone(),
@@ -75,11 +109,12 @@ fn run_one(
     sql: &str,
     page: u32,
     page_size: u32,
+    operation: &OperationContext,
 ) -> AppResult<StatementResult> {
     let offset = (page - 1)
         .checked_mul(page_size)
         .ok_or_else(|| AppError::msg("分页位置超出范围"))?;
-    let paged = state.with_session(connection_id, |session| {
+    let paged = state.with_session_operation(connection_id, database, operation, |session| {
         Ok(paginate_query_sql(
             session.engine(),
             sql,
@@ -88,7 +123,7 @@ fn run_one(
         ))
     })?;
     if let Some(paged) = paged {
-        match state.with_session(connection_id, |session| {
+        match state.with_session_operation(connection_id, database, operation, |session| {
             session.execute(database, &paged, Some(page_size as usize + 1))
         }) {
             Ok(mut outcome) => {
@@ -111,7 +146,7 @@ fn run_one(
     if page > 1 {
         return Err(AppError::msg("这条语句按原文执行，不支持自动分页"));
     }
-    let outcome = state.with_session(connection_id, |session| {
+    let outcome = state.with_session_operation(connection_id, database, operation, |session| {
         session.execute(database, sql, Some(5_000))
     })?;
     Ok(from_outcome(outcome, page, page_size, false, None))

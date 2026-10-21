@@ -2,7 +2,9 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { App, Alert, Button, Pagination, Select, Space, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useRef, useState } from "react";
-import { api, errorText, pickSaveCsv, type PlanNode } from "../api";
+import { api, errorText, isOperationCancelled, pickSaveCsv, type PlanNode } from "../api";
+import { useLongOperation } from "../operations";
+import { TaskProgress } from "./TaskProgress";
 import { engineLabel } from "../engines";
 import { displayCell, isNumericType } from "../format";
 import { applyEditorTheme, editorFont } from "../monacoTheme";
@@ -29,6 +31,7 @@ interface QueryResult extends ExecuteSqlResponse {
 
 export function QueryPanel({ tab }: { tab: QueryTab }) {
   const { message } = App.useApp();
+  const task = useLongOperation(tab.id);
   const theme = useUiStore((state) => state.theme);
   const setStatus = useUiStore((state) => state.setStatus);
   const profiles = useConnectionStore((state) => state.profiles);
@@ -156,16 +159,16 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   async function execute(context: QueryContext, token: number, page: number, size: number, onlyStatement: number | null) {
     await ensure(context.connectionId);
     if (!isCurrent(token, context)) return null;
-    return api.executeSql({
+    return task.execute(`执行查询 · ${context.database || "默认数据库"}`, (operationId) => api.executeSql({
       ...context,
       page,
       pageSize: size,
       onlyStatement,
-    });
+    }, operationId));
   }
 
   async function run(mode: "all" | "selection") {
-    if (runningRef.current !== null) return;
+    if (runningRef.current !== null || task.active || exportRef.current) return;
     if (!tab.connectionId) {
       message.warning("先选择一个连接");
       return;
@@ -197,7 +200,10 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       setStatus(first?.ok ? first.message : first?.error || "执行结束");
       if (response.stopped) message.error(first?.error || "语句执行失败，后续语句已停止");
     } catch (err) {
-      if (isCurrent(token, context)) message.error(errorText(err));
+      if (isCurrent(token, context)) {
+        setStatus(errorText(err));
+        if (!isOperationCancelled(err)) message.error(errorText(err));
+      }
     } finally {
       if (runningRef.current === token) { runningRef.current = null; setRunning(false); }
     }
@@ -207,7 +213,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function changePage(page: number, size: number) {
     const current = result?.statements[active];
-    if (!current || !result || runningRef.current !== null) return;
+    if (!current || !result || runningRef.current !== null || task.active) return;
     if (!current.pageable) {
       message.info("这条语句不能分页");
       return;
@@ -231,7 +237,10 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       });
       setStatus(updated.ok ? updated.message : updated.error || "分页失败");
     } catch (err) {
-      if (isCurrent(token, context)) message.error(errorText(err));
+      if (isCurrent(token, context)) {
+        setStatus(errorText(err));
+        if (!isOperationCancelled(err)) message.error(errorText(err));
+      }
     } finally {
       if (runningRef.current === token) { runningRef.current = null; setRunning(false); }
     }
@@ -239,7 +248,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function exportCsv() {
     const current = result?.statements[active];
-    if (exportRef.current) return;
+    if (exportRef.current || task.active || runningRef.current !== null) return;
     if (!result || !current?.ok || current.columns.length === 0) {
       message.warning("没有可导出的结果");
       return;
@@ -255,18 +264,19 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         message.warning("查询上下文已改变，请重新运行后导出");
         return;
       }
-      const exported = await api.exportSqlCsv({
+      const exported = await task.execute("导出查询结果", (operationId) => api.exportSqlCsv({
         connectionId: context.connectionId,
         database: context.database,
         sql: current.sql,
         path,
-      });
+      }, operationId));
       const text = `已导出 ${exported.rowCount} 行${exported.truncated ? "，结果已截断，仅包含部分数据" : ""}`;
       if (exported.truncated) message.warning(text);
       else message.success(text);
       setStatus(`CSV 已写入 ${exported.path}`);
     } catch (err) {
-      message.error(errorText(err));
+      setStatus(errorText(err));
+      if (!isOperationCancelled(err)) message.error(errorText(err));
     } finally {
       exportRef.current = false;
       setExporting(false);
@@ -381,13 +391,13 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
           }))}
           onChange={(database: string) => { invalidateResults(); patchQuery(tab.id, { database }); }}
         />
-        <Button type="primary" loading={running} onClick={() => void run("all")}>
+        <Button type="primary" disabled={task.active || exporting} loading={running} onClick={() => void run("all")}>
           运行
         </Button>
-        <Button loading={running} onClick={() => void run("selection")}>
+        <Button disabled={task.active || exporting} loading={running} onClick={() => void run("selection")}>
           运行选中
         </Button>
-        <Button loading={exporting} onClick={() => void exportCsv()}>
+        <Button disabled={task.active || running} loading={exporting} onClick={() => void exportCsv()}>
           导出 CSV
         </Button>
         <Button
@@ -432,6 +442,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         </Button>
         <span className="text-xs text-[var(--xb-muted)]">Ctrl+Enter 运行全部。草稿和历史以 SQL 原文保存在本机。</span>
       </div>
+      <TaskProgress task={task} />
       <div className="xb-editor">
         <Editor
           path={`inmemory://queries/${encodeURIComponent(tab.id)}.sql`}

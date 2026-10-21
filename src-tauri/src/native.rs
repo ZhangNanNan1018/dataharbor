@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{AppError, AppResult};
+use crate::operations::OperationContext;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativePlan {
@@ -264,7 +265,15 @@ pub fn write_secret(path: &Path, body: &str) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn run_plan(plan: &NativePlan) -> AppResult<String> {
+    run_plan_with_operation(plan, &OperationContext::detached())
+}
+
+pub fn run_plan_with_operation(
+    plan: &NativePlan,
+    operation: &OperationContext,
+) -> AppResult<String> {
     struct SecretCleanup<'a>(Option<&'a str>);
     impl Drop for SecretCleanup<'_> {
         fn drop(&mut self) {
@@ -274,46 +283,163 @@ pub fn run_plan(plan: &NativePlan) -> AppResult<String> {
         }
     }
     let _cleanup = SecretCleanup(plan.secret_file.as_deref());
+    operation.checkpoint()?;
     let program = tool_path(&plan.program)
         .ok_or_else(|| AppError::msg(format!("没有找到 {}", plan.program)))?;
     if plan.program == "psql" {
-        let help = Command::new(&program)
-            .arg("--help=commands")
+        let mut help_output = PrivateCapture::new()?;
+        let mut help = Command::new(&program);
+        help.arg("--help=commands")
             .stdin(Stdio::null())
-            .output()
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        if !help.status.success() || !String::from_utf8_lossy(&help.stdout).contains("\\restrict") {
+            .stdout(Stdio::from(
+                help_output.file().try_clone().map_err(io_error)?,
+            ));
+        run_process(&mut help, "psql 能力检测", operation)?;
+        let text = help_output.read_bounded(256 * 1024)?;
+        if !text.contains("\\restrict") {
             return Err(AppError::msg("本机 psql 不支持 restricted 安全模式，已拒绝执行外部脚本；请更新 PostgreSQL 客户端补丁版本"));
         }
     }
     let mut command = Command::new(program);
-    command.args(&plan.args);
-    command.stdout(Stdio::null());
+    command.args(&plan.args).stdout(Stdio::null());
     if let Some(path) = &plan.stdin_file {
-        command.stdin(Stdio::from(
-            fs::File::open(path).map_err(|err| AppError::msg(err.to_string()))?,
-        ));
+        command.stdin(Stdio::from(fs::File::open(path).map_err(io_error)?));
     } else {
         command.stdin(Stdio::null());
     }
     for (key, value) in &plan.env {
         command.env(key, value);
     }
-    let output = command
-        .output()
-        .map_err(|err| AppError::msg(err.to_string()))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        let text = err.trim();
-        let text: String = text.chars().take(400).collect();
-        return Err(AppError::msg(format!("{} 失败：{text}", plan.program)));
-    }
+    operation.report(
+        "执行原生工具",
+        0,
+        None,
+        "取消将停止当前工具进程；还原可能已有数据库副作用，停止后需核对目标数据",
+    );
+    run_process(&mut command, &plan.program, operation)?;
+    operation.checkpoint()?;
     Ok(plan.note.clone())
+}
+
+fn io_error(error: std::io::Error) -> AppError {
+    AppError::msg(error.to_string())
+}
+
+/// Regular files avoid waiting forever for a descendant which inherited a pipe.
+/// Only a bounded error prefix is read back into memory.
+struct PrivateCapture {
+    path: PathBuf,
+    file: Option<fs::File>,
+}
+impl PrivateCapture {
+    fn new() -> AppResult<Self> {
+        let path =
+            std::env::temp_dir().join(format!("dataharbor-native-{}.log", uuid::Uuid::new_v4()));
+        let file = private_output(&path)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+        })
+    }
+    fn file(&self) -> &fs::File {
+        self.file.as_ref().expect("capture file is open")
+    }
+    fn read_bounded(&mut self, limit: u64) -> AppResult<String> {
+        let file = self.file.as_mut().expect("capture file is open");
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes).map_err(io_error)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+impl Drop for PrivateCapture {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+fn private_output(path: &Path) -> AppResult<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(io_error)
+}
+
+fn run_process(command: &mut Command, label: &str, operation: &OperationContext) -> AppResult<()> {
+    operation.checkpoint()?;
+    let mut errors = PrivateCapture::new()?;
+    command.stderr(Stdio::from(errors.file().try_clone().map_err(io_error)?));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let spawned = command.spawn();
+    // Release the parent's redirection handle immediately (important for
+    // deleting the capture file on Windows after the child has been reaped).
+    command.stderr(Stdio::null());
+    let child = std::sync::Arc::new(std::sync::Mutex::new(spawned.map_err(io_error)?));
+    struct Reap(std::sync::Arc<std::sync::Mutex<std::process::Child>>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let mut child = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+    let _reap = Reap(child.clone());
+    let signal_child = child.clone();
+    let interrupt = operation.bind_interrupt(Some(std::sync::Arc::new(move || {
+        let mut child = signal_child.lock().unwrap_or_else(|p| p.into_inner());
+        if child.try_wait().map_err(io_error)?.is_none() {
+            child.kill().map_err(io_error)?;
+        }
+        Ok(())
+    })))?;
+    let status = loop {
+        operation.checkpoint()?;
+        if let Some(status) = child
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .try_wait()
+            .map_err(io_error)?
+        {
+            break status;
+        }
+        if errors.file().metadata().map_err(io_error)?.len() > 8 * 1024 * 1024 {
+            return Err(AppError::msg(format!("{label} 错误输出过多，已停止进程")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    drop(interrupt);
+    operation.checkpoint()?;
+    if !status.success() {
+        let text = errors.read_bounded(4096)?;
+        let text = text.trim().chars().take(400).collect::<String>();
+        return Err(AppError::msg(format!("{label} 失败：{text}")));
+    }
+    Ok(())
 }
 
 /// Remove only a canonical, paired pg_dump restriction envelope. The process
 /// installs its own unpredictable restriction key before interpreting this copy.
+#[cfg(test)]
 pub fn prepare_pg_script(source: &Path, destination: &Path) -> AppResult<()> {
+    prepare_pg_script_with_operation(source, destination, &OperationContext::detached())
+}
+
+pub fn prepare_pg_script_with_operation(
+    source: &Path,
+    destination: &Path,
+    operation: &OperationContext,
+) -> AppResult<()> {
+    operation.checkpoint()?;
     let mut input = fs::File::open(source).map_err(|err| AppError::msg(err.to_string()))?;
     let length = input
         .metadata()
@@ -352,22 +478,28 @@ pub fn prepare_pg_script(source: &Path, destination: &Path) -> AppResult<()> {
     if copy_end < skip_end {
         return Err(AppError::msg("PostgreSQL 脚本的安全包装无效"));
     }
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|err| AppError::msg(err.to_string()))?;
-    let result = (|| -> std::io::Result<()> {
-        input.seek(SeekFrom::Start(0))?;
-        std::io::copy(&mut (&mut input).take(skip_start), &mut output)?;
-        input.seek(SeekFrom::Start(skip_end))?;
-        std::io::copy(&mut (&mut input).take(copy_end - skip_end), &mut output)?;
-        output.flush()
+    let mut output = private_output(destination)?;
+    let result = (|| -> AppResult<()> {
+        input.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        copy_with_operation(
+            &mut (&mut input).take(skip_start),
+            &mut output,
+            operation,
+            None,
+        )?;
+        input.seek(SeekFrom::Start(skip_end)).map_err(io_error)?;
+        copy_with_operation(
+            &mut (&mut input).take(copy_end - skip_end),
+            &mut output,
+            operation,
+            None,
+        )?;
+        output.flush().map_err(io_error)
     })();
     drop(output);
     if let Err(err) = result {
         let _ = fs::remove_file(destination);
-        return Err(AppError::msg(err.to_string()));
+        return Err(err);
     }
     Ok(())
 }
@@ -389,61 +521,94 @@ fn pg_restrict_header(header: &[u8]) -> Option<(usize, usize, String)> {
     None
 }
 
-pub fn convert_dump_to_sql(source: &Path, destination: &Path) -> AppResult<String> {
-    let mut bytes = vec![0; 256];
-    let length = fs::File::open(source)
-        .and_then(|mut file| file.read(&mut bytes))
-        .map_err(|err| AppError::msg(err.to_string()))?;
-    bytes.truncate(length);
-    if bytes.starts_with(b"PGDMP") {
-        if tool_path("pg_restore").is_none() {
-            return Err(AppError::msg(
-                "这是 PostgreSQL 自定义格式备份，需要本机 pg_restore 才能转成 SQL。",
-            ));
+fn copy_with_operation(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    operation: &OperationContext,
+    total: Option<u64>,
+) -> AppResult<u64> {
+    let mut copied = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        operation.checkpoint()?;
+        let size = reader.read(&mut buffer).map_err(io_error)?;
+        if size == 0 {
+            break;
         }
-        let status = Command::new("pg_restore")
-            .args([
-                "-f",
-                &destination.display().to_string(),
-                &source.display().to_string(),
-            ])
-            .status()
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        if !status.success() {
-            return Err(AppError::msg("pg_restore 没有写出 SQL"));
-        }
-        return Ok("已用 pg_restore 转成 SQL".into());
+        writer.write_all(&buffer[..size]).map_err(io_error)?;
+        copied += size as u64;
+        operation.report("复制脚本（字节）", copied, total, "尚未替换目标文件");
     }
-    if bytes.starts_with(b"SQLite format 3") {
-        if tool_path("sqlite3").is_none() {
-            return Err(AppError::msg(
-                "这是 SQLite 文件。没有 sqlite3 命令时，请在应用里直接打开该文件。",
-            ));
+    operation.checkpoint()?;
+    Ok(copied)
+}
+
+pub fn convert_dump_to_sql_with_operation(
+    source: &Path,
+    destination: &Path,
+    operation: &OperationContext,
+) -> AppResult<String> {
+    operation.checkpoint()?;
+    let mut input = fs::File::open(source).map_err(io_error)?;
+    let length = input.metadata().map_err(io_error)?.len();
+    let mut bytes = [0; 256];
+    let read = input.read(&mut bytes).map_err(io_error)?;
+    let bytes = &bytes[..read];
+    let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
         }
-        let output = Command::new("sqlite3")
+    }
+    let _cleanup = Cleanup(temporary.clone());
+    let message = if bytes.starts_with(b"PGDMP") {
+        let plan = NativePlan {
+            program: "pg_restore".into(),
+            args: vec![
+                "-f".into(),
+                temporary.display().to_string(),
+                source.display().to_string(),
+            ],
+            env: vec![],
+            secret_file: None,
+            stdin_file: None,
+            note: "已用 pg_restore 转成 SQL".into(),
+        };
+        run_plan_with_operation(&plan, operation)?
+    } else if bytes.starts_with(b"SQLite format 3") {
+        let tool = tool_path("sqlite3").ok_or_else(|| {
+            AppError::msg("这是 SQLite 文件。没有 sqlite3 命令时，请在应用里直接打开该文件。")
+        })?;
+        let output = private_output(&temporary)?;
+        let mut command = Command::new(tool);
+        command
             .arg(source)
             .arg(".dump")
-            .output()
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        if !output.status.success() {
-            return Err(AppError::msg("sqlite3 .dump 失败"));
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output));
+        operation.report("转换 SQLite 备份", 0, None, "取消后不会替换原目标文件");
+        run_process(&mut command, "sqlite3 .dump", operation)?;
+        "已用 sqlite3 .dump 转成 SQL".into()
+    } else {
+        let head = String::from_utf8_lossy(bytes);
+        let head = head.trim_start();
+        if !["--", "CREATE", "INSERT", "/*"]
+            .iter()
+            .any(|prefix| head.starts_with(prefix))
+        {
+            return Err(AppError::msg("无法识别的备份。mongodump 归档请改用 JSON 导出；SQL Server 原生备份需在数据库服务器恢复。"));
         }
-        fs::write(destination, &output.stdout).map_err(|err| AppError::msg(err.to_string()))?;
-        return Ok("已用 sqlite3 .dump 转成 SQL".into());
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let head = text.trim_start();
-    if head.starts_with("--")
-        || head.starts_with("CREATE")
-        || head.starts_with("INSERT")
-        || head.starts_with("/*")
-    {
-        fs::copy(source, destination).map_err(|err| AppError::msg(err.to_string()))?;
-        return Ok("源文件已经是 SQL，已原样复制".into());
-    }
-    Err(AppError::msg(
-        "无法识别的备份。mongodump 归档请改用 JSON 导出，或安装 bsondump 后再转换。SQL Server 的原生备份留在服务器磁盘上，不能在客户端直接展开。",
-    ))
+        let mut output = private_output(&temporary)?;
+        input.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        copy_with_operation(&mut input, &mut output, operation, Some(length))?;
+        output.flush().map_err(io_error)?;
+        "源文件已经是 SQL，已原样复制".into()
+    };
+    drop(input);
+    operation.checkpoint()?;
+    fs::rename(&temporary, destination).map_err(io_error)?;
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -622,6 +787,122 @@ mod tests {
         .unwrap();
         assert!(prepare_pg_script(&source, &destination).is_err());
         assert!(!destination.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_child_fixture() {
+        let Ok(marker) = std::env::var("DATAHARBOR_NATIVE_CHILD_MARKER") else {
+            return;
+        };
+        let mut ticks = 0u64;
+        loop {
+            fs::write(&marker, ticks.to_string()).unwrap();
+            eprintln!("controlled fixture heartbeat {ticks}");
+            ticks += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn precancelled_native_plan_never_spawns_and_cleans_secret() {
+        let directory =
+            std::env::temp_dir().join(format!("dataharbor-native-cancel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("started");
+        let secret = directory.join("secret");
+        write_secret(&secret, "dummy").unwrap();
+        let plan = NativePlan {
+            program: std::env::current_exe().unwrap().display().to_string(),
+            args: vec![
+                "--exact".into(),
+                "native::tests::native_child_fixture".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![(
+                "DATAHARBOR_NATIVE_CHILD_MARKER".into(),
+                marker.display().to_string(),
+            )],
+            secret_file: Some(secret.display().to_string()),
+            stdin_file: None,
+            note: "fixture".into(),
+        };
+        let operation = OperationContext::detached();
+        operation.request_cancel().unwrap();
+        assert!(matches!(
+            run_plan_with_operation(&plan, &operation),
+            Err(AppError::Cancelled { .. })
+        ));
+        assert!(!marker.exists());
+        assert!(!secret.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn running_native_child_is_killed_reaped_and_cannot_keep_writing() {
+        let directory =
+            std::env::temp_dir().join(format!("dataharbor-native-child-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("heartbeat");
+        let plan = NativePlan {
+            program: std::env::current_exe().unwrap().display().to_string(),
+            args: vec![
+                "--exact".into(),
+                "native::tests::native_child_fixture".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![(
+                "DATAHARBOR_NATIVE_CHILD_MARKER".into(),
+                marker.display().to_string(),
+            )],
+            secret_file: None,
+            stdin_file: None,
+            note: "fixture".into(),
+        };
+        let operation = OperationContext::detached();
+        let worker_operation = operation.clone();
+        let worker = std::thread::spawn(move || run_plan_with_operation(&plan, &worker_operation));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() || !operation.snapshot().interruptible {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native fixture did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        operation.request_cancel().unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(AppError::Cancelled { .. })
+        ));
+        let after = fs::read(&marker).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(fs::read(&marker).unwrap(), after);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancelled_conversion_keeps_original_destination() {
+        let directory = std::env::temp_dir().join(format!(
+            "dataharbor-convert-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.sql");
+        let destination = directory.join("target.sql");
+        fs::write(&source, "-- fixture\nSELECT 1;").unwrap();
+        fs::write(&destination, "previous artifact").unwrap();
+        let operation = OperationContext::detached();
+        operation.request_cancel().unwrap();
+        assert!(matches!(
+            convert_dump_to_sql_with_operation(&source, &destination, &operation),
+            Err(AppError::Cancelled { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "previous artifact"
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 }

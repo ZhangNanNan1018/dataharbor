@@ -1,6 +1,8 @@
 import { Alert, Button, Select, Space } from "antd";
 import { useState } from "react";
 import { api, pickOpenPath, pickSavePath, type FileExportResult } from "../../api";
+import { useLongOperation } from "../../operations";
+import { TaskProgress } from "../TaskProgress";
 import { ConnFields, objectLabel, useDestructiveConfirm, useOperation, useProfiles } from "./shared";
 
 interface Feedback {
@@ -27,6 +29,7 @@ export function ImportExport() {
   const [format, setFormat] = useState("json");
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const { busy, run } = useOperation();
+  const task = useLongOperation();
   const ready = !!ref.id && !!ref.table;
 
   async function transfer(exporting: boolean) {
@@ -35,8 +38,8 @@ export function ImportExport() {
       if (!path) return;
       setFeedback(null);
       const request = { connectionId: ref.id, database: ref.database, schema: ref.schema, table: ref.table, format, path };
-      if (exporting) setFeedback(exportFeedback(await api.exportTableFile(request)));
-      else setFeedback({ type: "success", text: `已导入 ${await api.importTableFile(request)} 行` });
+      if (exporting) setFeedback(exportFeedback(await task.execute("导出文件", (operationId) => api.exportTableFile(request, operationId))));
+      else setFeedback({ type: "success", text: `已导入 ${await task.execute("导入文件", (operationId) => api.importTableFile(request, operationId))} 行` });
     });
   }
 
@@ -49,6 +52,7 @@ export function ImportExport() {
         <Button disabled={!!busy || !ready} loading={busy === "export"} onClick={() => void transfer(true)}>导出</Button>
         <Button disabled={!!busy || !ready} loading={busy === "import"} onClick={() => void transfer(false)}>导入</Button>
       </Space>
+      <TaskProgress task={task} />
       {feedback && <Alert type={feedback.type} showIcon message={feedback.text} description={feedback.note} />}
     </div>
   );
@@ -60,6 +64,7 @@ export function Backup() {
   const [schema, setSchema] = useState("");
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const { busy, run } = useOperation();
+  const task = useLongOperation();
   const profiles = useProfiles();
   const confirm = useDestructiveConfirm();
 
@@ -69,7 +74,7 @@ export function Backup() {
       const path = await pickSavePath("backup.sql");
       if (!path) return;
       setFeedback(null);
-      setFeedback(exportFeedback(await api.backupSql({ connectionId: id, database, schema, path })));
+      setFeedback(exportFeedback(await task.execute("数据库备份", (operationId) => api.backupSql({ connectionId: id, database, schema, path }, operationId))));
     });
   }
 
@@ -81,7 +86,7 @@ export function Backup() {
       const target = objectLabel({ id, database, schema, table: "" }, profiles);
       if (!await confirm("确认还原 / 执行 SQL", `目标：${target}\n文件：${path}\n将执行文件中的语句或还原命令，可能覆盖现有结构和数据。`)) return;
       setFeedback(null);
-      setFeedback({ type: "success", text: await api.restoreSql({ connectionId: id, database, path }) });
+      setFeedback({ type: "success", text: await task.execute("恢复数据库", (operationId) => api.restoreSql({ connectionId: id, database, path }, operationId)) });
     });
   }
 
@@ -92,7 +97,7 @@ export function Backup() {
       const destination = await pickSavePath("converted.sql");
       if (!destination) return;
       setFeedback(null);
-      setFeedback({ type: "success", text: await api.convertBackup(source, destination) });
+      setFeedback({ type: "success", text: await task.execute("转换备份", (operationId) => api.convertBackup(source, destination, operationId)) });
     });
   }
 
@@ -110,6 +115,7 @@ export function Backup() {
         <Button disabled={!!busy || !id} loading={busy === "restore"} onClick={() => void restore()}>还原 / 执行 SQL</Button>
         <Button disabled={!!busy} loading={busy === "convert"} onClick={() => void convert()}>备份转 SQL</Button>
       </Space>
+      <TaskProgress task={task} />
       {feedback && <Alert type={feedback.type} showIcon message={feedback.text} description={feedback.note} />}
     </div>
   );

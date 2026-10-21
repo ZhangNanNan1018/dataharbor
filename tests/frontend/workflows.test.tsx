@@ -5,7 +5,9 @@ import { DataGridPanel } from "../../src/components/DataGridPanel";
 import { QueryPanel } from "../../src/components/QueryPanel";
 import { Workspace } from "../../src/components/Workspace";
 import { AiAssistant } from "../../src/components/studio/AiAssistant";
+import { DataSync } from "../../src/components/studio/Synchronization";
 import { api, pickSaveCsv } from "../../src/api";
+import { useOperationStore } from "../../src/operations";
 import { useTabStore } from "../../src/stores/useTabStore";
 import { useConnectionStore } from "../../src/stores/useConnectionStore";
 import type { ColumnMeta, ConnectionPublic, DataPage, DataTab, QueryTab, StatementResult } from "../../src/types";
@@ -16,6 +18,8 @@ vi.mock("../../src/api", async (importOriginal) => {
     fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn(),
     listDatabases: vi.fn(), executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
     aiSettings: vi.fn(), saveAiSettings: vi.fn(),
+    createOperation: vi.fn(), operationStatus: vi.fn(), cancelOperation: vi.fn(), releaseOperation: vi.fn(),
+    syncRows: vi.fn(), transferRows: vi.fn(),
   }, pickSaveCsv: vi.fn() };
 });
 // These adapters isolate the panel workflows from Monaco/WebView and specialist cell editors.
@@ -74,6 +78,12 @@ beforeEach(() => {
   localStorage.clear();
   useTabStore.setState({ tabs: [], activeId: null, dirty: {}, draftSaveError: null });
   useConnectionStore.setState({ profiles: [profile] });
+  useOperationStore.setState({ active: [] });
+  const operation = (id: string, status: "queued" | "running" | "succeeded" = "succeeded") => ({ id, label: "测试操作", status, phase: "读取数据", completed: 0, total: null, committed: 0, batches: 0, cancelRequested: false, message: "", interruptible: false });
+  vi.mocked(api.createOperation).mockImplementation(async () => operation(crypto.randomUUID(), "queued"));
+  vi.mocked(api.operationStatus).mockImplementation(async (id) => operation(id));
+  vi.mocked(api.cancelOperation).mockImplementation(async (id) => ({ ...operation(id), cancelRequested: true }));
+  vi.mocked(api.releaseOperation).mockResolvedValue(undefined);
   vi.mocked(api.fetchRows).mockImplementation(async (input) => page(input.table));
   vi.mocked(api.foreignKeys).mockResolvedValue([]);
   vi.mocked(api.commitChanges).mockResolvedValue({ applied: 1 });
@@ -169,7 +179,7 @@ describe("网格写入边界", () => {
     expect(api.fetchRows).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: "name" })).toHaveTextContent(/^name$/);
     fireEvent.click(screen.getByRole("button", { name: "导出 CSV" }));
-    await waitFor(() => expect(api.exportTableCsv).toHaveBeenCalledWith(expect.objectContaining({ sorts: [], filters: [] })));
+    await waitFor(() => expect(api.exportTableCsv).toHaveBeenCalledWith(expect.objectContaining({ sorts: [], filters: [] }), expect.any(String)));
   });
 });
 
@@ -311,4 +321,55 @@ it("文档库部分提交失败后保留草稿但禁止整批重放", async () =
   expect(screen.getByLabelText("name")).toHaveValue("edited");
   fireEvent.keyDown(window, { key: "s", ctrlKey: true });
   expect(api.commitChanges).toHaveBeenCalledTimes(1);
+});
+
+
+it("关闭运行中的查询标签会确认取消，并等后台返回后再移除标签", async () => {
+  vi.mocked(api.operationStatus).mockImplementation(async (id) => ({ id, label: "查询", status: "running", phase: "读取", completed: 0, total: null, committed: 0, batches: 0, cancelRequested: false, message: "", interruptible: false }));
+  const pending = deferred<{ statements: StatementResult[]; stopped: boolean }>();
+  vi.mocked(api.executeSql).mockReturnValueOnce(pending.promise);
+  openQuery();
+  mount(<Workspace />);
+  fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+  await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByLabelText("remove"));
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveTextContent("取消运行中的任务并关闭标签？");
+  fireEvent.click(within(dialog).getByRole("button", { name: "取消任务并等待关闭" }));
+  await waitFor(() => expect(api.cancelOperation).toHaveBeenCalledTimes(1));
+  expect(useTabStore.getState().tabs).toHaveLength(1);
+  expect(screen.getByLabelText("SQL 编辑器")).toBeInTheDocument();
+  vi.mocked(api.operationStatus).mockImplementation(async (id) => ({ id, label: "查询", status: "cancelled", phase: "读取", completed: 0, total: null, committed: 0, batches: 0, cancelRequested: true, message: "查询已停止", interruptible: false }));
+  await act(async () => pending.reject({ kind: "cancelled", message: "查询已停止", committed: 0, batches: 0 }));
+  await waitFor(() => expect(useTabStore.getState().tabs).toHaveLength(0));
+});
+
+
+it("同步界面把操作ID传给后台，取消中锁住目标并保留部分提交说明", async () => {
+  useConnectionStore.setState({ profiles: [{ ...profile, id: "source", name: "源连接" }, { ...profile, id: "target", name: "目标连接" }] });
+  const pending = deferred<{ inserted: number; updated: number; deleted: number; truncated: boolean; note: string }>();
+  vi.mocked(api.syncRows).mockReturnValueOnce(pending.promise);
+  const operation = { id: "sync-task", label: "数据同步", status: "running" as const, phase: "写入目标", completed: 500, total: 1000, committed: 500, batches: 1, cancelRequested: false, interruptible: false, message: "已提交第一批" };
+  vi.mocked(api.createOperation).mockResolvedValueOnce({ ...operation, status: "queued", completed: 0, committed: 0, batches: 0 });
+  vi.mocked(api.operationStatus).mockResolvedValue(operation);
+  vi.mocked(api.cancelOperation).mockResolvedValueOnce({ ...operation, cancelRequested: true });
+  mount(<DataSync />);
+  fireEvent.mouseDown(screen.getAllByRole("combobox")[0]);
+  fireEvent.click(await screen.findByText(/源连接 · PostgreSQL/, { selector: ".ant-select-item-option-content" }));
+  fireEvent.mouseDown(screen.getAllByRole("combobox")[1]);
+  fireEvent.click((await screen.findAllByText(/目标连接 · PostgreSQL/, { selector: ".ant-select-item-option-content" })).at(-1)!);
+  fireEvent.change(screen.getAllByPlaceholderText("表")[0], { target: { value: "source_rows" } });
+  fireEvent.change(screen.getAllByPlaceholderText("表")[1], { target: { value: "target_rows" } });
+  fireEvent.click(screen.getByRole("button", { name: "按主键同步" }));
+  await waitFor(() => expect(api.syncRows).toHaveBeenCalledWith(expect.objectContaining({ sourceId: "source", targetId: "target", sourceTable: "source_rows", targetTable: "target_rows" }), "sync-task"));
+  await screen.findByText(/已提交 500 条，1 批/);
+  fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
+  await waitFor(() => expect(api.cancelOperation).toHaveBeenCalledWith("sync-task"));
+  expect(screen.getByRole("button", { name: /按主键同步/ })).toBeDisabled();
+  expect(screen.getAllByPlaceholderText("表")[1]).toBeDisabled();
+  vi.mocked(api.operationStatus).mockResolvedValue({ ...operation, status: "cancelled", cancelRequested: true, message: "已完成的第一批保留" });
+  await act(async () => pending.reject({ kind: "cancelled", message: "已完成的第一批保留", committed: 500, batches: 1 }));
+  await screen.findByText("任务已取消");
+  expect(screen.getByLabelText("任务进度")).toHaveTextContent("已完成的第一批保留");
+  expect(screen.queryByText(/插入 500，更新/)).not.toBeInTheDocument();
 });

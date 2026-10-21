@@ -41,7 +41,29 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   return invoke<T>(command, args);
 }
 
+export interface OperationSnapshot {
+  id: string;
+  label: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  phase: string;
+  completed: number;
+  total: number | null;
+  committed: number;
+  batches: number;
+  cancelRequested: boolean;
+  message: string;
+  interruptible: boolean;
+}
+
+export function isOperationCancelled(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "kind" in error && error.kind === "cancelled");
+}
+
 export const api = {
+  createOperation: (label: string) => call<OperationSnapshot>("create_operation", { label }),
+  operationStatus: (id: string) => call<OperationSnapshot>("operation_status", { id }),
+  cancelOperation: (id: string) => call<OperationSnapshot>("cancel_operation", { id }),
+  releaseOperation: (id: string) => call<void>("release_operation", { id }),
   appInfo: () => call<AppInfo>("app_info"),
   listConnections: () => call<ConnectionPublic[]>("list_connections"),
   saveConnection: (request: SaveConnectionRequest) =>
@@ -68,7 +90,7 @@ export const api = {
     page: number;
     pageSize: number;
     onlyStatement?: number | null;
-  }) => call<ExecuteSqlResponse>("execute_sql", { request }),
+  }, operationId?: string) => call<ExecuteSqlResponse>("execute_sql", { request, operationId }),
   fetchRows: (request: FetchRowsRequest) => call<DataPage>("fetch_rows", { request }),
   commitChanges: (request: {
     connectionId: string;
@@ -85,9 +107,9 @@ export const api = {
     filters: FilterSpec[];
     sorts: SortSpec[];
     path: string;
-  }) => call<ExportResult>("export_table_csv", { request }),
-  exportSqlCsv: (request: { connectionId: string; database: string; sql: string; path: string }) =>
-    call<ExportResult>("export_sql_csv", { request }),
+  }, operationId?: string) => call<ExportResult>("export_table_csv", { request, operationId }),
+  exportSqlCsv: (request: { connectionId: string; database: string; sql: string; path: string }, operationId?: string) =>
+    call<ExportResult>("export_sql_csv", { request, operationId }),
   importTableCsv: (request: {
     connectionId: string;
     database: string;
@@ -95,7 +117,7 @@ export const api = {
     table: string;
     path: string;
     truncate: boolean;
-  }) => call<ImportResult>("import_table_csv", { request }),
+  }, operationId?: string) => call<ImportResult>("import_table_csv", { request, operationId }),
   formatSql: (sql: string, minify: boolean) => call<string>("format_sql", { request: { sql, minify } }),
   bindSql: (sql: string, engine: string, params: { name: string; value: unknown }[]) =>
     call<string>("bind_sql", { request: { sql, engine, params } }),
@@ -106,13 +128,13 @@ export const api = {
     call<Snippet>("save_snippet", { snippet }),
   deleteSnippet: (id: string) => call<void>("delete_snippet", { id }),
   erDiagram: (request: ObjectRef) => call<ErGraph>("er_diagram", { request }),
-  exportTableFile: (request: FileTransferRequest) => call<FileExportResult>("export_table_file", { request }),
-  importTableFile: (request: FileTransferRequest) => call<number>("import_table_file", { request }),
+  exportTableFile: (request: FileTransferRequest, operationId?: string) => call<FileExportResult>("export_table_file", { request, operationId }),
+  importTableFile: (request: FileTransferRequest, operationId?: string) => call<number>("import_table_file", { request, operationId }),
   diffStructure: (request: PairRequest) => call<DiffResult>("diff_structure", { request }),
-  transferRows: (request: PairRequest) => call<SyncResult>("transfer_rows", { request }),
-  syncRows: (request: PairRequest) => call<SyncResult>("sync_rows", { request }),
-  backupSql: (request: BackupRequest) => call<FileExportResult>("backup_sql", { request }),
-  restoreSql: (request: RestoreRequest) => call<string>("restore_sql", { request }),
+  transferRows: (request: PairRequest, operationId?: string) => call<SyncResult>("transfer_rows", { request, operationId }),
+  syncRows: (request: PairRequest, operationId?: string) => call<SyncResult>("sync_rows", { request, operationId }),
+  backupSql: (request: BackupRequest, operationId?: string) => call<FileExportResult>("backup_sql", { request, operationId }),
+  restoreSql: (request: RestoreRequest, operationId?: string) => call<string>("restore_sql", { request, operationId }),
   generateRows: (request: TableRef & { count: number }) => call<number>("generate_rows", { request }),
   maskColumns: (request: TableRef & { columns: string[] }) => call<string>("mask_columns", { request }),
   dataDictionary: (request: ObjectRef) => call<string>("data_dictionary", { request }),
@@ -166,8 +188,8 @@ export const api = {
     call<string>("redis_expire", { connectionId, key, seconds }),
   exportPdfText: (title: string, body: string, path: string) =>
     call<string>("export_pdf_text", { title, body, path }),
-  convertBackup: (source: string, destination: string) =>
-    call<string>("convert_backup", { source, destination }),
+  convertBackup: (source: string, destination: string, operationId?: string) =>
+    call<string>("convert_backup", { source, destination, operationId }),
   installSchedule: (intervalMinutes: number) => call<string>("install_schedule", { intervalMinutes }),
   mailSettings: () => call<MailSettings>("mail_settings"),
   saveMailSettings: (request: Record<string, unknown>) => call<MailSettings>("save_mail_settings", { request }),

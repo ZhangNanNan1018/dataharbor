@@ -2,6 +2,7 @@ import { App, Alert, Tabs } from "antd";
 import { errorText } from "../api";
 import { openSampleBookstore } from "../actions";
 import { useTabStore } from "../stores/useTabStore";
+import { cancelTabOperations, OperationOwnerContext, useOperationStore } from "../operations";
 import type { WorkspaceTab } from "../types";
 import { DataGridPanel } from "./DataGridPanel";
 import { StudioPanel } from "./StudioPanel";
@@ -48,6 +49,19 @@ export function Workspace() {
         onChange={setActive}
         onEdit={(target, action) => {
           if (action !== "remove" || typeof target !== "string") return;
+          if (useOperationStore.getState().active.some((operation) => operation.ownerId === target)) {
+            modal.confirm({
+              title: "取消运行中的任务并关闭标签？",
+              content: `将请求取消并等待后台实际停止。当前批次可能仍会完成，已提交的数据不会撤销。${dirty[target] ? "关闭后未保存的草稿也会丢失。" : ""}`,
+              okText: "取消任务并等待关闭",
+              cancelText: "继续查看",
+              onOk: async () => {
+                try { await cancelTabOperations(target); close(target); }
+                catch (error) { message.error(errorText(error)); throw error; }
+              },
+            });
+            return;
+          }
           if (dirty[target]) {
             const query = tabs.find((tab) => tab.id === target)?.kind === "query";
             modal.confirm({
@@ -64,7 +78,7 @@ export function Workspace() {
         items={tabs.map((tab) => ({
           key: tab.id,
           label: dirty[tab.id] ? `${tab.title} *` : tab.title,
-          children: renderTab(tab),
+          children: <OperationOwnerContext.Provider value={tab.id}>{renderTab(tab)}</OperationOwnerContext.Provider>,
         }))}
       />
     </section>

@@ -22,10 +22,14 @@ pub use automation::{
     delete_job, install_schedule, list_jobs, mail_settings, run_due_jobs, save_job,
     save_mail_settings,
 };
-pub use backup::{backup_sql, convert_backup, restore_sql};
+pub use backup::{
+    backup_sql_with_operation, convert_backup_with_operation, restore_sql_with_operation,
+};
 pub use catalog::{data_dictionary, er_diagram, foreign_keys, reference_rows, search_catalog};
 pub use engine_tools::{debug_status, redis_expire, redis_listen, redis_publish};
-pub use file_io::{export_file, export_pdf_text, import_file};
+#[cfg(test)]
+pub use file_io::{export_file, import_file};
+pub use file_io::{export_file_with_operation, export_pdf_text, import_file_with_operation};
 pub use inspection::{analyze_schema, profile_table};
 pub use modeling::{
     delete_dashboard, delete_model, forward_sql, list_dashboards, list_models, model_html,
@@ -39,7 +43,7 @@ pub use query_tools::{
     bind_sql, explain_plan, explain_query, format_sql, list_accounts, preview_design,
     server_activity,
 };
-pub use sync::{diff_structure, sync_rows, transfer_rows};
+pub use sync::{diff_structure, sync_rows_with_operation, transfer_rows_with_operation};
 pub use table_data::{generate_rows, mask_columns};
 pub use types::{
     AiAskRequest, AiSettingsPublic, AiSettingsRequest, BackupRequest, BindRequest, Dashboard,

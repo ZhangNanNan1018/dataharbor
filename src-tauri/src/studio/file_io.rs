@@ -1,24 +1,47 @@
 use super::storage::{cell_string, escape_xml};
-use super::table_data::{load_all, CEILING};
+use super::table_data::{load_all_operation, CEILING};
 use super::types::{FileExportRequest, FileExportResult, FileImportRequest};
-use crate::data::{commit_changes, delimited};
+use crate::data::{commit_changes_with_operation, delimited};
 use crate::error::{AppError, AppResult};
 use crate::models::{CommitRequest, FieldValue, RowChange};
+use crate::operations::{AtomicOutput, OperationContext};
 use crate::state::AppState;
 use serde_json::{json, Value as JsonValue};
 use std::fs;
 use std::path::Path;
 
 pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<FileExportResult> {
+    export_file_with_operation(state, request, &OperationContext::detached())
+}
+
+pub fn export_file_with_operation(
+    state: &AppState,
+    request: FileExportRequest,
+    operation: &OperationContext,
+) -> AppResult<FileExportResult> {
+    operation.checkpoint()?;
     let format = request.format.to_ascii_lowercase();
-    let (columns, rows, total, hit_ceiling) = load_all(
+    let (columns, rows, total, hit_ceiling) = load_all_operation(
         state,
         &request.connection_id,
         &request.database,
         &request.schema,
         &request.table,
+        operation,
     )?;
     let text_columns: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+    operation.checkpoint()?;
+    operation.report(
+        "写出文件",
+        0,
+        Some(rows.len() as u64),
+        "取消在当前格式处理完成后停止，不会替换旧输出",
+    );
+    let output = AtomicOutput::new(Path::new(&request.path))?;
+    let output_path = output
+        .path()
+        .to_str()
+        .ok_or_else(|| AppError::msg("输出路径无效"))?;
     match format.as_str() {
         "json" => {
             let objects: Vec<JsonValue> = rows
@@ -26,26 +49,26 @@ pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<Fi
                 .map(|row| row_object(&text_columns, row))
                 .collect();
             fs::write(
-                &request.path,
+                output_path,
                 serde_json::to_string_pretty(&objects).unwrap_or_else(|_| "[]".into()),
             )
             .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "xml" => {
-            fs::write(&request.path, rows_to_xml(&text_columns, &rows))
+            fs::write(output_path, rows_to_xml(&text_columns, &rows))
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "txt" => {
-            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, '\t')?)
+            fs::write(output_path, rows_to_delimited(&text_columns, &rows, '\t')?)
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "csv" => {
-            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, ',')?)
+            fs::write(output_path, rows_to_delimited(&text_columns, &rows, ',')?)
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
-        "xlsx" => write_xlsx(&request.path, &text_columns, &rows)?,
-        "dbf" => crate::dbf::write_dbf(Path::new(&request.path), &text_columns, &rows)?,
-        "parquet" => crate::parquetio::write_table(Path::new(&request.path), &text_columns, &rows)?,
+        "xlsx" => write_xlsx(output_path, &text_columns, &rows)?,
+        "dbf" => crate::dbf::write_dbf(Path::new(output_path), &text_columns, &rows)?,
+        "parquet" => crate::parquetio::write_table(Path::new(output_path), &text_columns, &rows)?,
         "pdf" => {
             let mut lines = vec![text_columns.join(" | ")];
             for row in &rows {
@@ -56,10 +79,18 @@ pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<Fi
                         .join(" | "),
                 );
             }
-            crate::pdf::write_text_pdf(Path::new(&request.path), &request.table, &lines)?;
+            crate::pdf::write_text_pdf(Path::new(output_path), &request.table, &lines)?;
         }
         other => return Err(AppError::msg(format!("不支持的导出格式 {other}"))),
     }
+    operation.checkpoint()?;
+    output.commit()?;
+    operation.report(
+        "文件已保存",
+        rows.len() as u64,
+        Some(rows.len() as u64),
+        &request.path,
+    );
     Ok(FileExportResult {
         path: request.path,
         row_count: rows.len() as u64,
@@ -73,13 +104,29 @@ pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<Fi
     })
 }
 
+#[cfg(test)]
 pub fn import_file(state: &AppState, request: FileImportRequest) -> AppResult<usize> {
+    import_file_with_operation(state, request, &OperationContext::detached())
+}
+
+pub fn import_file_with_operation(
+    state: &AppState,
+    request: FileImportRequest,
+    operation: &OperationContext,
+) -> AppResult<usize> {
+    operation.checkpoint()?;
+    operation.report(
+        "解析文件",
+        0,
+        None,
+        "尚未写入数据库；复杂格式解析将在当前步骤结束后响应取消",
+    );
     let format = request.format.to_ascii_lowercase();
     let (headers, records) = match format.as_str() {
         "json" => read_json_table(&request.path)?,
         "xml" => read_xml_table(&request.path)?,
-        "txt" => read_delimited(&request.path, '\t')?,
-        "csv" => read_delimited(&request.path, ',')?,
+        "txt" => read_delimited_operation(&request.path, '\t', operation)?,
+        "csv" => read_delimited_operation(&request.path, ',', operation)?,
         "xlsx" => read_xlsx_table(&request.path)?,
         "dbf" => crate::dbf::read_dbf(Path::new(&request.path))?,
         "parquet" => crate::parquetio::read_table(Path::new(&request.path))?,
@@ -87,27 +134,31 @@ pub fn import_file(state: &AppState, request: FileImportRequest) -> AppResult<us
         "odbc" => read_odbc_table(&request.path, &request.table)?,
         other => return Err(AppError::msg(format!("不支持的导入格式 {other}"))),
     };
+    operation.checkpoint()?;
     if records.len() > CEILING as usize {
         return Err(AppError::msg(format!("一次最多导入 {CEILING} 行")));
     }
     let changes = records
         .into_iter()
-        .map(|row| RowChange {
-            kind: "insert".into(),
-            original: None,
-            pk: Vec::new(),
-            values: headers
-                .iter()
-                .cloned()
-                .zip(row)
-                .map(|(column, value)| FieldValue { column, value })
-                .collect(),
+        .map(|row| {
+            operation.checkpoint()?;
+            Ok(RowChange {
+                kind: "insert".into(),
+                original: None,
+                pk: Vec::new(),
+                values: headers
+                    .iter()
+                    .cloned()
+                    .zip(row)
+                    .map(|(column, value)| FieldValue { column, value })
+                    .collect(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<AppResult<Vec<_>>>()?;
     if changes.is_empty() {
         return Err(AppError::msg("文件里没有数据行"));
     }
-    let result = commit_changes(
+    let result = commit_changes_with_operation(
         state,
         CommitRequest {
             connection_id: request.connection_id,
@@ -116,6 +167,7 @@ pub fn import_file(state: &AppState, request: FileImportRequest) -> AppResult<us
             table: request.table,
             changes,
         },
+        operation,
     )?;
     Ok(result.applied)
 }
@@ -205,9 +257,13 @@ fn rows_to_xml(columns: &[String], rows: &[Vec<JsonValue>]) -> String {
     text
 }
 
-fn read_delimited(path: &str, sep: char) -> AppResult<(Vec<String>, Vec<Vec<JsonValue>>)> {
+fn read_delimited_operation(
+    path: &str,
+    sep: char,
+    operation: &OperationContext,
+) -> AppResult<(Vec<String>, Vec<Vec<JsonValue>>)> {
     let file = fs::File::open(path).map_err(|err| AppError::msg(err.to_string()))?;
-    delimited::read(file, sep as u8, CEILING as usize)
+    delimited::read_with_operation(file, sep as u8, CEILING as usize, operation)
 }
 
 fn parse_cell(text: String) -> JsonValue {

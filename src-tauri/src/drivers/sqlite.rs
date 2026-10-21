@@ -38,6 +38,31 @@ impl DbSession for SqliteSession {
         Engine::Sqlite
     }
 
+    fn cancel_handle(
+        &mut self,
+        _database: &str,
+    ) -> AppResult<Option<crate::operations::CancelHandle>> {
+        let interrupt = self.conn.get_interrupt_handle();
+        Ok(Some(std::sync::Arc::new(move || {
+            interrupt.interrupt();
+            Ok(())
+        })))
+    }
+
+    fn begin_read_snapshot(&mut self, _database: &str) -> AppResult<()> {
+        self.conn
+            .execute_batch("PRAGMA query_only = ON; BEGIN; SELECT name FROM sqlite_schema LIMIT 1;")
+            .map_err(|err| AppError::msg(format!("无法建立 SQLite 只读快照：{err}")))
+    }
+
+    fn end_read_snapshot(&mut self, _database: &str) -> AppResult<()> {
+        let result = self.conn.execute_batch("ROLLBACK;");
+        let reset = self.conn.execute_batch("PRAGMA query_only = OFF;");
+        result
+            .and(reset)
+            .map_err(|err| AppError::msg(format!("无法结束 SQLite 快照：{err}")))
+    }
+
     fn version(&mut self) -> AppResult<String> {
         self.conn
             .query_row("SELECT sqlite_version()", [], |row| row.get::<_, String>(0))
@@ -59,9 +84,7 @@ impl DbSession for SqliteSession {
     }
 
     fn list_views(&mut self, _database: &str, _schema: &str) -> AppResult<Vec<String>> {
-        self.query_strings(
-            "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name",
-        )
+        self.query_strings("SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")
     }
 
     fn list_columns(
@@ -183,7 +206,10 @@ impl DbSession for SqliteSession {
             .map_err(|err| AppError::msg(err.to_string()))?;
         let mut rows = Vec::new();
         let mut truncated = false;
-        while let Some(row) = cursor.next().map_err(|err| AppError::msg(err.to_string()))? {
+        while let Some(row) = cursor
+            .next()
+            .map_err(|err| AppError::msg(err.to_string()))?
+        {
             if max_rows.is_some_and(|limit| rows.len() >= limit) {
                 truncated = true;
                 break;

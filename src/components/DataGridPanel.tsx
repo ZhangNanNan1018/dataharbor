@@ -12,7 +12,9 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useRef, useState } from "react";
-import { api, errorText, pickCsvFile, pickSaveCsv } from "../api";
+import { api, errorText, isOperationCancelled, pickCsvFile, pickSaveCsv } from "../api";
+import { useLongOperation } from "../operations";
+import { TaskProgress } from "./TaskProgress";
 import type { ForeignKeyRef } from "../api";
 import { CellValue } from "./CellEditors";
 import { isBlank, isNumericType, sameValue } from "../format";
@@ -43,6 +45,8 @@ const FILTER_OPS = [
 
 export function DataGridPanel({ tab }: { tab: DataTab }) {
   const { message, modal } = App.useApp();
+  const task = useLongOperation(tab.id);
+  const exportInFlight = useRef(false);
   const setStatus = useUiStore((state) => state.setStatus);
   const setDirty = useTabStore((state) => state.setDirty);
   const supportsFilters = useConnectionStore((state) => state.profiles.find((profile) => profile.id === tab.connectionId)?.engine !== "redis");
@@ -253,7 +257,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }
 
   async function commit() {
-    if (writeInFlight.current || loading || readOnly || refreshRequired) return;
+    if (writeInFlight.current || exportInFlight.current || task.active || loading || readOnly || refreshRequired) return;
     writeInFlight.current = true;
     const active = document.activeElement;
     if (active instanceof HTMLElement && active !== document.body) active.blur();
@@ -309,10 +313,12 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   commitRef.current = commit;
 
   async function exportCsv() {
-    const path = await pickSaveCsv(`${tab.table}.csv`);
-    if (!path) return;
+    if (exportInFlight.current || writeInFlight.current || task.active) return;
+    exportInFlight.current = true;
     try {
-      const exported = await api.exportTableCsv({
+      const path = await pickSaveCsv(`${tab.table}.csv`);
+      if (!path) return;
+      const exported = await task.execute("导出表数据 CSV", (operationId) => api.exportTableCsv({
         connectionId: tab.connectionId,
         database: tab.database,
         schema: tab.schema,
@@ -320,18 +326,21 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         filters: supportsFilters ? filters : [],
         sorts: supportsFilters ? sorts : [],
         path,
-      });
+      }, operationId));
       const text = `已导出 ${exported.rowCount} 行${exported.truncated ? "，结果已截断，仅包含部分数据" : ""}`;
       if (exported.truncated) message.warning(text);
       else message.success(text);
       setStatus(`CSV 已写入 ${exported.path}`);
     } catch (err) {
-      message.error(errorText(err));
+      setStatus(errorText(err));
+      if (!isOperationCancelled(err)) message.error(errorText(err));
+    } finally {
+      exportInFlight.current = false;
     }
   }
 
   async function importCsv() {
-    if (writeInFlight.current || loading) return;
+    if (writeInFlight.current || exportInFlight.current || task.active || loading || refreshRequired) return;
     if (!csvPath) {
       message.warning("先选择 CSV 文件");
       return;
@@ -355,14 +364,14 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
       }
       editsLocked.current = true;
       setImporting(true);
-      const result = await api.importTableCsv({
+      const result = await task.execute("导入 CSV", (operationId) => api.importTableCsv({
         connectionId: tab.connectionId,
         database: tab.database,
         schema: tab.schema,
         table: tab.table,
         path: csvPath,
         truncate,
-      });
+      }, operationId));
       message.success(`已导入 ${result.inserted} 行`);
       setImportOpen(false);
       setCsvPath("");
@@ -372,7 +381,11 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
       setRefreshRequired(true);
       await load({ page: 1, size: pageSize, filters, sorts, force: true, afterWrite: true });
     } catch (err) {
-      message.error(errorText(err));
+      setStatus(errorText(err));
+      if (isOperationCancelled(err)) {
+        const detail = err as { committed?: number };
+        if ((detail.committed ?? 0) > 0) setRefreshRequired(true);
+      } else message.error(errorText(err));
     } finally {
       writeInFlight.current = false;
       editsLocked.current = false;
@@ -424,13 +437,13 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         <Button size="small" disabled={!dirty} onClick={() => setReviewOpen((value) => !value)}>
           查看更改
         </Button>
-        <Button size="small" type="primary" loading={submitting} disabled={readOnly || loading || importing || refreshRequired} onClick={() => void commit()}>
+        <Button size="small" type="primary" loading={submitting} disabled={readOnly || loading || importing || task.active || refreshRequired} onClick={() => void commit()}>
           提交
         </Button>
-        <Button size="small" onClick={() => void exportCsv()}>
+        <Button size="small" disabled={task.active || loading || submitting || importing} onClick={() => void exportCsv()}>
           导出 CSV
         </Button>
-        <Button size="small" disabled={readOnly || loading || submitting || importing || refreshRequired} onClick={() => setImportOpen(true)}>
+        <Button size="small" disabled={readOnly || task.active || loading || submitting || importing || refreshRequired} onClick={() => setImportOpen(true)}>
           导入 CSV
         </Button>
         <Button size="small" onClick={() => setFormView((value) => !value)}>
@@ -487,6 +500,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
           JSON
         </Button>
       </div>
+      {!importOpen && <TaskProgress task={task} />}
       {dirty && (
         <div className="xb-review-bar">
           <strong>{buildChanges(columns, rows).length} 处待提交</strong>
@@ -619,14 +633,20 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         okText="导入"
         cancelText="取消"
         confirmLoading={importing}
+        okButtonProps={{ disabled: refreshRequired }}
+        cancelButtonProps={{ disabled: importing }}
+        closable={!importing}
+        maskClosable={!importing}
         onOk={() => void importCsv()}
         onCancel={() => { if (!importing) setImportOpen(false); }}
       >
         <Space direction="vertical" className="w-full">
+          <TaskProgress task={task} />
           <div className="text-sm text-[var(--xb-muted)]">第一行是表头，空单元格保留空字符串，{"\\N"} 表示 NULL。文本本身若是反斜杠加 N，需再加一个反斜杠；普通文件路径保持原样。单次最多 10 万行、50MB。</div>
           <Space.Compact className="w-full">
             <Input value={csvPath} placeholder="选择 CSV 文件" readOnly />
             <Button
+              disabled={importing}
               onClick={() => {
                 void pickCsvFile().then((path) => {
                   if (path) setCsvPath(path);
@@ -636,7 +656,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
               浏览
             </Button>
           </Space.Compact>
-          <Checkbox checked={truncate} onChange={(event) => setTruncate(event.target.checked)}>
+          <Checkbox disabled={importing} checked={truncate} onChange={(event) => setTruncate(event.target.checked)}>
             导入前删除表中现有行
           </Checkbox>
         </Space>

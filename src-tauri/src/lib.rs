@@ -9,6 +9,7 @@ mod mail;
 mod migrate;
 mod models;
 mod native;
+mod operations;
 mod parquetio;
 mod pdf;
 mod pldbg;
@@ -27,6 +28,7 @@ mod tunnel;
 mod server_tests;
 
 use commands::{
+    create_operation, operation_status, cancel_operation, release_operation,
     ai_ask, ai_settings, analyze_schema, app_info, backup_sql, bind_sql, commit_changes, connect,
     create_sample_database, data_dictionary, delete_connection, delete_dashboard, delete_favorite,
     delete_job, delete_model, delete_snippet, diff_structure, disconnect, er_diagram, execute_sql,
@@ -77,6 +79,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(app)
         .invoke_handler(tauri::generate_handler![
+            create_operation, operation_status, cancel_operation, release_operation,
             app_info,
             list_connections,
             save_connection,

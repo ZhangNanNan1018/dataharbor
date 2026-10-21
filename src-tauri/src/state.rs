@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -22,6 +22,23 @@ pub struct SessionSlot {
     pub live: SessionConfig,
 }
 
+/// A task owns its database transaction and pins any SSH/HTTP tunnel until it ends.
+pub(crate) struct IsolatedSession {
+    inner: Box<dyn DbSession>,
+    _owner: Arc<SessionSlot>,
+}
+impl std::ops::Deref for IsolatedSession {
+    type Target = dyn DbSession;
+    fn deref(&self) -> &Self::Target {
+        &*self.inner
+    }
+}
+impl std::ops::DerefMut for IsolatedSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.inner
+    }
+}
+
 impl SessionSlot {
     pub fn tunnel_count(&self) -> usize {
         self.tunnel.len()
@@ -29,6 +46,7 @@ impl SessionSlot {
 }
 
 pub struct AppState {
+    pub(crate) operations: crate::operations::OperationManager,
     config_dir: PathBuf,
     cipher: CredentialCipher,
     key_source: KeySource,
@@ -51,6 +69,7 @@ impl AppState {
         let (cipher, key_source) = crypto::load_or_create_cipher(&dir, force_file)?;
         let profiles = store::load_profiles(&dir)?;
         Ok(Self {
+            operations: crate::operations::OperationManager::default(),
             config_dir: dir,
             cipher,
             key_source,
@@ -470,6 +489,68 @@ impl AppState {
         };
         let mut guard = lock(&slot.inner);
         f(&mut **guard)
+    }
+
+    pub(crate) fn with_session_operation<T>(
+        &self,
+        id: &str,
+        database: &str,
+        operation: &crate::operations::OperationContext,
+        f: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.with_session_wait(id, operation, |session| {
+            let interrupt = operation.bind_interrupt(session.cancel_handle(database)?)?;
+            operation.checkpoint()?;
+            let result = f(session);
+            drop(interrupt);
+            if result.is_err() && operation.cancel_requested() {
+                return Err(operation.cancel_error());
+            }
+            result
+        })
+    }
+
+    pub(crate) fn with_session_wait<T>(
+        &self,
+        id: &str,
+        operation: &crate::operations::OperationContext,
+        f: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
+    ) -> AppResult<T> {
+        operation.checkpoint()?;
+        let slot = lock(&self.sessions)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| AppError::msg("连接未打开，请先在左侧连接"))?;
+        let mut session = loop {
+            operation.checkpoint()?;
+            match slot.inner.try_lock() {
+                Ok(session) => break session,
+                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(15))
+                }
+            }
+        };
+        operation.checkpoint()?;
+        f(&mut **session)
+    }
+
+    pub(crate) fn open_isolated_session(&self, id: &str) -> AppResult<IsolatedSession> {
+        let existing = { lock(&self.sessions).get(id).cloned() };
+        let slot = if let Some(slot) = existing {
+            slot
+        } else {
+            self.connect(id)?;
+            lock(&self.sessions)
+                .get(id)
+                .cloned()
+                .ok_or_else(|| AppError::msg("连接已关闭"))?
+        };
+        let inner = drivers::open_session(&slot.live)?;
+        Ok(IsolatedSession {
+            inner,
+            _owner: slot,
+        })
     }
 
     fn profile_by_id(&self, id: &str) -> AppResult<StoredProfile> {
@@ -951,10 +1032,16 @@ mod tests {
                 for index in 0..12 {
                     let state = if index % 2 == 0 { &first } else { &second };
                     let path = dir.join(format!("fixture-{index}.sqlite"));
-                    scope.spawn(move || state.save_connection(SaveConnectionRequest {
-                        name: format!("connection-{index}"), engine: Engine::Sqlite,
-                        file_path: path.display().to_string(), ..Default::default()
-                    }).unwrap());
+                    scope.spawn(move || {
+                        state
+                            .save_connection(SaveConnectionRequest {
+                                name: format!("connection-{index}"),
+                                engine: Engine::Sqlite,
+                                file_path: path.display().to_string(),
+                                ..Default::default()
+                            })
+                            .unwrap()
+                    });
                 }
             });
             let reopened = AppState::open_in(dir.clone(), true).unwrap();

@@ -188,6 +188,7 @@ fn sorting_appends_all_composite_keys_and_rejects_offset_overflow() {
 struct RecordingSession {
     calls: Vec<String>,
     fail_on: Option<String>,
+    cancel_after: Option<(String, OperationContext)>,
 }
 
 impl DbSession for RecordingSession {
@@ -222,6 +223,9 @@ impl DbSession for RecordingSession {
         _: Option<usize>,
     ) -> AppResult<crate::models::QueryOutcome> {
         self.calls.push(sql.into());
+        if let Some((trigger, operation)) = &self.cancel_after {
+            if trigger == sql { operation.request_cancel()?; }
+        }
         if self.fail_on.as_deref() == Some(sql) {
             return Err(AppError::msg("fixture failure"));
         }
@@ -234,6 +238,7 @@ fn mssql_transaction_starts_with_begin_transaction_and_rolls_back_on_failure() {
     let mut session = RecordingSession {
         calls: vec![],
         fail_on: None,
+        cancel_after: None,
     };
     session
         .execute_transaction("db", &["INSERT first".into()])
@@ -457,4 +462,56 @@ fn numeric_literals_keep_decimal_precision_and_reject_sql_tokens() {
             assert!(value_sql(Engine::Postgres, kind, &json!(bad)).is_err());
         }
     }
+}
+
+
+#[test]
+fn cancellation_rolls_back_current_transaction_without_executing_next_statement() {
+    let operation = OperationContext::detached();
+    let mut session = RecordingSession { calls: vec![], fail_on: None, cancel_after: Some(("INSERT first".into(), operation.clone())) };
+    let error = session.execute_transaction_with_operation("db", &["INSERT first".into(), "INSERT second".into()], &operation).unwrap_err();
+    assert!(matches!(error, AppError::Cancelled { committed: 0, batches: 0 }));
+    assert_eq!(session.calls, ["BEGIN TRANSACTION", "INSERT first", "ROLLBACK"]);
+}
+
+#[test]
+fn query_failure_and_uncommitted_writes_have_truthful_operation_state() {
+    let fixture = EditFixture::new();
+    fixture.sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
+    fixture.sql("INSERT INTO items VALUES(1,'before')");
+    let run = |sql: &str, operation: &OperationContext| {
+        crate::query::execute_sql_with_operation(&fixture.state, ExecuteSqlRequest {
+            connection_id: fixture.id.clone(), database: "main".into(), sql: sql.into(), page: 1, page_size: 10, only_statement: None,
+        }, operation)
+    };
+    let transaction = OperationContext::detached();
+    let result = run("BEGIN; UPDATE items SET label='uncommitted'; ROLLBACK", &transaction);
+    transaction.finish(&result);
+    assert!(!result.unwrap().stopped);
+    assert_eq!(transaction.snapshot().committed, 0);
+    assert_eq!(fixture.sql("SELECT label FROM items"), vec![vec![json!("before")]]);
+    let failure = OperationContext::detached();
+    let result = run("SELECT * FROM nonexistent; DELETE FROM items", &failure);
+    failure.finish(&result);
+    assert!(result.unwrap().stopped);
+    assert_eq!(failure.snapshot().status, "failed");
+    assert_eq!(fixture.sql("SELECT COUNT(*) FROM items"), vec![vec![json!(1)]]);
+}
+
+#[test]
+fn cancelled_import_and_export_preserve_existing_data_and_output() {
+    let fixture = EditFixture::new();
+    fixture.sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
+    fixture.sql("INSERT INTO items VALUES(1,'before')");
+    let path = fixture.dir.join("protected.csv");
+    fs::write(&path, "id,label\n2,after\n").unwrap();
+    let operation = OperationContext::detached();
+    operation.request_cancel().unwrap();
+    let error = import_table_csv_with_operation(&fixture.state, ImportCsvRequest {
+        connection_id: fixture.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), path: path.display().to_string(), truncate: true,
+    }, &operation).unwrap_err();
+    assert!(matches!(error, AppError::Cancelled { .. }));
+    assert_eq!(fixture.sql("SELECT label FROM items"), vec![vec![json!("before")]]);
+    assert!(write_csv_operation(path.to_str().unwrap(), &[ColumnMeta::named("x")], &[vec![json!("new")]], &operation).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), "id,label\n2,after\n");
 }

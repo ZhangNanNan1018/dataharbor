@@ -131,12 +131,23 @@ pub fn open_client(
     Ok(client)
 }
 
-fn connection_options(host: &str, port: u16, use_ssl: bool, tls_server_name: Option<&str>) -> AppResult<Config> {
+fn connection_options(
+    host: &str,
+    port: u16,
+    use_ssl: bool,
+    tls_server_name: Option<&str>,
+) -> AppResult<Config> {
     let mut config = Config::new();
-    config.port(port).ssl_mode(if use_ssl { SslMode::Require } else { SslMode::Disable });
+    config.port(port).ssl_mode(if use_ssl {
+        SslMode::Require
+    } else {
+        SslMode::Disable
+    });
     if let Some(server_name) = tls_server_name {
         // host remains the remote TLS/SNI identity; hostaddr is the local tunnel.
-        let address = host.parse().map_err(|_| AppError::msg("PostgreSQL 隧道的本地地址必须是 IP"))?;
+        let address = host
+            .parse()
+            .map_err(|_| AppError::msg("PostgreSQL 隧道的本地地址必须是 IP"))?;
         config.host(server_name).hostaddr(address);
     } else {
         config.host(host);
@@ -204,6 +215,51 @@ impl DbSession for PostgresSession {
         Engine::Postgres
     }
 
+    fn cancel_handle(
+        &mut self,
+        database: &str,
+    ) -> AppResult<Option<crate::operations::CancelHandle>> {
+        let token = self.with_client(database, |client| Ok(client.cancel_token()))?;
+        let handle: crate::operations::CancelHandle = if self.use_ssl {
+            let mut builder = TlsConnector::builder();
+            if self.ssl_insecure {
+                builder.danger_accept_invalid_certs(true);
+                builder.danger_accept_invalid_hostnames(true);
+            }
+            let connector = builder
+                .build()
+                .map_err(|err| AppError::msg(format!("取消连接 TLS 初始化失败：{err}")))?;
+            std::sync::Arc::new(move || {
+                token
+                    .cancel_query(MakeTlsConnector::new(connector.clone()))
+                    .map_err(|err| AppError::msg(format!("PostgreSQL 取消请求未送达：{err}")))
+            })
+        } else {
+            std::sync::Arc::new(move || {
+                token
+                    .cancel_query(NoTls)
+                    .map_err(|err| AppError::msg(format!("PostgreSQL 取消请求未送达：{err}")))
+            })
+        };
+        Ok(Some(handle))
+    }
+
+    fn begin_read_snapshot(&mut self, database: &str) -> AppResult<()> {
+        self.with_client(database, |client| {
+            client
+                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .map_err(|err| AppError::msg(format!("无法建立 PostgreSQL 只读快照：{err}")))
+        })
+    }
+
+    fn end_read_snapshot(&mut self, database: &str) -> AppResult<()> {
+        self.with_client(database, |client| {
+            client
+                .batch_execute("ROLLBACK")
+                .map_err(|err| AppError::msg(format!("无法结束 PostgreSQL 快照：{err}")))
+        })
+    }
+
     fn version(&mut self) -> AppResult<String> {
         let values = self.one_column("", "SELECT version()")?;
         values
@@ -262,7 +318,10 @@ impl DbSession for PostgresSession {
     ) -> AppResult<Vec<ColumnMeta>> {
         let schema = schema_or_public(schema);
         let schema_lit = sql_literal(Engine::Postgres, &JsonValue::String(schema))?;
-        let table_lit = sql_literal(Engine::Postgres, &JsonValue::String(object_name.to_string()))?;
+        let table_lit = sql_literal(
+            Engine::Postgres,
+            &JsonValue::String(object_name.to_string()),
+        )?;
         let sql = format!(
             "SELECT c.column_name, pg_catalog.format_type(a.atttypid, a.atttypmod), c.is_nullable, c.column_default, \
                     CASE WHEN EXISTS ( \
@@ -319,7 +378,10 @@ impl DbSession for PostgresSession {
     ) -> AppResult<Option<String>> {
         let schema = schema_or_public(schema);
         let schema_lit = sql_literal(Engine::Postgres, &JsonValue::String(schema))?;
-        let table_lit = sql_literal(Engine::Postgres, &JsonValue::String(object_name.to_string()))?;
+        let table_lit = sql_literal(
+            Engine::Postgres,
+            &JsonValue::String(object_name.to_string()),
+        )?;
         let rows = self.one_column(
             database,
             &format!(
@@ -358,7 +420,11 @@ fn schema_or_public(schema: &str) -> String {
     }
 }
 
-pub(crate) fn run_simple(client: &mut Client, sql: &str, max_rows: Option<usize>) -> AppResult<QueryOutcome> {
+pub(crate) fn run_simple(
+    client: &mut Client,
+    sql: &str,
+    max_rows: Option<usize>,
+) -> AppResult<QueryOutcome> {
     let messages = client
         .simple_query(sql)
         .map_err(|err| AppError::msg(err.to_string()))?;
@@ -421,9 +487,16 @@ mod tests {
 
     #[test]
     fn tunneled_tls_dials_loopback_but_verifies_the_remote_host() {
-        let options = connection_options("127.0.0.1", 49152, true, Some("db.example.test")).unwrap();
-        assert_eq!(options.get_hosts(), &[postgres::config::Host::Tcp("db.example.test".into())]);
-        assert_eq!(options.get_hostaddrs(), &["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+        let options =
+            connection_options("127.0.0.1", 49152, true, Some("db.example.test")).unwrap();
+        assert_eq!(
+            options.get_hosts(),
+            &[postgres::config::Host::Tcp("db.example.test".into())]
+        );
+        assert_eq!(
+            options.get_hostaddrs(),
+            &["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
         assert_eq!(options.get_ports(), &[49152]);
         assert_eq!(options.get_ssl_mode(), SslMode::Require);
     }
@@ -435,7 +508,9 @@ mod tests {
         assert!(tls.get_hostaddrs().is_empty());
         let plain = connection_options("db.example.test", 5432, false, None).unwrap();
         assert_eq!(plain.get_ssl_mode(), SslMode::Disable);
-        assert!(connection_options("not-a-local-ip", 49152, true, Some("db.example.test")).is_err());
+        assert!(
+            connection_options("not-a-local-ip", 49152, true, Some("db.example.test")).is_err()
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub struct MysqlSession {
     conn: mysql::Conn,
     engine: Engine,
     current_db: String,
+    cancel_options: mysql::Opts,
 }
 
 pub fn connect(config: &SessionConfig) -> AppResult<MysqlSession> {
@@ -49,17 +50,75 @@ pub fn connect(config: &SessionConfig) -> AppResult<MysqlSession> {
         }
         opts = opts.ssl_opts(Some(ssl));
     }
+    // Keep the original transport, authentication and TLS policy for the
+    // separate cancellation connection. It must never downgrade a tunnel/TLS.
+    let cancel_options = mysql::Opts::from(opts.clone().db_name(None::<String>));
     let conn = mysql::Conn::new(opts).map_err(|err| AppError::msg(err.to_string()))?;
     Ok(MysqlSession {
         conn,
         engine: config.engine,
         current_db: config.database.trim().to_string(),
+        cancel_options,
     })
 }
 
 impl DbSession for MysqlSession {
     fn engine(&self) -> Engine {
         self.engine
+    }
+
+    fn cancel_handle(
+        &mut self,
+        _database: &str,
+    ) -> AppResult<Option<crate::operations::CancelHandle>> {
+        let thread = self.conn.connection_id();
+        let options = self.cancel_options.clone();
+        Ok(Some(std::sync::Arc::new(move || {
+            let mut control = mysql::Conn::new(options.clone())
+                .map_err(|err| AppError::msg(format!("MySQL 取消连接失败：{err}")))?;
+            control
+                .query_drop(format!("KILL QUERY {thread}"))
+                .map_err(|err| AppError::msg(format!("MySQL 取消请求未送达：{err}")))
+        })))
+    }
+
+    fn begin_read_snapshot(&mut self, database: &str) -> AppResult<()> {
+        self.activate(database)?;
+        self.conn
+            .query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .map_err(|err| AppError::msg(format!("无法设置 MySQL 快照隔离级别：{err}")))?;
+        self.conn
+            .query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            .map_err(|err| AppError::msg(format!("无法建立 MySQL 只读快照：{err}")))
+    }
+
+    fn end_read_snapshot(&mut self, _database: &str) -> AppResult<()> {
+        self.conn
+            .query_drop("ROLLBACK")
+            .map_err(|err| AppError::msg(format!("无法结束 MySQL 快照：{err}")))
+    }
+
+    fn validate_snapshot_relation(
+        &mut self,
+        database: &str,
+        _schema: &str,
+        table: &str,
+    ) -> AppResult<()> {
+        let database = if database.is_empty() {
+            &self.current_db
+        } else {
+            database
+        };
+        let metadata: Option<(String, Option<String>)> = self.conn.exec_first(
+            "SELECT TABLE_TYPE, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            (database, table),
+        ).map_err(|err| AppError::msg(format!("无法核对快照表引擎：{err}")))?;
+        if !metadata.is_some_and(|(kind, engine)| {
+            kind == "BASE TABLE" && engine.is_some_and(|name| name.eq_ignore_ascii_case("InnoDB"))
+        }) {
+            return Err(AppError::msg("MySQL/MariaDB 全量同步要求 InnoDB 实体表，其他引擎或视图无法保证一致性快照；没有开始写入目标"));
+        }
+        Ok(())
     }
 
     fn version(&mut self) -> AppResult<String> {
@@ -114,7 +173,10 @@ impl DbSession for MysqlSession {
                 ColumnMeta {
                     name: row.first().cloned().unwrap_or_default(),
                     data_type: row.get(1).cloned().unwrap_or_default(),
-                    nullable: row.get(2).map(|value| value.eq_ignore_ascii_case("YES")).unwrap_or(true),
+                    nullable: row
+                        .get(2)
+                        .map(|value| value.eq_ignore_ascii_case("YES"))
+                        .unwrap_or(true),
                     primary_key: row.get(4).map(|value| value == "PRI").unwrap_or(false),
                     auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
                     default_value: row.get(3).cloned().filter(|value| !value.is_empty()),
@@ -145,7 +207,9 @@ impl DbSession for MysqlSession {
 
     fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
         self.activate(database)?;
-        self.conn.query_drop(sql).map_err(|err| AppError::msg(err.to_string()))?;
+        self.conn
+            .query_drop(sql)
+            .map_err(|err| AppError::msg(err.to_string()))?;
         Ok(self.conn.affected_rows())
     }
 
@@ -164,10 +228,25 @@ impl DbSession for MysqlSession {
             .conn
             .query_iter(sql)
             .map_err(|err| AppError::msg(err.to_string()))?;
-        let binary_columns = result.columns().as_ref().iter().map(|column| {
-            use mysql::consts::ColumnType::*;
-            column.character_set() == 63 && matches!(column.column_type(), MYSQL_TYPE_BLOB | MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_STRING | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_VARCHAR)
-        }).collect::<Vec<_>>();
+        let binary_columns = result
+            .columns()
+            .as_ref()
+            .iter()
+            .map(|column| {
+                use mysql::consts::ColumnType::*;
+                column.character_set() == 63
+                    && matches!(
+                        column.column_type(),
+                        MYSQL_TYPE_BLOB
+                            | MYSQL_TYPE_TINY_BLOB
+                            | MYSQL_TYPE_MEDIUM_BLOB
+                            | MYSQL_TYPE_LONG_BLOB
+                            | MYSQL_TYPE_STRING
+                            | MYSQL_TYPE_VAR_STRING
+                            | MYSQL_TYPE_VARCHAR
+                    )
+            })
+            .collect::<Vec<_>>();
         let columns: Vec<ColumnMeta> = result
             .columns()
             .as_ref()
@@ -276,15 +355,27 @@ fn mysql_to_json(value: Value) -> JsonValue {
             if hour == 0 && minute == 0 && second == 0 && micros == 0 {
                 JsonValue::String(format!("{year:04}-{month:02}-{day:02}"))
             } else {
-                let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}") };
-                JsonValue::String(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}{fraction}"))
+                let fraction = if micros == 0 {
+                    String::new()
+                } else {
+                    format!(".{micros:06}")
+                };
+                JsonValue::String(format!(
+                    "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}{fraction}"
+                ))
             }
         }
         Value::Time(negative, days, hour, minute, second, micros) => {
             let sign = if negative { "-" } else { "" };
             let hours = u64::from(days) * 24 + u64::from(hour);
-            let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}") };
-            JsonValue::String(format!("{sign}{hours:02}:{minute:02}:{second:02}{fraction}"))
+            let fraction = if micros == 0 {
+                String::new()
+            } else {
+                format!(".{micros:06}")
+            };
+            JsonValue::String(format!(
+                "{sign}{hours:02}:{minute:02}:{second:02}{fraction}"
+            ))
         }
     }
 }
@@ -302,7 +393,13 @@ mod tests {
     use super::*;
     #[test]
     fn temporal_values_keep_microseconds_and_mysql_duration_syntax() {
-        assert_eq!(mysql_to_json(Value::Date(2026, 10, 21, 0, 0, 0, 1)), JsonValue::String("2026-10-21 00:00:00.000001".into()));
-        assert_eq!(mysql_to_json(Value::Time(true, 2, 1, 2, 3, 456789)), JsonValue::String("-49:02:03.456789".into()));
+        assert_eq!(
+            mysql_to_json(Value::Date(2026, 10, 21, 0, 0, 0, 1)),
+            JsonValue::String("2026-10-21 00:00:00.000001".into())
+        );
+        assert_eq!(
+            mysql_to_json(Value::Time(true, 2, 1, 2, 3, 456789)),
+            JsonValue::String("-49:02:03.456789".into())
+        );
     }
 }

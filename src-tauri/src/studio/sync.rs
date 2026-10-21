@@ -1,12 +1,14 @@
 use super::catalog::object_snap;
 use super::storage::{cell_string, engine_of, profile_of};
 use super::table_data::{
-    commit_batches, ensure_complete, load_all_with_ceiling, remap_cell, BATCH, CEILING,
+    ensure_complete, load_all_with_ceiling_operation, remap_cell, BATCH, CEILING,
 };
 use super::types::{DiffResult, PairRequest, SyncResult};
 use crate::catalogdiff;
+use crate::drivers::DbSession;
 use crate::error::{AppError, AppResult};
-use crate::models::{ColumnMeta, Engine, ExecuteSqlRequest, FieldValue, RowChange};
+use crate::models::{ColumnMeta, CommitRequest, Engine, ExecuteSqlRequest, FieldValue, RowChange};
+use crate::operations::OperationContext;
 use crate::query::execute_sql;
 use crate::sqlutil::qualified_name;
 use crate::state::AppState;
@@ -14,6 +16,9 @@ use serde_json::Value as JsonValue;
 
 #[path = "type_mapping.rs"]
 mod type_mapping;
+
+#[path = "stream_sync.rs"]
+mod streaming;
 
 pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<DiffResult> {
     if request.apply && request.selected_ids.is_empty() {
@@ -119,26 +124,56 @@ pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<Diff
     })
 }
 
-pub fn transfer_rows(state: &AppState, request: &PairRequest) -> AppResult<SyncResult> {
-    transfer_with_ceiling(state, request, CEILING)
+pub fn transfer_rows_with_operation(
+    state: &AppState,
+    request: &PairRequest,
+    operation: &OperationContext,
+) -> AppResult<SyncResult> {
+    reject_same_object(state, request)?;
+    if streaming::supports_pair(state, request)? {
+        streaming::run(state, request, false, operation)
+    } else {
+        operation.report(
+            "reading",
+            0,
+            None,
+            "当前引擎使用受限读取；取消会在读取阶段结束或当前批次提交后生效",
+        );
+        transfer_legacy(state, request, CEILING, operation)
+    }
 }
 
+#[cfg(test)]
 pub(super) fn transfer_with_ceiling(
     state: &AppState,
     request: &PairRequest,
     ceiling: u32,
 ) -> AppResult<SyncResult> {
+    transfer_legacy(state, request, ceiling, &OperationContext::detached())
+}
+
+fn transfer_legacy(
+    state: &AppState,
+    request: &PairRequest,
+    ceiling: u32,
+    operation: &OperationContext,
+) -> AppResult<SyncResult> {
+    operation.checkpoint()?;
     reject_same_object(state, request)?;
-    let (columns, rows, total, hit_ceiling) = load_all_with_ceiling(
+    let source_profile = profile_of(state, &request.source_id)?;
+    let target_profile = profile_of(state, &request.target_id)?;
+    let mut target_session = state.open_isolated_session(&request.target_id)?;
+    let (columns, rows, total, hit_ceiling) = load_all_with_ceiling_operation(
         state,
         &request.source_id,
         &request.source_database,
         &request.source_schema,
         &request.source_table,
         ceiling,
+        operation,
     )?;
     ensure_complete(total, rows.len(), hit_ceiling, "数据传输")?;
-    let target_engine = engine_of(state, &request.target_id)?;
+    let target_engine = target_session.engine();
     let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
     let changes = rows
         .iter()
@@ -157,8 +192,11 @@ pub(super) fn transfer_with_ceiling(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let inserted = commit_batches(
-        state,
+    operation.checkpoint()?;
+    ensure_unchanged_profiles(state, request, &source_profile, &target_profile)?;
+    let inserted = commit_legacy_batches(
+        &mut *target_session,
+        operation,
         &request.target_id,
         &request.target_database,
         &request.target_schema,
@@ -174,31 +212,68 @@ pub(super) fn transfer_with_ceiling(
     })
 }
 
+#[cfg(test)]
 pub fn sync_rows(state: &AppState, request: &PairRequest) -> AppResult<SyncResult> {
-    sync_with_ceiling(state, request, CEILING)
+    sync_rows_with_operation(state, request, &OperationContext::detached())
 }
 
+pub fn sync_rows_with_operation(
+    state: &AppState,
+    request: &PairRequest,
+    operation: &OperationContext,
+) -> AppResult<SyncResult> {
+    reject_same_object(state, request)?;
+    if streaming::supports_pair(state, request)? {
+        streaming::run(state, request, true, operation)
+    } else {
+        operation.report(
+            "reading",
+            0,
+            None,
+            "当前引擎使用受限读取；取消会在读取阶段结束或当前批次提交后生效",
+        );
+        sync_legacy(state, request, CEILING, operation)
+    }
+}
+
+#[cfg(test)]
 pub(super) fn sync_with_ceiling(
     state: &AppState,
     request: &PairRequest,
     ceiling: u32,
 ) -> AppResult<SyncResult> {
+    sync_legacy(state, request, ceiling, &OperationContext::detached())
+}
+
+fn sync_legacy(
+    state: &AppState,
+    request: &PairRequest,
+    ceiling: u32,
+    operation: &OperationContext,
+) -> AppResult<SyncResult> {
+    operation.checkpoint()?;
     reject_same_object(state, request)?;
-    let (source_columns, source_rows, source_total, source_cap) = load_all_with_ceiling(
+    let source_profile = profile_of(state, &request.source_id)?;
+    let target_profile = profile_of(state, &request.target_id)?;
+    let mut target_session = state.open_isolated_session(&request.target_id)?;
+    let (source_columns, source_rows, source_total, source_cap) = load_all_with_ceiling_operation(
         state,
         &request.source_id,
         &request.source_database,
         &request.source_schema,
         &request.source_table,
         ceiling,
+        operation,
     )?;
-    let (target_columns, target_rows, target_total, target_cap) = load_all_with_ceiling(
+    operation.checkpoint()?;
+    let (target_columns, target_rows, target_total, target_cap) = load_all_with_ceiling_operation(
         state,
         &request.target_id,
         &request.target_database,
         &request.target_schema,
         &request.target_table,
         ceiling,
+        operation,
     )?;
     ensure_complete(
         source_total,
@@ -274,15 +349,17 @@ pub(super) fn sync_with_ceiling(
         .iter()
         .filter(|change| change.kind == "update")
         .count();
-    let target_engine = engine_of(state, &request.target_id)?;
+    let target_engine = target_session.engine();
     for change in &mut changes {
         for value in &mut change.values {
             value.value = remap_cell(target_engine, &value.value);
         }
     }
+    ensure_unchanged_profiles(state, request, &source_profile, &target_profile)?;
     if !changes.is_empty() {
-        commit_batches(
-            state,
+        commit_legacy_batches(
+            &mut *target_session,
+            operation,
             &request.target_id,
             &request.target_database,
             &request.target_schema,
@@ -300,6 +377,56 @@ pub(super) fn sync_with_ceiling(
             keys.join(", ")
         ),
     })
+}
+
+fn commit_legacy_batches(
+    session: &mut dyn DbSession,
+    operation: &OperationContext,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    changes: Vec<RowChange>,
+) -> AppResult<usize> {
+    let mut applied = 0;
+    for (index, chunk) in changes.chunks(BATCH as usize).enumerate() {
+        operation.checkpoint()?;
+        let count = crate::data::commit_changes_on_session(session, CommitRequest {
+            connection_id: connection_id.into(), database: database.into(), schema: schema.into(),
+            table: table.into(), changes: chunk.to_vec(),
+        }, operation).map_err(|err| match err {
+            cancelled @ AppError::Cancelled { .. } => cancelled,
+            other => AppError::msg(format!("第 {} 批失败；此前已提交 {} 批、{} 条更改，已提交批次不会回滚，勿重放整个任务：{other}", index + 1, index, applied)),
+        })?.applied;
+        applied += count;
+        operation.report(
+            "writing",
+            applied as u64,
+            Some(changes.len() as u64),
+            "正在分批写入，已提交批次不会自动回滚",
+        );
+        operation.checkpoint()?;
+    }
+    Ok(applied)
+}
+
+fn ensure_unchanged_profiles(
+    state: &AppState,
+    request: &PairRequest,
+    source: &crate::models::StoredProfile,
+    target: &crate::models::StoredProfile,
+) -> AppResult<()> {
+    let current_source = profile_of(state, &request.source_id)?;
+    let current_target = profile_of(state, &request.target_id)?;
+    let value = |profile: &crate::models::StoredProfile| {
+        serde_json::to_value(profile).map_err(|err| AppError::msg(err.to_string()))
+    };
+    if value(source)? != value(&current_source)? || value(target)? != value(&current_target)? {
+        return Err(AppError::msg(
+            "读取期间连接配置发生变化，已取消；没有开始写入目标",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_same_object(state: &AppState, request: &PairRequest) -> AppResult<()> {
@@ -405,12 +532,7 @@ fn compatible_keys(source: &[ColumnMeta], target: &[ColumnMeta]) -> AppResult<Ve
 
 fn key_family(data_type: &str) -> &'static str {
     let kind = data_type.to_ascii_lowercase();
-    if [
-        "int", "serial", "real", "float", "double", "numeric", "decimal", "number",
-    ]
-    .iter()
-    .any(|token| kind.contains(token))
-    {
+    if crate::sqlutil::is_numeric_type(&kind) {
         "number"
     } else if kind.contains("bool") || kind == "bit" {
         "bool"

@@ -4,6 +4,7 @@ use crate::catalogdiff;
 use crate::data::commit_changes;
 use crate::error::{AppError, AppResult};
 use crate::models::{ColumnMeta, CommitRequest, Engine, ExecuteSqlRequest, FieldValue, RowChange};
+use crate::operations::OperationContext;
 use crate::query::execute_sql;
 use crate::sqlutil::{paginate_sql, qualified_name, quote_ident};
 use crate::state::AppState;
@@ -102,34 +103,7 @@ pub(super) fn remap_cell(engine: Engine, value: &JsonValue) -> JsonValue {
     value.clone()
 }
 
-pub(super) fn commit_batches(
-    state: &AppState,
-    connection_id: &str,
-    database: &str,
-    schema: &str,
-    table: &str,
-    changes: Vec<RowChange>,
-) -> AppResult<usize> {
-    if changes.is_empty() {
-        return Ok(0);
-    }
-    let mut applied = 0;
-    for (index, chunk) in changes.chunks(BATCH as usize).enumerate() {
-        applied += commit_changes(
-            state,
-            CommitRequest {
-                connection_id: connection_id.to_string(),
-                database: database.to_string(),
-                schema: schema.to_string(),
-                table: table.to_string(),
-                changes: chunk.to_vec(),
-            },
-        ).map_err(|err| AppError::msg(format!("第 {} 批失败；此前已提交 {} 批、{} 条更改，已提交批次不会回滚，请核对目标数据后重新对比，勿直接重放整个任务：{err}", index + 1, index, applied)))?
-        .applied;
-    }
-    Ok(applied)
-}
-
+#[cfg(test)]
 pub(super) fn load_all(
     state: &AppState,
     id: &str,
@@ -140,6 +114,18 @@ pub(super) fn load_all(
     load_all_with_ceiling(state, id, database, schema, table, CEILING)
 }
 
+pub(super) fn load_all_operation(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    operation: &OperationContext,
+) -> AppResult<(Vec<ColumnMeta>, Vec<Vec<JsonValue>>, u64, bool)> {
+    load_all_with_ceiling_operation(state, id, database, schema, table, CEILING, operation)
+}
+
+#[cfg(test)]
 pub(super) fn load_all_with_ceiling(
     state: &AppState,
     id: &str,
@@ -148,18 +134,40 @@ pub(super) fn load_all_with_ceiling(
     table: &str,
     ceiling: u32,
 ) -> AppResult<(Vec<ColumnMeta>, Vec<Vec<JsonValue>>, u64, bool)> {
+    load_all_with_ceiling_operation(
+        state,
+        id,
+        database,
+        schema,
+        table,
+        ceiling,
+        &OperationContext::detached(),
+    )
+}
+
+pub(super) fn load_all_with_ceiling_operation(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    ceiling: u32,
+    operation: &OperationContext,
+) -> AppResult<(Vec<ColumnMeta>, Vec<Vec<JsonValue>>, u64, bool)> {
+    operation.checkpoint()?;
     let mut offset = 0u32;
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut total = None;
     let mut hit = false;
     loop {
+        operation.checkpoint()?;
         let limit = BATCH.min(ceiling.saturating_sub(offset));
         if limit == 0 {
             break;
         }
         let (page_columns, page_rows, page_total, page_truncated) =
-            load_range(state, id, database, schema, table, limit, offset)?;
+            load_range_operation(state, id, database, schema, table, limit, offset, operation)?;
         if total.is_some_and(|expected| expected != page_total) {
             return Err(AppError::msg(
                 "读取期间表的行数发生变化，请停止写入源表后重试",
@@ -170,8 +178,9 @@ pub(super) fn load_all_with_ceiling(
             columns = page_columns;
             // Without a unique ordering key, read once instead of using OFFSET pages.
             if !columns.iter().any(|column| column.primary_key) && page_total > u64::from(limit) {
-                let (all_columns, all_rows, final_total, truncated) =
-                    load_range(state, id, database, schema, table, ceiling, 0)?;
+                let (all_columns, all_rows, final_total, truncated) = load_range_operation(
+                    state, id, database, schema, table, ceiling, 0, operation,
+                )?;
                 if final_total != page_total {
                     return Err(AppError::msg(
                         "读取期间表的行数发生变化，请停止写入源表后重试",
@@ -190,6 +199,7 @@ pub(super) fn load_all_with_ceiling(
         let count = page_rows.len() as u32;
         rows.extend(page_rows);
         offset += count;
+        operation.report("读取表数据", u64::from(offset), total, table);
         if page_truncated {
             hit = true;
             break;
@@ -215,7 +225,7 @@ pub(super) fn ensure_complete(
     Ok(())
 }
 
-pub(super) fn load_range(
+pub(super) fn load_range_operation(
     state: &AppState,
     id: &str,
     database: &str,
@@ -223,8 +233,9 @@ pub(super) fn load_range(
     table: &str,
     limit: u32,
     offset: u32,
+    operation: &OperationContext,
 ) -> AppResult<(Vec<ColumnMeta>, Vec<Vec<JsonValue>>, u64, bool)> {
-    state.with_session(id, |session| {
+    state.with_session_operation(id, database, operation, |session| {
         if session.is_document_store() {
             let total = session.count_relation(database, schema, table)?;
             let page = session.browse_page(database, schema, table, &[], &[], limit, offset)?;

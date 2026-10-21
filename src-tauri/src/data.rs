@@ -13,6 +13,7 @@ use crate::models::{
     ExportTableRequest, FetchRowsRequest, FieldValue, FilterSpec, ImportCsvRequest, ImportResult,
     RowChange, SortSpec,
 };
+use crate::operations::OperationContext;
 use crate::sqlutil::{
     json_count, like_contains, paginate_query_sql, paginate_sql, qualified_name, split_sql,
     sql_literal, value_sql,
@@ -36,8 +37,12 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
                 page_size,
                 page_offset(page, page_size)?,
             )?;
-            let total =
-                session.count_filtered_relation(&request.database, &request.schema, &request.table, &request.filters)?;
+            let total = session.count_filtered_relation(
+                &request.database,
+                &request.schema,
+                &request.table,
+                &request.filters,
+            )?;
             return Ok(DataPage {
                 original_rows: outcome.original_rows,
                 columns: outcome.columns,
@@ -81,106 +86,172 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
 }
 
 pub fn commit_changes(state: &AppState, request: CommitRequest) -> AppResult<CommitResult> {
-    if request.changes.is_empty() {
-        return Err(AppError::msg("没有需要提交的更改"));
-    }
-    state.with_session(&request.connection_id, |session| {
-        if session.is_document_store() {
-            for (index, change) in request.changes.iter().enumerate() {
-                session
-                    .apply_mutation(&request.database, &request.schema, &request.table, change)
-                    .map_err(|err| AppError::PartialWrite { applied: index, failed_index: index + 1, detail: err.to_string() })?;
-            }
-            return Ok(CommitResult {
-                applied: request.changes.len(),
-            });
-        }
-        let engine = session.engine();
-        let columns = session.list_columns(&request.database, &request.schema, &request.table)?;
-        if session
-            .relation_kind(&request.database, &request.schema, &request.table)?
-            .as_deref()
-            == Some("view")
-        {
-            return Err(AppError::msg("视图是只读的"));
-        }
-        let statements = request
-            .changes
-            .iter()
-            .enumerate()
-            .map(|(index, change)| {
-                let compiled = compile_change(
-                    engine,
-                    &request.database,
-                    &request.schema,
-                    &request.table,
-                    &columns,
-                    change,
-                )
-                .map_err(|err| AppError::msg(format!("第 {} 条更改无效: {err}", index + 1)))?;
-                Ok(compiled.map(|sql| (sql, Some(1))))
-            })
-            .collect::<AppResult<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        let applied = session.execute_checked_transaction(&request.database, &statements)?;
-        Ok(CommitResult {
-            applied,
-        })
+    commit_changes_with_operation(state, request, &OperationContext::detached())
+}
+
+pub(crate) fn commit_changes_with_operation(
+    state: &AppState,
+    request: CommitRequest,
+    operation: &OperationContext,
+) -> AppResult<CommitResult> {
+    let id = request.connection_id.clone();
+    state.with_session_wait(&id, operation, |session| {
+        commit_changes_on_session(session, request, operation)
     })
 }
 
+pub(crate) fn commit_changes_on_session(
+    session: &mut dyn DbSession,
+    request: CommitRequest,
+    operation: &OperationContext,
+) -> AppResult<CommitResult> {
+    operation.checkpoint()?;
+    if request.changes.is_empty() {
+        return Err(AppError::msg("没有需要提交的更改"));
+    }
+
+    if session.is_document_store() {
+        for (index, change) in request.changes.iter().enumerate() {
+            operation.checkpoint()?;
+            operation.report(
+                "逐行写入",
+                index as u64,
+                Some(request.changes.len() as u64),
+                "文档库逐条提交，取消不会撤销已完成的更改",
+            );
+            session
+                .apply_mutation(&request.database, &request.schema, &request.table, change)
+                .map_err(|err| AppError::PartialWrite {
+                    applied: index,
+                    failed_index: index + 1,
+                    detail: err.to_string(),
+                })?;
+            operation.committed(1);
+        }
+        return Ok(CommitResult {
+            applied: request.changes.len(),
+        });
+    }
+    let engine = session.engine();
+    let columns = session.list_columns(&request.database, &request.schema, &request.table)?;
+    if session
+        .relation_kind(&request.database, &request.schema, &request.table)?
+        .as_deref()
+        == Some("view")
+    {
+        return Err(AppError::msg("视图是只读的"));
+    }
+    let statements = request
+        .changes
+        .iter()
+        .enumerate()
+        .map(|(index, change)| {
+            operation.checkpoint()?;
+            let compiled = compile_change(
+                engine,
+                &request.database,
+                &request.schema,
+                &request.table,
+                &columns,
+                change,
+            )
+            .map_err(|err| AppError::msg(format!("第 {} 条更改无效: {err}", index + 1)))?;
+            Ok(compiled.map(|sql| (sql, Some(1))))
+        })
+        .collect::<AppResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let applied = session.execute_checked_transaction_with_operation(
+        &request.database,
+        &statements,
+        operation,
+    )?;
+    if applied > 0 {
+        operation.committed(applied as u64);
+    }
+    Ok(CommitResult { applied })
+}
+
+#[cfg(test)]
 pub fn export_table_csv(state: &AppState, request: ExportTableRequest) -> AppResult<ExportResult> {
-    state.with_session(&request.connection_id, |session| {
-        if session.is_document_store() {
-            let total =
-                session.count_filtered_relation(&request.database, &request.schema, &request.table, &request.filters)?;
-            let outcome = session.browse_page(
+    export_table_csv_with_operation(state, request, &OperationContext::detached())
+}
+
+pub(crate) fn export_table_csv_with_operation(
+    state: &AppState,
+    request: ExportTableRequest,
+    operation: &OperationContext,
+) -> AppResult<ExportResult> {
+    operation.checkpoint()?;
+    state.with_session_operation(
+        &request.connection_id,
+        &request.database,
+        operation,
+        |session| {
+            if session.is_document_store() {
+                let total = session.count_filtered_relation(
+                    &request.database,
+                    &request.schema,
+                    &request.table,
+                    &request.filters,
+                )?;
+                let outcome = session.browse_page(
+                    &request.database,
+                    &request.schema,
+                    &request.table,
+                    &request.filters,
+                    &request.sorts,
+                    EXPORT_CAP as u32,
+                    0,
+                )?;
+                write_csv_operation(&request.path, &outcome.columns, &outcome.rows, operation)?;
+                return Ok(ExportResult {
+                    path: request.path,
+                    row_count: outcome.rows.len() as u64,
+                    truncated: total > EXPORT_CAP,
+                });
+            }
+            let engine = session.engine();
+            let plan = plan_table(
+                session,
+                engine,
                 &request.database,
                 &request.schema,
                 &request.table,
                 &request.filters,
                 &request.sorts,
-                EXPORT_CAP as u32,
-                0,
             )?;
-            write_csv(&request.path, &outcome.columns, &outcome.rows)?;
-            return Ok(ExportResult {
+            let count = session.execute(&request.database, &plan.count_sql, Some(1))?;
+            let total = count
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(json_count)
+                .unwrap_or(0);
+            let sql = paginate_sql(engine, &plan.select_body, EXPORT_CAP as u32, 0);
+            let outcome = session.execute(&request.database, &sql, Some(EXPORT_CAP as usize))?;
+            write_csv_operation(&request.path, &plan.columns, &outcome.rows, operation)?;
+            Ok(ExportResult {
                 path: request.path,
                 row_count: outcome.rows.len() as u64,
-                truncated: total > EXPORT_CAP,
-            });
-        }
-        let engine = session.engine();
-        let plan = plan_table(
-            session,
-            engine,
-            &request.database,
-            &request.schema,
-            &request.table,
-            &request.filters,
-            &request.sorts,
-        )?;
-        let count = session.execute(&request.database, &plan.count_sql, Some(1))?;
-        let total = count
-            .rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(json_count)
-            .unwrap_or(0);
-        let sql = paginate_sql(engine, &plan.select_body, EXPORT_CAP as u32, 0);
-        let outcome = session.execute(&request.database, &sql, Some(EXPORT_CAP as usize))?;
-        write_csv(&request.path, &plan.columns, &outcome.rows)?;
-        Ok(ExportResult {
-            path: request.path,
-            row_count: outcome.rows.len() as u64,
-            truncated: outcome.truncated || total > outcome.rows.len() as u64,
-        })
-    })
+                truncated: outcome.truncated || total > outcome.rows.len() as u64,
+            })
+        },
+    )
 }
 
+#[cfg(test)]
 pub fn export_sql_csv(state: &AppState, request: ExportSqlRequest) -> AppResult<ExportResult> {
+    export_sql_csv_with_operation(state, request, &OperationContext::detached())
+}
+
+pub(crate) fn export_sql_csv_with_operation(
+    state: &AppState,
+    request: ExportSqlRequest,
+    operation: &OperationContext,
+) -> AppResult<ExportResult> {
+    operation.checkpoint()?;
     let statements = split_sql(&request.sql);
     if statements.len() != 1 {
         return Err(AppError::msg("一次只导出一条 SQL"));
@@ -189,10 +260,15 @@ pub fn export_sql_csv(state: &AppState, request: ExportSqlRequest) -> AppResult<
     if !crate::sqlutil::is_read_query(sql) {
         return Err(AppError::msg("SQL 导出仅接受 SELECT 或只读 CTE 查询；写语句和含写操作的 CTE 已拒绝，避免导出时再次修改数据库"));
     }
-    state.with_session(&request.connection_id, |session| {
-        let read_limit = EXPORT_CAP as usize + 1;
-        let mut outcome =
-            if let Some(paged) = paginate_query_sql(session.engine(), sql, read_limit as u32, 0) {
+    state.with_session_operation(
+        &request.connection_id,
+        &request.database,
+        operation,
+        |session| {
+            let read_limit = EXPORT_CAP as usize + 1;
+            let mut outcome = if let Some(paged) =
+                paginate_query_sql(session.engine(), sql, read_limit as u32, 0)
+            {
                 match session.execute(&request.database, &paged, Some(read_limit)) {
                     Ok(outcome) => outcome,
                     Err(err) => return Err(err),
@@ -200,30 +276,43 @@ pub fn export_sql_csv(state: &AppState, request: ExportSqlRequest) -> AppResult<
             } else {
                 session.execute(&request.database, sql, Some(read_limit))?
             };
-        if outcome.columns.is_empty() {
-            return Err(AppError::msg("该语句没有可导出的结果集"));
-        }
-        let truncated = outcome.truncated || outcome.rows.len() as u64 > EXPORT_CAP;
-        outcome.rows.truncate(EXPORT_CAP as usize);
-        write_csv(&request.path, &outcome.columns, &outcome.rows)?;
-        Ok(ExportResult {
-            path: request.path,
-            row_count: outcome.rows.len() as u64,
-            truncated,
-        })
-    })
+            if outcome.columns.is_empty() {
+                return Err(AppError::msg("该语句没有可导出的结果集"));
+            }
+            let truncated = outcome.truncated || outcome.rows.len() as u64 > EXPORT_CAP;
+            outcome.rows.truncate(EXPORT_CAP as usize);
+            write_csv_operation(&request.path, &outcome.columns, &outcome.rows, operation)?;
+            Ok(ExportResult {
+                path: request.path,
+                row_count: outcome.rows.len() as u64,
+                truncated,
+            })
+        },
+    )
 }
 
+#[cfg(test)]
 pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResult<ImportResult> {
+    import_table_csv_with_operation(state, request, &OperationContext::detached())
+}
+
+pub(crate) fn import_table_csv_with_operation(
+    state: &AppState,
+    request: ImportCsvRequest,
+    operation: &OperationContext,
+) -> AppResult<ImportResult> {
+    operation.checkpoint()?;
     let meta =
         fs::metadata(&request.path).map_err(|err| AppError::msg(format!("无法读取 CSV: {err}")))?;
     if meta.len() > IMPORT_BYTES {
         return Err(AppError::msg("CSV 超过 50MB"));
     }
-    let file = fs::File::open(&request.path).map_err(|err| AppError::msg(format!("无法读取 CSV: {err}")))?;
-    let (headers, records) = delimited::read(file, b',', EXPORT_CAP as usize)?;
+    let file = fs::File::open(&request.path)
+        .map_err(|err| AppError::msg(format!("无法读取 CSV: {err}")))?;
+    let (headers, records) =
+        delimited::read_with_operation(file, b',', EXPORT_CAP as usize, operation)?;
 
-    state.with_session(&request.connection_id, |session| {
+    state.with_session_wait(&request.connection_id, operation, |session| {
         let engine = session.engine();
         let columns = session.list_columns(&request.database, &request.schema, &request.table)?;
         if session
@@ -256,6 +345,15 @@ pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResul
             statements.push(format!("DELETE FROM {table_sql}"));
         }
         for (index, record) in records.iter().enumerate() {
+            operation.checkpoint()?;
+            if index % 500 == 0 {
+                operation.report(
+                    "校验导入",
+                    index as u64,
+                    Some(records.len() as u64),
+                    "完整校验后才开始事务",
+                );
+            }
             let values = record
                 .iter()
                 .enumerate()
@@ -288,7 +386,8 @@ pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResul
             }
         }
         // Validate the entire file, including binary values, before DELETE or INSERT.
-        session.execute_transaction(&request.database, &statements)?;
+        session.execute_transaction_with_operation(&request.database, &statements, operation)?;
+        operation.committed(records.len() as u64);
         Ok(ImportResult {
             inserted: records.len() as u64,
         })
@@ -485,6 +584,21 @@ fn compile_change(
     }
 }
 
+pub(crate) fn validate_changes(
+    engine: Engine,
+    database: &str,
+    schema: &str,
+    table: &str,
+    columns: &[ColumnMeta],
+    changes: &[RowChange],
+) -> AppResult<()> {
+    for (index, change) in changes.iter().enumerate() {
+        compile_change(engine, database, schema, table, columns, change)
+            .map_err(|error| AppError::msg(format!("第 {} 条更改无效：{error}", index + 1)))?;
+    }
+    Ok(())
+}
+
 fn ensure_pk(columns: &[ColumnMeta], pk: &[FieldValue]) -> AppResult<()> {
     let expected: BTreeSet<&str> = columns
         .iter()
@@ -519,9 +633,18 @@ fn pk_predicate(engine: Engine, columns: &[ColumnMeta], pk: &[FieldValue]) -> Ap
 }
 
 fn edit_predicate(engine: Engine, columns: &[ColumnMeta], change: &RowChange) -> AppResult<String> {
-    let original = change.original.as_ref().ok_or_else(|| AppError::msg("缺少读取时的原始行，无法检查并发冲突；请刷新后重试"))?;
-    let names = original.iter().map(|field| field.column.as_str()).collect::<BTreeSet<_>>();
-    let expected = columns.iter().map(|column| column.name.as_str()).collect::<BTreeSet<_>>();
+    let original = change
+        .original
+        .as_ref()
+        .ok_or_else(|| AppError::msg("缺少读取时的原始行，无法检查并发冲突；请刷新后重试"))?;
+    let names = original
+        .iter()
+        .map(|field| field.column.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<BTreeSet<_>>();
     if names != expected || original.len() != columns.len() {
         return Err(AppError::msg("原始行字段与当前结构不一致，请刷新后重试"));
     }
@@ -537,9 +660,18 @@ fn edit_predicate(engine: Engine, columns: &[ColumnMeta], change: &RowChange) ->
             // engines. Compare their canonical textual representation.
             let kind = column.data_type.to_ascii_lowercase();
             let predicate = match engine {
-                Engine::Postgres if matches!(kind.as_str(), "json" | "xml") => format!("CAST({ident} AS TEXT) = {literal}"),
-                Engine::Mssql if matches!(kind.as_str(), "text" | "ntext" | "xml") => format!("CAST({ident} AS NVARCHAR(MAX)) = {literal}"),
-                Engine::Mysql | Engine::Mariadb if !crate::sqlutil::is_numeric_type(&kind) && !crate::sqlutil::is_binary_type(&kind) => format!("BINARY {ident} = BINARY {literal}"),
+                Engine::Postgres if matches!(kind.as_str(), "json" | "xml") => {
+                    format!("CAST({ident} AS TEXT) = {literal}")
+                }
+                Engine::Mssql if matches!(kind.as_str(), "text" | "ntext" | "xml") => {
+                    format!("CAST({ident} AS NVARCHAR(MAX)) = {literal}")
+                }
+                Engine::Mysql | Engine::Mariadb
+                    if !crate::sqlutil::is_numeric_type(&kind)
+                        && !crate::sqlutil::is_binary_type(&kind) =>
+                {
+                    format!("BINARY {ident} = BINARY {literal}")
+                }
                 _ => format!("{ident} = {literal}"),
             };
             parts.push(predicate);
@@ -565,7 +697,11 @@ fn literal_for_column(engine: Engine, column: &ColumnMeta, raw: &str) -> AppResu
             return sql_literal(engine, &JsonValue::Bool(false));
         }
     }
-    value_sql(engine, &column.data_type, &JsonValue::String(raw.to_string()))
+    value_sql(
+        engine,
+        &column.data_type,
+        &JsonValue::String(raw.to_string()),
+    )
 }
 
 fn is_blank(value: &JsonValue) -> bool {
@@ -577,21 +713,40 @@ fn is_bool_type(data_type: &str) -> bool {
     data_type.starts_with("bool")
 }
 
-fn write_csv(path: &str, columns: &[ColumnMeta], rows: &[Vec<JsonValue>]) -> AppResult<()> {
+fn write_csv_operation(
+    path: &str,
+    columns: &[ColumnMeta],
+    rows: &[Vec<JsonValue>],
+    operation: &OperationContext,
+) -> AppResult<()> {
+    use std::io::Write;
+    operation.checkpoint()?;
     if path.trim().is_empty() {
         return Err(AppError::msg("请选择导出路径"));
     }
-    let path = Path::new(path);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|err| AppError::msg(format!("无法创建目录: {err}")))?;
-        }
-    }
-    let mut buffer = vec![0xEF, 0xBB, 0xBF];
-    let names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
-    delimited::write(&mut buffer, &names, rows, b',')?;
-    fs::write(path, buffer).map_err(|err| AppError::msg(format!("写入 CSV 失败: {err}")))?;
+    let output = crate::operations::AtomicOutput::new(Path::new(path))?;
+    let file = fs::File::create(output.path()).map_err(|err| AppError::msg(err.to_string()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer
+        .write_all(&[0xEF, 0xBB, 0xBF])
+        .map_err(|err| AppError::msg(err.to_string()))?;
+    let names = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    delimited::write_with_operation(&mut writer, &names, rows, b',', operation)?;
+    writer
+        .flush()
+        .map_err(|err| AppError::msg(err.to_string()))?;
+    drop(writer);
+    operation.checkpoint()?;
+    output.commit()?;
+    operation.report(
+        "文件已保存",
+        rows.len() as u64,
+        Some(rows.len() as u64),
+        path,
+    );
     Ok(())
 }
 

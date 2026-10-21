@@ -1,6 +1,8 @@
 import { App, Alert, Button, Space, Switch } from "antd";
 import { useState } from "react";
 import { api, type SyncResult } from "../../api";
+import { useLongOperation } from "../../operations";
+import { TaskProgress } from "../TaskProgress";
 import { ConnFields, objectLabel, pairRequest, useDestructiveConfirm, useOperation, useProfiles, type ObjectSelection } from "./shared";
 
 function changesExistingStructure(statement: { kind: string }) {
@@ -87,6 +89,7 @@ export function DataSync() {
   const [result, setResult] = useState<SyncResult | null>(null);
   const profiles = useProfiles();
   const { busy, run } = useOperation();
+  const task = useLongOperation();
   const confirm = useDestructiveConfirm();
   const ready = !!source.id && !!source.table && !!target.id && !!target.table;
 
@@ -98,7 +101,7 @@ export function DataSync() {
       }
       setResult(null);
       const request = { ...pairRequest(source, target), deleteMissing: sync && deleteMissing };
-      setResult(await (sync ? api.syncRows(request) : api.transferRows(request)));
+      setResult(await task.execute(sync ? "全量数据同步" : "数据传输", (operationId) => sync ? api.syncRows(request, operationId) : api.transferRows(request, operationId)));
     });
   }
 
@@ -116,6 +119,7 @@ export function DataSync() {
         <Button disabled={!!busy || !ready} loading={busy === "transfer"} onClick={() => void transfer(false)}>传输插入</Button>
         <Button type="primary" disabled={!!busy || !ready} loading={busy === "sync"} onClick={() => void transfer(true)}>按主键同步</Button>
       </Space>
+      <TaskProgress task={task} />
       {result && <Alert type={result.truncated ? "warning" : "success"} showIcon message={`${result.truncated ? "仅处理了部分数据：" : ""}插入 ${result.inserted}，更新 ${result.updated}，删除 ${result.deleted}。`} description={result.note} />}
     </div>
   );

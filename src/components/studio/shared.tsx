@@ -1,6 +1,6 @@
 import { App, Input, Select, Space, Table } from "antd";
 import { useRef, useState } from "react";
-import { errorText, type GridResult, type PairRequest } from "../../api";
+import { errorText, isOperationCancelled, type GridResult, type PairRequest } from "../../api";
 import { engineLabel } from "../../engines";
 import { useConnectionStore } from "../../stores/useConnectionStore";
 import { type ConnectionPublic, type JsonValue } from "../../types";
@@ -81,7 +81,7 @@ export function useOperation() {
     try {
       await action();
     } catch (error) {
-      message.error(errorText(error));
+      if (!isOperationCancelled(error)) message.error(errorText(error));
     } finally {
       active.current = false;
       setBusy(null);

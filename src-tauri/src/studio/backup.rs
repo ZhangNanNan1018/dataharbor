@@ -1,9 +1,10 @@
 use super::storage::{engine_of, profile_of};
-use super::table_data::{ensure_complete, load_all_with_ceiling, CEILING};
+use super::table_data::{ensure_complete, load_all_with_ceiling_operation, CEILING};
 use super::types::{BackupRequest, FileExportResult, RestoreRequest};
 use crate::error::{AppError, AppResult};
 use crate::models::{Engine, ExecuteSqlRequest, StoredProfile};
-use crate::query::execute_sql;
+use crate::operations::OperationContext;
+use crate::query::execute_sql_with_operation;
 use crate::sqlutil::{qualified_name, quote_ident, sql_literal, value_sql};
 use crate::state::AppState;
 use serde_json::Value as JsonValue;
@@ -14,18 +15,37 @@ use std::path::Path;
 const MAX_STATEMENT_BYTES: usize = 20 * 1024 * 1024;
 
 pub fn backup_sql(state: &AppState, request: &BackupRequest) -> AppResult<FileExportResult> {
-    backup_with_ceiling(state, request, CEILING)
+    backup_sql_with_operation(state, request, &OperationContext::detached())
 }
 
+pub fn backup_sql_with_operation(
+    state: &AppState,
+    request: &BackupRequest,
+    operation: &OperationContext,
+) -> AppResult<FileExportResult> {
+    backup_with_ceiling_operation(state, request, CEILING, operation)
+}
+
+#[cfg(test)]
 pub(super) fn backup_with_ceiling(
     state: &AppState,
     request: &BackupRequest,
     ceiling: u32,
 ) -> AppResult<FileExportResult> {
+    backup_with_ceiling_operation(state, request, ceiling, &OperationContext::detached())
+}
+
+fn backup_with_ceiling_operation(
+    state: &AppState,
+    request: &BackupRequest,
+    ceiling: u32,
+    operation: &OperationContext,
+) -> AppResult<FileExportResult> {
+    operation.checkpoint()?;
     let engine = engine_of(state, &request.connection_id)?;
     let mode = request.mode.to_ascii_lowercase();
     if mode != "builtin" {
-        if let Some(result) = try_native_backup(state, request, engine)? {
+        if let Some(result) = try_native_backup(state, request, engine, operation)? {
             return Ok(result);
         }
         if mode == "native" {
@@ -42,9 +62,12 @@ pub(super) fn backup_with_ceiling(
             "文档库请用 JSON 导出。逻辑备份目前覆盖 SQL 引擎。",
         ));
     }
-    let tables = state.with_session(&request.connection_id, |session| {
-        session.list_tables(&request.database, &request.schema)
-    })?;
+    let tables = state.with_session_operation(
+        &request.connection_id,
+        &request.database,
+        operation,
+        |session| session.list_tables(&request.database, &request.schema),
+    )?;
     let (kind, note) = if engine == Engine::Sqlite {
         ("sqlite-script", "SQLite 表结构和数据脚本；不含独立索引、视图和触发器。读取期间需停止写入，本脚本不提供一致性快照。")
     } else {
@@ -63,9 +86,14 @@ pub(super) fn backup_with_ceiling(
         }
     }
     let _cleanup = Cleanup(temporary.clone());
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut output_options = fs::OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        output_options.mode(0o600);
+    }
+    let file = output_options
         .open(&temporary)
         .map_err(|err| AppError::msg(err.to_string()))?;
     let mut writer = std::io::BufWriter::new(file);
@@ -73,14 +101,22 @@ pub(super) fn backup_with_ceiling(
         .write_all(header.as_bytes())
         .map_err(|err| AppError::msg(err.to_string()))?;
     let mut count = 0u64;
-    for table in &tables {
-        let (columns, rows, total, truncated) = load_all_with_ceiling(
+    for (table_index, table) in tables.iter().enumerate() {
+        operation.checkpoint()?;
+        operation.report(
+            "读取备份表",
+            table_index as u64,
+            Some(tables.len() as u64),
+            &format!("正在读取 {table}；取消不会替换旧备份"),
+        );
+        let (columns, rows, total, truncated) = load_all_with_ceiling_operation(
             state,
             &request.connection_id,
             &request.database,
             &request.schema,
             table,
             ceiling,
+            operation,
         )?;
         ensure_complete(
             total,
@@ -91,16 +127,21 @@ pub(super) fn backup_with_ceiling(
         let name = qualified_name(engine, &request.database, &request.schema, table)?;
         writeln!(writer, "-- {name}").map_err(|err| AppError::msg(err.to_string()))?;
         if engine == Engine::Sqlite {
-            let outcome = state.with_session(&request.connection_id, |session| {
-                session.execute(
-                    &request.database,
-                    &format!(
-                        "SELECT sql FROM sqlite_master WHERE name = {}",
-                        sql_literal(Engine::Sqlite, &JsonValue::String(table.clone()))?
-                    ),
-                    Some(1),
-                )
-            })?;
+            let outcome = state.with_session_operation(
+                &request.connection_id,
+                &request.database,
+                operation,
+                |session| {
+                    session.execute(
+                        &request.database,
+                        &format!(
+                            "SELECT sql FROM sqlite_master WHERE name = {}",
+                            sql_literal(Engine::Sqlite, &JsonValue::String(table.clone()))?
+                        ),
+                        Some(1),
+                    )
+                },
+            )?;
             let definition = outcome
                 .rows
                 .first()
@@ -114,7 +155,16 @@ pub(super) fn backup_with_ceiling(
             .map(|column| quote_ident(engine, &column.name))
             .collect::<AppResult<Vec<_>>>()?
             .join(", ");
-        for row in &rows {
+        for (row_index, row) in rows.iter().enumerate() {
+            operation.checkpoint()?;
+            if row_index % 500 == 0 {
+                operation.report(
+                    "写入备份（行）",
+                    row_index as u64,
+                    Some(total),
+                    &format!("{table}，临时文件尚未替换目标"),
+                );
+            }
             let values = row
                 .iter()
                 .zip(&columns)
@@ -133,6 +183,7 @@ pub(super) fn backup_with_ceiling(
         .flush()
         .map_err(|err| AppError::msg(err.to_string()))?;
     drop(writer);
+    operation.checkpoint()?;
     fs::rename(temporary, &request.path).map_err(|err| AppError::msg(err.to_string()))?;
     Ok(FileExportResult {
         path: request.path.clone(),
@@ -153,7 +204,17 @@ fn write_statement(writer: &mut impl Write, statement: &str) -> AppResult<()> {
         .map_err(|err| AppError::msg(err.to_string()))
 }
 
+#[cfg(test)]
 pub fn restore_sql(state: &AppState, request: &RestoreRequest) -> AppResult<String> {
+    restore_sql_with_operation(state, request, &OperationContext::detached())
+}
+
+pub fn restore_sql_with_operation(
+    state: &AppState,
+    request: &RestoreRequest,
+    operation: &OperationContext,
+) -> AppResult<String> {
+    operation.checkpoint()?;
     let engine = engine_of(state, &request.connection_id)?;
     let mut header = [0; 256];
     let length = fs::File::open(&request.path).and_then(|mut file| file.read(&mut header));
@@ -166,7 +227,7 @@ pub fn restore_sql(state: &AppState, request: &RestoreRequest) -> AppResult<Stri
             && !head.starts_with(&[0xEF, 0xBB, 0xBF])
         {
             let sql = crate::native::mssql_restore_sql(&request.database, &request.path);
-            let response = execute_sql(
+            let response = execute_sql_with_operation(
                 state,
                 ExecuteSqlRequest {
                     connection_id: request.connection_id.clone(),
@@ -176,6 +237,7 @@ pub fn restore_sql(state: &AppState, request: &RestoreRequest) -> AppResult<Stri
                     page_size: 5,
                     only_statement: None,
                 },
+                operation,
             )?;
             if let Some(failed) = response.statements.iter().find(|item| !item.ok) {
                 return Err(AppError::msg(
@@ -203,37 +265,188 @@ pub fn restore_sql(state: &AppState, request: &RestoreRequest) -> AppResult<Stri
             request,
             engine,
             header[..length].starts_with(b"PGDMP"),
+            operation,
         );
     }
-    // Preflight all lexical boundaries before a potentially destructive first statement.
-    // The file is streamed twice; memory is bounded by one statement, not total file size.
-    visit_sql_file(Path::new(&request.path), |_| Ok(()))?;
-    state.with_session(&request.connection_id, |session| {
-        let mut applied = 0usize;
-        visit_sql_file(Path::new(&request.path), |sql| {
-            session
-                .execute(&request.database, sql, Some(0))
-                .map_err(|err| {
-                    AppError::msg(format!(
-                        "还原在第 {} 条语句失败；前 {applied} 条可能已生效：{err}",
-                        applied + 1
-                    ))
-                })?;
-            applied += 1;
+    // Validate every statement before applying the first one. Cancellation during
+    // this phase cannot have database side effects.
+    let mut total = 0u64;
+    visit_sql_file_with_operation(
+        Path::new(&request.path),
+        operation,
+        "预检还原脚本（字节）",
+        |_| {
+            total += 1;
             Ok(())
-        })?;
-        Ok(format!("已执行 {applied} 条语句"))
-    })
+        },
+    )?;
+    operation.checkpoint()?;
+    let mut applied = 0u64;
+    // Restore has its own connection. Dropping it on cancellation rolls back
+    // open transactions without touching transactions in an editor tab.
+    let mut session = state.open_isolated_session(&request.connection_id)?;
+    let mut transaction = RestoreTransaction::Auto;
+    visit_sql_file_with_operation(Path::new(&request.path), operation, "", |sql| {
+        operation.report(
+            "执行还原（语句）",
+            applied,
+            Some(total),
+            "已执行语句不等于已提交；取消会关闭本次还原连接，已确认提交之外的复杂脚本结果仍需核对",
+        );
+        operation.checkpoint()?;
+        let interrupt = operation.bind_interrupt(session.cancel_handle(&request.database)?)?;
+        let result = session.execute(&request.database, sql, Some(0));
+        drop(interrupt);
+        if let Err(error) = result {
+            if operation.cancel_requested() {
+                return Err(operation.cancel_error());
+            }
+            return Err(AppError::msg(format!("还原在第 {} 条语句失败；前 {applied} 条已执行，未提交事务将随连接关闭回滚，已提交部分需核对：{error}", applied + 1)));
+        }
+        applied += 1;
+        if let Some(committed) = transaction.observe(sql, engine) {
+            if committed > 0 {
+                operation.committed(committed);
+            }
+        }
+        operation.report(
+            "执行还原（语句）",
+            applied,
+            Some(total),
+            "已提交量按可确认提交的写语句计；读取和未提交语句不计入，复杂脚本副作用需核对",
+        );
+        operation.checkpoint()
+    })?;
+    Ok(format!("已执行 {applied} 条语句"))
 }
 
-fn visit_sql_file(path: &Path, mut visit: impl FnMut(&str) -> AppResult<()>) -> AppResult<()> {
+#[derive(Debug)]
+enum RestoreTransaction {
+    Auto,
+    Open(u64),
+    Unknown,
+}
+impl RestoreTransaction {
+    fn observe(&mut self, sql: &str, engine: Engine) -> Option<u64> {
+        let head = crate::sqlutil::strip_leading_comments(sql).to_ascii_uppercase();
+        let words = head.split_whitespace().collect::<Vec<_>>();
+        let first = words.first().copied().unwrap_or("");
+        if matches!(self, Self::Unknown) {
+            return None;
+        }
+        if first == "BEGIN"
+            && words
+                .get(1)
+                .is_none_or(|word| matches!(*word, "TRAN" | "TRANSACTION" | "WORK"))
+            || first == "START" && words.get(1) == Some(&"TRANSACTION")
+        {
+            // Nested BEGIN differs across engines (warning, implicit commit,
+            // or transaction depth). Do not guess which writes became durable.
+            *self = if matches!(self, Self::Auto) {
+                Self::Open(0)
+            } else {
+                Self::Unknown
+            };
+            return None;
+        }
+        if matches!(first, "COMMIT" | "END") {
+            if words.contains(&"PREPARED") {
+                *self = Self::Unknown;
+                return None;
+            }
+            let completed = match self {
+                Self::Open(count) => Some(*count),
+                _ => None,
+            };
+            *self = if words.contains(&"CHAIN") && !words.contains(&"NO") {
+                Self::Open(0)
+            } else {
+                Self::Auto
+            };
+            return completed;
+        }
+        if first == "ROLLBACK" {
+            *self = if words.iter().skip(1).any(|word| {
+                !matches!(
+                    *word,
+                    "WORK" | "TRAN" | "TRANSACTION" | "AND" | "NO" | "CHAIN"
+                )
+            }) {
+                Self::Unknown
+            } else if words.contains(&"CHAIN") && !words.contains(&"NO") {
+                Self::Open(0)
+            } else {
+                Self::Auto
+            };
+            return None;
+        }
+        let ddl = matches!(
+            first,
+            "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE"
+        );
+        if matches!(
+            first,
+            "SET" | "SAVE" | "SAVEPOINT" | "RELEASE" | "CALL" | "EXEC" | "EXECUTE" | "DO" | "BEGIN"
+        ) || ddl
+            && matches!(
+                engine,
+                Engine::Mysql | Engine::Mariadb | Engine::Oracle | Engine::Dameng
+            )
+            && matches!(self, Self::Open(_))
+        {
+            // Session modes, procedures and implicit-commit DDL cannot be
+            // accounted for reliably by a lightweight script dispatcher.
+            *self = Self::Unknown;
+            return None;
+        }
+        let mutation = ddl || matches!(first, "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "MERGE");
+        if !mutation {
+            return None;
+        }
+        match self {
+            Self::Auto => Some(1),
+            Self::Open(pending) => {
+                *pending += 1;
+                None
+            }
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn visit_sql_file(path: &Path, visit: impl FnMut(&str) -> AppResult<()>) -> AppResult<()> {
+    visit_sql_file_with_operation(path, &OperationContext::detached(), "", visit)
+}
+
+fn visit_sql_file_with_operation(
+    path: &Path,
+    operation: &OperationContext,
+    phase: &str,
+    mut visit: impl FnMut(&str) -> AppResult<()>,
+) -> AppResult<()> {
+    operation.checkpoint()?;
+    let total_bytes = fs::metadata(path)
+        .map_err(|err| AppError::msg(err.to_string()))?
+        .len();
+    let mut completed_bytes = 0u64;
     let mut file = fs::File::open(path).map_err(|err| AppError::msg(err.to_string()))?;
     let mut pending = Vec::new();
     let mut chunk = [0; 64 * 1024];
     loop {
+        operation.checkpoint()?;
         let read = file
             .read(&mut chunk)
             .map_err(|err| AppError::msg(err.to_string()))?;
+        completed_bytes += read as u64;
+        if !phase.is_empty() {
+            operation.report(
+                phase,
+                completed_bytes,
+                Some(total_bytes),
+                "完整校验完成前不会执行语句",
+            );
+        }
         pending.extend_from_slice(&chunk[..read]);
         let valid_length = match std::str::from_utf8(&pending) {
             Ok(_) => pending.len(),
@@ -250,6 +463,7 @@ fn visit_sql_file(path: &Path, mut visit: impl FnMut(&str) -> AppResult<()>) -> 
                         "单条 SQL 超过 20MB，请使用数据库原生恢复工具",
                     ));
                 }
+                operation.checkpoint()?;
                 visit(&sql)?;
             }
             pending.drain(..prefix);
@@ -271,6 +485,7 @@ fn visit_sql_file(path: &Path, mut visit: impl FnMut(&str) -> AppResult<()>) -> 
                 return Err(AppError::msg("SQL 文件包含未闭合的引号或注释，已停止还原"));
             }
             for sql in crate::sqlutil::split_sql(tail) {
+                operation.checkpoint()?;
                 visit(&sql)?;
             }
             return Ok(());
@@ -306,6 +521,7 @@ fn restore_native(
     request: &RestoreRequest,
     engine: Engine,
     custom: bool,
+    operation: &OperationContext,
 ) -> AppResult<String> {
     let profile = profile_of(state, &request.connection_id)?;
     validate_native_profile(&profile)?;
@@ -334,7 +550,11 @@ fn restore_native(
                 )
             } else {
                 let script = secret_path(state, "sql");
-                crate::native::prepare_pg_script(Path::new(&request.path), Path::new(&script))?;
+                crate::native::prepare_pg_script_with_operation(
+                    Path::new(&request.path),
+                    Path::new(&script),
+                    operation,
+                )?;
                 let mut plan = crate::native::pg_restore_plan(
                     &profile.host,
                     port,
@@ -375,22 +595,32 @@ fn restore_native(
         }
         _ => return Err(AppError::msg("此引擎不支持该原生恢复格式")),
     };
-    crate::native::run_plan(&plan)
+    crate::native::run_plan_with_operation(&plan, operation)
 }
 
-pub fn convert_backup(source: &str, destination: &str) -> AppResult<String> {
-    crate::native::convert_dump_to_sql(Path::new(source), Path::new(destination))
+pub fn convert_backup_with_operation(
+    source: &str,
+    destination: &str,
+    operation: &OperationContext,
+) -> AppResult<String> {
+    crate::native::convert_dump_to_sql_with_operation(
+        Path::new(source),
+        Path::new(destination),
+        operation,
+    )
 }
 
 fn try_native_backup(
     state: &AppState,
     request: &BackupRequest,
     engine: Engine,
+    operation: &OperationContext,
 ) -> AppResult<Option<FileExportResult>> {
+    operation.checkpoint()?;
     let profile = profile_of(state, &request.connection_id)?;
     if engine == Engine::Mssql {
         let sql = crate::native::mssql_backup_sql(&request.database, &request.path);
-        let response = execute_sql(
+        let response = execute_sql_with_operation(
             state,
             ExecuteSqlRequest {
                 connection_id: request.connection_id.clone(),
@@ -400,6 +630,7 @@ fn try_native_backup(
                 page_size: 5,
                 only_statement: None,
             },
+            operation,
         )?;
         if let Some(failed) = response.statements.iter().find(|item| !item.ok) {
             return Err(AppError::msg(
@@ -490,7 +721,8 @@ fn try_native_backup(
         }
         _ => return Ok(None),
     };
-    crate::native::run_plan(&plan)?;
+    crate::native::run_plan_with_operation(&plan, operation)?;
+    operation.checkpoint()?;
     fs::rename(temporary, &request.path)
         .map_err(|err| AppError::msg(format!("原生备份已生成，但替换目标文件失败：{err}")))?;
     Ok(Some(FileExportResult {
@@ -669,5 +901,177 @@ mod tests {
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("''escaped''"));
         assert!(statements[1].contains("$tag$semicolon;文本$tag$"));
+    }
+
+    #[test]
+    fn precancelled_backup_does_not_replace_existing_artifact() {
+        let fixture = Fixture::new();
+        let id = fixture.database("source");
+        let destination = fixture.directory.join("existing.sql");
+        fs::write(&destination, "previous backup").unwrap();
+        let operation = OperationContext::detached();
+        operation.request_cancel().unwrap();
+        let result = backup_sql_with_operation(
+            &fixture.state,
+            &BackupRequest {
+                connection_id: id,
+                database: "main".into(),
+                schema: String::new(),
+                path: destination.display().to_string(),
+                mode: "builtin".into(),
+            },
+            &operation,
+        );
+        assert!(matches!(result, Err(AppError::Cancelled { .. })));
+        assert_eq!(fs::read_to_string(destination).unwrap(), "previous backup");
+        assert!(fs::read_dir(&fixture.directory).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "tmp")));
+    }
+
+    #[test]
+    fn cancelled_restore_preserves_completed_statements_and_skips_later_writes() {
+        let fixture = Fixture::new();
+        let id = fixture.database("target");
+        let path = fixture.directory.join("cancel.sql");
+        fs::write(&path, "-- DataHarbor fixture\nCREATE TABLE items(id INTEGER PRIMARY KEY); INSERT INTO items VALUES(1); WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n; INSERT INTO items VALUES(2);").unwrap();
+        let operation = OperationContext::detached();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                restore_sql_with_operation(
+                    &fixture.state,
+                    &RestoreRequest {
+                        connection_id: id.clone(),
+                        database: "main".into(),
+                        path: path.display().to_string(),
+                    },
+                    &operation,
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let progress = operation.snapshot();
+                if progress.committed == 2 && progress.interruptible {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restore did not reach the long statement"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            operation.request_cancel().unwrap();
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(AppError::Cancelled {
+                    committed: 2,
+                    batches: 2
+                })
+            ));
+        });
+        let rows = fixture
+            .state
+            .with_session(&id, |session| {
+                session.execute("main", "SELECT id FROM items ORDER BY id", None)
+            })
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![json!(1)]]);
+    }
+
+    #[test]
+    fn cancelled_transactional_restore_rolls_back_only_its_own_connection() {
+        let fixture = Fixture::new();
+        let id = fixture.database("transactional-target");
+        let path = fixture.directory.join("transactional.sql");
+        fs::write(&path, "-- DataHarbor fixture\nBEGIN; CREATE TABLE uncommitted(id INTEGER PRIMARY KEY); INSERT INTO uncommitted VALUES(1); WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n; COMMIT;").unwrap();
+        let operation = OperationContext::detached();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                restore_sql_with_operation(
+                    &fixture.state,
+                    &RestoreRequest {
+                        connection_id: id.clone(),
+                        database: "main".into(),
+                        path: path.display().to_string(),
+                    },
+                    &operation,
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let progress = operation.snapshot();
+                if progress.phase == "执行还原（语句）"
+                    && progress.completed == 3
+                    && progress.interruptible
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restore did not reach the transactional long statement"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            operation.request_cancel().unwrap();
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(AppError::Cancelled {
+                    committed: 0,
+                    batches: 0
+                })
+            ));
+        });
+        let tables = fixture
+            .state
+            .with_session(&id, |session| session.list_tables("main", ""))
+            .unwrap();
+        assert!(
+            tables.is_empty(),
+            "the dedicated connection must roll back unfinished DDL"
+        );
+    }
+
+    #[test]
+    fn restore_progress_only_counts_confirmed_commits() {
+        let mut tracking = RestoreTransaction::Auto;
+        assert_eq!(tracking.observe("BEGIN", Engine::Postgres), None);
+        assert_eq!(
+            tracking.observe("INSERT INTO items VALUES(1)", Engine::Postgres),
+            None
+        );
+        assert_eq!(tracking.observe("SELECT 1", Engine::Postgres), None);
+        assert_eq!(tracking.observe("COMMIT", Engine::Postgres), Some(1));
+        assert_eq!(tracking.observe("BEGIN", Engine::Postgres), None);
+        assert_eq!(
+            tracking.observe("DELETE FROM items", Engine::Postgres),
+            None
+        );
+        assert_eq!(tracking.observe("ROLLBACK", Engine::Postgres), None);
+        assert_eq!(tracking.observe("SET autocommit=0", Engine::Mysql), None);
+        assert_eq!(
+            tracking.observe("INSERT INTO items VALUES(2)", Engine::Mysql),
+            None
+        );
+        assert_eq!(tracking.observe("COMMIT", Engine::Mysql), None);
+        let mut chained = RestoreTransaction::Auto;
+        chained.observe("BEGIN", Engine::Postgres);
+        chained.observe("INSERT INTO items VALUES(1)", Engine::Postgres);
+        assert_eq!(
+            chained.observe("COMMIT AND CHAIN", Engine::Postgres),
+            Some(1)
+        );
+        assert_eq!(
+            chained.observe("INSERT INTO items VALUES(2)", Engine::Postgres),
+            None
+        );
+        assert_eq!(chained.observe("ROLLBACK", Engine::Postgres), None);
+        let mut nested = RestoreTransaction::Auto;
+        nested.observe("BEGIN TRANSACTION", Engine::Mssql);
+        nested.observe("BEGIN TRANSACTION", Engine::Mssql);
+        nested.observe("INSERT INTO items VALUES(1)", Engine::Mssql);
+        assert_eq!(nested.observe("COMMIT", Engine::Mssql), None);
     }
 }
