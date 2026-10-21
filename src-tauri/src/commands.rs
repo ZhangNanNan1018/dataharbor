@@ -223,6 +223,18 @@ pub async fn execute_sql(
 }
 
 #[tauri::command]
+pub async fn execute_read_query(
+    app: tauri::AppHandle,
+    request: ExecuteSqlRequest,
+    operation_id: Option<String>,
+) -> AppResult<ExecuteSqlResponse> {
+    run_operation(app, operation_id, move |state, operation| {
+        crate::studio::execute_read_query_with_operation(state, request, operation)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn fetch_rows(app: tauri::AppHandle, request: FetchRowsRequest) -> AppResult<DataPage> {
     run_blocking(move || {
         let state = app.state::<AppState>();

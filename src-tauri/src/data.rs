@@ -95,8 +95,31 @@ pub(crate) fn commit_changes_with_operation(
     operation: &OperationContext,
 ) -> AppResult<CommitResult> {
     let id = request.connection_id.clone();
-    state.with_session_wait(&id, operation, |session| {
+    with_write_session(state, &id, operation, |session| {
         commit_changes_on_session(session, request, operation)
+    })
+}
+
+/// Automatic writes own their transaction; they must never finish a transaction
+/// opened in the query editor on the connection's persistent session.
+fn with_write_session<T>(
+    state: &AppState,
+    id: &str,
+    operation: &OperationContext,
+    action: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
+) -> AppResult<T> {
+    operation.checkpoint()?;
+    let mut session = state.open_isolated_session(id)?;
+    operation.checkpoint()?;
+    let engine = session.engine();
+    action(&mut *session).map_err(|error| {
+        if engine == Engine::Sqlite
+            && matches!(&error, crate::error::AppError::Message(text) if text.contains("database is locked") || text.contains("database table is locked"))
+        {
+            AppError::msg(format!("SQLite 写入被其他事务锁定；请先在查询编辑器提交或回滚，或等待其他客户端释放锁。原查询事务保持不变。{error}"))
+        } else {
+            error
+        }
     })
 }
 
@@ -312,7 +335,7 @@ pub(crate) fn import_table_csv_with_operation(
     let (headers, records) =
         delimited::read_with_operation(file, b',', EXPORT_CAP as usize, operation)?;
 
-    state.with_session_wait(&request.connection_id, operation, |session| {
+    with_write_session(state, &request.connection_id, operation, |session| {
         let engine = session.engine();
         let columns = session.list_columns(&request.database, &request.schema, &request.table)?;
         if session
@@ -752,3 +775,6 @@ fn write_csv_operation(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod independent_tests;

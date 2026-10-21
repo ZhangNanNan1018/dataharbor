@@ -42,13 +42,19 @@ export function clearSqlSchema(monaco: typeof Monaco, model: Monaco.editor.IText
 }
 
 export function setSqlSchema(monaco: typeof Monaco, owner: Monaco.editor.ITextModel, next: SchemaTable[]) {
-  clearSqlSchema(monaco, owner);
+  const names = new Set(next.map((table) => table.name));
+  for (const previous of schemas.get(owner.uri.toString()) ?? []) {
+    if (!names.has(previous.name)) monaco.editor.getModel(definitionUri(monaco, owner, previous.name))?.dispose();
+  }
   schemas.set(owner.uri.toString(), next);
+  if (!owner.isDisposed()) monaco.editor.setModelMarkers(owner, "dataharbor-sql", []);
   for (const table of next) {
     const uri = definitionUri(monaco, owner, table.name);
     const body = [`-- ${table.name}`, ...(table.columnsLoaded === false ? ["-- 列信息尚未加载"] : table.columns.map((column) => `-- ${column.primaryKey ? "PK " : ""}${column.name} ${column.dataType}`)), ""].join("\n");
     const model = monaco.editor.getModel(uri);
-    if (model) model.setValue(body);
+    if (model) {
+      if (model.getValue() !== body) model.setValue(body);
+    }
     else monaco.editor.createModel(body, "sql", uri);
   }
 }

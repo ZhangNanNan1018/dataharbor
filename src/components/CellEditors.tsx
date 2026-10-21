@@ -1,17 +1,20 @@
 import { Alert, Button, Input, Modal, Space, Table } from "antd";
-import { useEffect, useState } from "react";
+import type { InputRef } from "antd";
+import { useEffect, useRef, useState } from "react";
 import { api, errorText, type ForeignKeyRef } from "../api";
 import {
   bytesToBase64,
   bytesToHex,
   cellBytes,
+  cellEditorText,
   displayCell,
   hexToBytes,
   imageMime,
   isBinaryType,
   isBoolType,
   isImageBytes,
-  parseCell,
+  parseEditedCell,
+  sameValue,
 } from "../format";
 import type { ColumnMeta, JsonValue } from "../types";
 
@@ -43,9 +46,40 @@ export function CellValue({
   const [imageOpen, setImageOpen] = useState(false);
   const [htmlOpen, setHtmlOpen] = useState(false);
   const [fkOpen, setFkOpen] = useState(false);
+  const [draft, setDraft] = useState(() => cellEditorText(value, column));
+  const [editError, setEditError] = useState("");
+  const inputRef = useRef<InputRef>(null);
   const binary = isBinaryType(column.dataType);
   const shown = displayCell(value, column.dataType);
   const open = alwaysEdit || editing;
+
+  useEffect(() => {
+    setDraft(cellEditorText(value, column));
+    setEditError("");
+    inputRef.current?.input?.setCustomValidity("");
+  }, [value, column.dataType]);
+
+  function commitValue(next: JsonValue) {
+    setDraft(cellEditorText(next, column));
+    setEditError("");
+    inputRef.current?.input?.setCustomValidity("");
+    onCommit(next);
+  }
+
+  function finishEdit(input: HTMLInputElement) {
+    if (binary || disabled) return;
+    try {
+      const next = parseEditedCell(draft, column, value);
+      if (!sameValue(next, value)) onCommit(next);
+      input.setCustomValidity("");
+      setEditError("");
+      if (!alwaysEdit) setEditing(false);
+    } catch (error) {
+      const text = errorText(error);
+      input.setCustomValidity(text);
+      setEditError(text);
+    }
+  }
 
   if (disabled || !open) {
     return (
@@ -82,20 +116,20 @@ export function CellValue({
     <>
       <div className="xb-cell-editor">
         <Input
+          ref={inputRef}
           size="small"
           autoFocus={!alwaysEdit}
-          value={alwaysEdit ? (value === null ? "" : binary ? shown : String(value)) : undefined}
-          defaultValue={alwaysEdit || value === null ? undefined : binary ? shown : shown}
+          value={binary ? shown : draft}
           placeholder={value === null ? "NULL" : ""}
           readOnly={binary}
-          onBlur={(event) => {
-            if (alwaysEdit || binary) return;
-            onCommit(parseCell(event.target.value, column, false));
-            setEditing(false);
-          }}
+          status={editError ? "error" : undefined}
+          aria-label={`${column.name} 单元格`}
+          onBlur={(event) => finishEdit(event.currentTarget)}
           onChange={(event) => {
-            if (!alwaysEdit || binary) return;
-            onCommit(parseCell(event.target.value, column, false));
+            if (binary) return;
+            event.currentTarget.setCustomValidity("");
+            setDraft(event.target.value);
+            setEditError("");
           }}
           onPressEnter={(event) => event.currentTarget.blur()}
         />
@@ -104,7 +138,7 @@ export function CellValue({
             size="small"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
-              onCommit(null);
+              commitValue(null);
               if (!alwaysEdit) setEditing(false);
             }}
           >
@@ -132,6 +166,7 @@ export function CellValue({
           )}
         </div>
       </div>
+      {editError && <div role="alert" className="text-xs text-[var(--xb-danger)]">{editError}</div>}
       {fk && (
         <FkPicker
           open={fkOpen}
@@ -140,7 +175,7 @@ export function CellValue({
           database={database}
           onClose={() => setFkOpen(false)}
           onPick={(next) => {
-            onCommit(next);
+            commitValue(next);
             setFkOpen(false);
             if (!alwaysEdit) setEditing(false);
           }}
@@ -151,7 +186,7 @@ export function CellValue({
         value={value}
         onClose={() => setHexOpen(false)}
         onSave={(next) => {
-          onCommit(next);
+          commitValue(next);
           setHexOpen(false);
           if (!alwaysEdit) setEditing(false);
         }}
@@ -161,7 +196,7 @@ export function CellValue({
         value={value}
         onClose={() => setImageOpen(false)}
         onSave={(next) => {
-          onCommit(next);
+          commitValue(next);
           setImageOpen(false);
           if (!alwaysEdit) setEditing(false);
         }}

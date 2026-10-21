@@ -1,7 +1,7 @@
 import { Database, Eye, Folder, Table2 } from "lucide-react";
 import { App, Button, Empty, Input, Spin, Tree } from "antd";
 import type { DataNode, EventDataNode } from "antd/es/tree";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorText } from "../api";
 import { engineLabel, qualifiedTable, usesSchema } from "../engines";
 import { touchRecent } from "../recent";
@@ -11,6 +11,9 @@ import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
 import type { ConnectionPublic, Engine } from "../types";
 import { EngineGlyph } from "./EngineGlyph";
+import { belongsToConnection } from "../catalogTree";
+import { invalidateSqlCatalog } from "../sqlCatalog";
+import { ensureConnection } from "../connectionReady";
 
 const SEP = "\u001f";
 
@@ -46,7 +49,30 @@ export function Sidebar({ width }: { width: number }) {
   const [keyword, setKeyword] = useState("");
   const [cache, setCache] = useState<Record<string, XNode[]>>({});
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [loadedKeys, setLoadedKeys] = useState<string[]>([]);
+  const catalogRevisions = useRef<Record<string, number>>({});
+  const previousProfiles = useRef(profiles);
   const [menu, setMenu] = useState<{ x: number; y: number; meta: NodeMeta } | null>(null);
+
+  function clearConnectionTree(id: string) {
+    catalogRevisions.current[id] = (catalogRevisions.current[id] ?? 0) + 1;
+    setCache((previous) => Object.fromEntries(Object.entries(previous).filter(([key]) => !belongsToConnection(key, id))));
+    setLoadedKeys((keys) => keys.filter((key) => !belongsToConnection(key, id)));
+    setExpandedKeys((keys) => keys.filter((key) => !belongsToConnection(key, id)));
+  }
+
+  useEffect(() => {
+    for (const previous of previousProfiles.current) {
+      const next = profiles.find((profile) => profile.id === previous.id);
+      if (previous === next) continue;
+      // A successful initial handshake keeps its in-flight catalog read; edits and disconnects invalidate it.
+      if (!next || (previous.connected && !next.connected)
+        || JSON.stringify({ ...previous, connected: false }) !== JSON.stringify({ ...next, connected: false })) {
+        clearConnectionTree(previous.id);
+      }
+    }
+    previousProfiles.current = profiles;
+  }, [profiles]);
 
   useEffect(() => {
     if (!menu) return;
@@ -64,10 +90,9 @@ export function Sidebar({ width }: { width: number }) {
     const profile = useConnectionStore.getState().profiles.find((item) => item.id === id);
     if (!profile) throw new Error("连接不存在");
     if (!profile.connected) {
-      const result = await api.connect(id);
-      markConnected(id, true);
+      await ensureConnection(id);
       touchRecent(id);
-      setStatus(`已连接 ${profile.name} · ${result.version}`);
+      setStatus(`已连接 ${profile.name}`);
     }
   }
 
@@ -165,10 +190,15 @@ export function Sidebar({ width }: { width: number }) {
   async function onLoad(node: EventDataNode<XNode>) {
     const key = String(node.key);
     if (cache[key]) return;
+    const id = node.meta.connectionId ?? "";
+    const revision = catalogRevisions.current[id] ?? 0;
+    const current = () => revision === (catalogRevisions.current[id] ?? 0);
     try {
       const children = await produceChildren(node.meta, key);
+      if (!current()) throw new Error("对象目录已刷新");
       setCache((prev) => ({ ...prev, [key]: children }));
     } catch (err) {
+      if (!current()) throw err;
       const text = errorText(err);
       setStatus(text);
       setCache((prev) => ({
@@ -201,7 +231,7 @@ export function Sidebar({ width }: { width: number }) {
     const profile = profiles.find((item) => item.id === meta.connectionId);
     const sql =
       meta.name && meta.engine
-        ? `SELECT * FROM ${qualifiedTable(meta.engine, meta.database ?? "", meta.schema ?? "", meta.name)} LIMIT 100;\n`
+        ? `SELECT * FROM ${qualifiedTable(meta.engine, meta.database ?? "", meta.schema ?? "", meta.name)};\n`
         : undefined;
     openQuery({
       connectionId: meta.connectionId ?? profile?.id ?? null,
@@ -254,15 +284,8 @@ export function Sidebar({ width }: { width: number }) {
         {
           label: "刷新对象",
           run: () => {
-            const prefix = nodeKey("conn", id);
-            setCache((prev) => {
-              const next: Record<string, XNode[]> = {};
-              for (const [key, value] of Object.entries(prev)) {
-                if (key !== prefix && !key.startsWith(`${prefix}${SEP}`)) next[key] = value;
-              }
-              return next;
-            });
-            setExpandedKeys((keys) => keys.filter((key) => key !== prefix && !key.startsWith(`${prefix}${SEP}`)));
+            invalidateSqlCatalog(id);
+            clearConnectionTree(id);
           },
         },
       ];
@@ -339,6 +362,8 @@ export function Sidebar({ width }: { width: number }) {
             showIcon
             treeData={treeData}
             expandedKeys={expandedKeys}
+            loadedKeys={loadedKeys}
+            onLoad={(keys) => setLoadedKeys(keys.map(String))}
             onExpand={(keys) => setExpandedKeys(keys.map(String))}
             loadData={onLoad}
             onDoubleClick={(_, node) => {

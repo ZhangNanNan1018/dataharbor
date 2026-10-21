@@ -1,3 +1,4 @@
+use super::read_batches::{ReadSession, TableReader};
 use super::storage::{cell_string, escape_xml};
 use super::table_data::{load_all_operation, CEILING};
 use super::types::{FileExportRequest, FileExportResult, FileImportRequest};
@@ -8,6 +9,7 @@ use crate::operations::{AtomicOutput, OperationContext};
 use crate::state::AppState;
 use serde_json::{json, Value as JsonValue};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<FileExportResult> {
@@ -21,6 +23,12 @@ pub fn export_file_with_operation(
 ) -> AppResult<FileExportResult> {
     operation.checkpoint()?;
     let format = request.format.to_ascii_lowercase();
+    if matches!(format.as_str(), "csv" | "txt" | "json" | "xml") {
+        return export_streaming_file(state, request, operation);
+    }
+    if !matches!(format.as_str(), "xlsx" | "dbf" | "parquet" | "pdf") {
+        return Err(AppError::msg(format!("不支持的导出格式 {format}")));
+    }
     let (columns, rows, total, hit_ceiling) = load_all_operation(
         state,
         &request.connection_id,
@@ -43,29 +51,6 @@ pub fn export_file_with_operation(
         .to_str()
         .ok_or_else(|| AppError::msg("输出路径无效"))?;
     match format.as_str() {
-        "json" => {
-            let objects: Vec<JsonValue> = rows
-                .iter()
-                .map(|row| row_object(&text_columns, row))
-                .collect();
-            fs::write(
-                output_path,
-                serde_json::to_string_pretty(&objects).unwrap_or_else(|_| "[]".into()),
-            )
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        }
-        "xml" => {
-            fs::write(output_path, rows_to_xml(&text_columns, &rows))
-                .map_err(|err| AppError::msg(err.to_string()))?;
-        }
-        "txt" => {
-            fs::write(output_path, rows_to_delimited(&text_columns, &rows, '\t')?)
-                .map_err(|err| AppError::msg(err.to_string()))?;
-        }
-        "csv" => {
-            fs::write(output_path, rows_to_delimited(&text_columns, &rows, ',')?)
-                .map_err(|err| AppError::msg(err.to_string()))?;
-        }
         "xlsx" => write_xlsx(output_path, &text_columns, &rows)?,
         "dbf" => crate::dbf::write_dbf(Path::new(output_path), &text_columns, &rows)?,
         "parquet" => crate::parquetio::write_table(Path::new(output_path), &text_columns, &rows)?,
@@ -102,6 +87,159 @@ pub fn export_file_with_operation(
             String::new()
         },
     })
+}
+
+fn export_streaming_file(
+    state: &AppState,
+    request: FileExportRequest,
+    operation: &OperationContext,
+) -> AppResult<FileExportResult> {
+    export_streaming_file_with_hook(state, request, operation, &mut |_| {})
+}
+
+pub(super) fn export_streaming_file_with_hook(
+    state: &AppState,
+    request: FileExportRequest,
+    operation: &OperationContext,
+    after_batch: &mut dyn FnMut(u64),
+) -> AppResult<FileExportResult> {
+    let mut read = ReadSession::open(state, &request.connection_id, &request.database, operation)?;
+    let mut reader = TableReader::new(
+        &mut *read.session,
+        read.snapshot,
+        &request.database,
+        &request.schema,
+        &request.table,
+        None,
+        operation,
+    )?;
+    // Document drivers discover the complete display schema in their single
+    // bounded result. SQL readers already have schema before the first batch.
+    let mut batch = reader.next(operation)?;
+    let columns = reader
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<Vec<_>>();
+    let output = AtomicOutput::new(Path::new(&request.path))?;
+    let file = fs::File::create(output.path()).map_err(|e| AppError::msg(e.to_string()))?;
+    let mut writer = TextTableWriter::new(
+        BufWriter::new(file),
+        &request.format.to_ascii_lowercase(),
+        &columns,
+    )?;
+    while let Some(rows) = batch {
+        writer.batch(&columns, &rows, operation)?;
+        after_batch(reader.loaded);
+        batch = reader.next(operation)?;
+    }
+    writer.finish()?;
+    let (row_count, total, truncated) = (reader.loaded, reader.total, reader.truncated());
+    drop(reader);
+    read.finish()?;
+    operation.checkpoint()?;
+    output.commit()?;
+    operation.report("文件已保存", row_count, Some(row_count), &request.path);
+    Ok(FileExportResult {
+        path: request.path,
+        row_count,
+        truncated,
+        kind: "table-export".into(),
+        note: if truncated {
+            format!(
+                "导出已截断：共 {total} 行，仅导出 {row_count} 行；当前表无法使用安全快照主键扫描"
+            )
+        } else {
+            String::new()
+        },
+    })
+}
+
+enum TextTableWriter<W: Write> {
+    Delimited(csv::Writer<W>),
+    Json(W, bool),
+    Xml(W),
+}
+
+impl<W: Write> TextTableWriter<W> {
+    fn new(mut writer: W, format: &str, columns: &[String]) -> AppResult<Self> {
+        match format {
+            "csv" | "txt" => {
+                let mut csv = csv::WriterBuilder::new()
+                    .delimiter(if format == "txt" { b'\t' } else { b',' })
+                    .from_writer(writer);
+                csv.write_record(columns).map_err(io_error)?;
+                Ok(Self::Delimited(csv))
+            }
+            "json" => {
+                writer.write_all(b"[\n").map_err(io_error)?;
+                Ok(Self::Json(writer, true))
+            }
+            "xml" => {
+                writer
+                    .write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rows>\n")
+                    .map_err(io_error)?;
+                Ok(Self::Xml(writer))
+            }
+            _ => Err(AppError::msg("不支持的流式导出格式")),
+        }
+    }
+
+    fn batch(
+        &mut self,
+        columns: &[String],
+        rows: &[Vec<JsonValue>],
+        operation: &OperationContext,
+    ) -> AppResult<()> {
+        for row in rows {
+            operation.checkpoint()?;
+            match self {
+                Self::Delimited(writer) => writer
+                    .write_record(row.iter().map(delimited::cell))
+                    .map_err(io_error)?,
+                Self::Json(writer, first) => {
+                    if !*first {
+                        writer.write_all(b",\n").map_err(io_error)?;
+                    }
+                    serde_json::to_writer(&mut *writer, &row_object(columns, row))
+                        .map_err(io_error)?;
+                    *first = false;
+                }
+                Self::Xml(writer) => {
+                    writer.write_all(b"  <row>\n").map_err(io_error)?;
+                    for (index, name) in columns.iter().enumerate() {
+                        writeln!(
+                            writer,
+                            "    <col name=\"{}\">{}</col>",
+                            escape_xml(name),
+                            escape_xml(&cell_string(row.get(index)))
+                        )
+                        .map_err(io_error)?;
+                    }
+                    writer.write_all(b"  </row>\n").map_err(io_error)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> AppResult<()> {
+        match &mut self {
+            Self::Delimited(writer) => writer.flush().map_err(io_error),
+            Self::Json(writer, _) => {
+                writer.write_all(b"\n]\n").map_err(io_error)?;
+                writer.flush().map_err(io_error)
+            }
+            Self::Xml(writer) => {
+                writer.write_all(b"</rows>\n").map_err(io_error)?;
+                writer.flush().map_err(io_error)
+            }
+        }
+    }
+}
+
+fn io_error(error: impl std::fmt::Display) -> AppError {
+    AppError::msg(error.to_string())
 }
 
 #[cfg(test)]
@@ -231,30 +369,6 @@ fn row_object(columns: &[String], row: &[JsonValue]) -> JsonValue {
         );
     }
     JsonValue::Object(map)
-}
-
-fn rows_to_delimited(columns: &[String], rows: &[Vec<JsonValue>], sep: char) -> AppResult<Vec<u8>> {
-    let mut output = Vec::new();
-    delimited::write(&mut output, columns, rows, sep as u8)?;
-    Ok(output)
-}
-
-fn rows_to_xml(columns: &[String], rows: &[Vec<JsonValue>]) -> String {
-    let mut text = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rows>\n");
-    for row in rows {
-        text.push_str("  <row>\n");
-        for (index, name) in columns.iter().enumerate() {
-            let value = cell_string(row.get(index));
-            text.push_str(&format!(
-                "    <col name=\"{}\">{}</col>\n",
-                escape_xml(name),
-                escape_xml(&value)
-            ));
-        }
-        text.push_str("  </row>\n");
-    }
-    text.push_str("</rows>\n");
-    text
 }
 
 fn read_delimited_operation(

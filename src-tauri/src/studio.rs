@@ -10,6 +10,7 @@ mod inspection;
 mod modeling;
 mod project;
 mod query_tools;
+mod read_batches;
 mod storage;
 mod sync;
 mod table_data;
@@ -40,7 +41,7 @@ pub use project::{
     save_favorite, save_snippet,
 };
 pub use query_tools::{
-    bind_sql, explain_plan, explain_query, format_sql, list_accounts, preview_design,
+    bind_sql, execute_read_query_with_operation, explain_plan, explain_query, format_sql, list_accounts, preview_design,
     server_activity,
 };
 pub use sync::{diff_structure, sync_rows_with_operation, transfer_rows_with_operation};

@@ -2,6 +2,9 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 
+// Component tests replace the Monaco editor; its browser worker is verified by the build.
+vi.mock("../../src/monacoSetup", () => ({}));
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({

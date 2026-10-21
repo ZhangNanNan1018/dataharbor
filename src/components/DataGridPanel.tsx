@@ -81,6 +81,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   const columnsRef = useRef<ColumnMeta[]>([]);
   const writeInFlight = useRef(false);
   const editsLocked = useRef(false);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const hasPk = columns.some((column) => column.primaryKey);
   const dirty = rows.some((row) => row.status !== "clean");
@@ -261,7 +262,14 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
     if (writeInFlight.current || exportInFlight.current || task.active || loading || readOnly || refreshRequired) return;
     writeInFlight.current = true;
     const active = document.activeElement;
-    if (active instanceof HTMLElement && active !== document.body) active.blur();
+    if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
+    const invalid = panelRef.current?.querySelector<HTMLInputElement>(".xb-cell-editor input:invalid");
+    if (invalid) {
+      writeInFlight.current = false;
+      invalid.focus();
+      message.warning("请先修正单元格中的无效内容，再提交更改");
+      return;
+    }
     const changes = buildChanges(columnsRef.current, rowsRef.current);
     if (!changes.length) {
       writeInFlight.current = false;
@@ -419,7 +427,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }));
 
   return (
-    <div className="xb-panel">
+    <div className="xb-panel" ref={panelRef}>
       <div className="flex flex-wrap items-center gap-2">
         <strong className="text-sm">{tab.table}</strong>
         <span className="text-xs text-[var(--xb-muted)]">

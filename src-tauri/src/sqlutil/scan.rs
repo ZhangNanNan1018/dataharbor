@@ -2,6 +2,7 @@
 pub(super) struct Word {
     pub text: String,
     pub depth: usize,
+    pub end: usize,
 }
 
 pub(super) struct Scan {
@@ -107,6 +108,7 @@ pub(super) fn scan(sql: &str) -> Scan {
                 out.words.push(Word {
                     text: sql[word_start..index].to_ascii_uppercase(),
                     depth,
+                    end: index,
                 });
             }
             _ => {

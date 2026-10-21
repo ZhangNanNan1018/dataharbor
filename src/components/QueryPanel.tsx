@@ -1,4 +1,5 @@
 import Editor, { type OnMount } from "@monaco-editor/react";
+import "../monacoSetup";
 import { App, Alert, Button, Dropdown, Input, Modal, Pagination, Select, Space, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useRef, useState } from "react";
@@ -13,6 +14,8 @@ import { useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
 import type { ExecuteSqlResponse, JsonValue, QueryTab, StatementResult } from "../types";
+import { watchSqlCatalog } from "../sqlCatalog";
+import { ensureConnection } from "../connectionReady";
 
 interface ResultRow {
   key: string;
@@ -35,7 +38,6 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   const theme = useUiStore((state) => state.theme);
   const setStatus = useUiStore((state) => state.setStatus);
   const profiles = useConnectionStore((state) => state.profiles);
-  const markConnected = useConnectionStore((state) => state.markConnected);
   const patchQuery = useTabStore((state) => state.patchQuery);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const runRef = useRef<(mode: "all" | "selection") => Promise<void>>(async () => {});
@@ -148,13 +150,12 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     const current = useConnectionStore.getState().profiles.find((item) => item.id === id);
     if (!current) throw new Error("连接不存在");
     if (!current.connected) {
-      const connected = await api.connect(id);
-      markConnected(id, true);
+      await ensureConnection(id);
       if (current.engine !== "sqlite") {
         const list = await api.listDatabases(id).catch(() => [] as string[]);
         if (list.length && tabRef.current.connectionId === id) setDatabases(list);
       }
-      setStatus(`已连接 ${current.name} · ${connected.version}`);
+      setStatus(`已连接 ${current.name}`);
     }
   }
 
@@ -293,35 +294,26 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     clearSqlSchema(monaco, model);
     if (!id) return;
     let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
     void (async () => {
       try {
         await ensure(id);
-        const names = await api.listTables(id, tab.database, profile?.engine === "postgres" ? "public" : "");
-        const next = names.map((name) => ({ name, columns: [] as { name: string; dataType: string; primaryKey: boolean }[], columnsLoaded: false }));
-        for (const name of names.slice(0, 40)) {
-          if (cancelled) return;
-          const columns = await api.listColumns(id, tab.database, profile?.engine === "postgres" ? "public" : "", name);
-          const item = next.find((item) => item.name === name)!;
-          item.columns = columns.map((column) => ({
-              name: column.name,
-              dataType: column.dataType,
-              primaryKey: column.primaryKey,
-            }));
-          item.columnsLoaded = true;
-        }
-        if (!cancelled) {
+        if (cancelled) return;
+        unsubscribe = watchSqlCatalog({ connectionId: id, database: tab.database, schema: profile?.engine === "postgres" ? "public" : "" }, (next) => {
+          if (cancelled || model.isDisposed()) return;
           setSqlSchema(monaco, model, next);
           refreshSqlMarkers(monaco, model);
-        }
+        });
       } catch {
         if (!cancelled) clearSqlSchema(monaco, model);
       }
     })();
     return () => {
       cancelled = true;
+      unsubscribe?.();
       clearSqlSchema(monaco, model);
     };
-  }, [tab.connectionId, tab.database, profile?.engine, editorReady]);
+  }, [tab.connectionId, tab.database, profile, editorReady]);
 
   const onMount: OnMount = (instance, monaco) => {
     editorRef.current = instance;

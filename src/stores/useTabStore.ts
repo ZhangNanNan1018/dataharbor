@@ -187,8 +187,15 @@ export const useTabStore = create<TabState>((set, get) => ({
     }),
 }));
 
-useTabStore.subscribe((state, previous) => {
-  if (state.tabs === previous.tabs && state.activeId === previous.activeId && state.dirty === previous.dirty) return;
+let draftTimer: ReturnType<typeof setTimeout> | undefined;
+let pendingDraftSave = false;
+
+/** Flush the latest store snapshot at lifecycle boundaries, including a trailing keystroke. */
+export function flushQueryDrafts() {
+  if (draftTimer !== undefined) clearTimeout(draftTimer);
+  draftTimer = undefined;
+  pendingDraftSave = false;
+  const state = useTabStore.getState();
   // Do not overwrite an unreadable recovery record with an empty workspace.
   if (state.draftSaveError?.startsWith("查询草稿恢复失败")) return;
   const tabs = state.tabs.filter((tab) => tab.kind === "query");
@@ -198,4 +205,37 @@ useTabStore.subscribe((state, previous) => {
   } catch {
     if (!state.draftSaveError) useTabStore.setState({ draftSaveError: "查询草稿自动保存失败，请复制需要保留的 SQL 后再关闭应用。" });
   }
+}
+
+const unsubscribeDrafts = useTabStore.subscribe((state, previous) => {
+  if (state.tabs === previous.tabs && state.activeId === previous.activeId && state.dirty === previous.dirty) return;
+  const queries = state.tabs.filter((tab) => tab.kind === "query");
+  const previousQueries = previous.tabs.filter((tab) => tab.kind === "query");
+  const structureChanged = queries.length !== previousQueries.length || queries.some((tab, index) => tab.id !== previousQueries[index]?.id);
+  if (structureChanged || state.activeId !== previous.activeId) { flushQueryDrafts(); return; }
+  if (!queries.some((tab, index) => tab !== previousQueries[index] || state.dirty[tab.id] !== previous.dirty[tab.id])) return;
+  if (draftTimer !== undefined) { pendingDraftSave = true; return; }
+  // Save the first edit immediately, then coalesce the remainder of a typing burst.
+  flushQueryDrafts();
+  draftTimer = setTimeout(() => {
+    draftTimer = undefined;
+    if (pendingDraftSave) flushQueryDrafts();
+  }, 400);
 });
+
+const onPageHide = () => flushQueryDrafts();
+const onVisibility = () => { if (document.visibilityState === "hidden") flushQueryDrafts(); };
+window.addEventListener("pagehide", onPageHide);
+window.addEventListener("beforeunload", onPageHide);
+document.addEventListener("visibilitychange", onVisibility);
+
+// Dispose a previous module instance during hot reload rather than retaining its old snapshot.
+const persistenceHost = window as Window & { __dataharborDisposeDrafts?: () => void };
+persistenceHost.__dataharborDisposeDrafts?.();
+persistenceHost.__dataharborDisposeDrafts = () => {
+  if (draftTimer !== undefined) clearTimeout(draftTimer);
+  unsubscribeDrafts();
+  window.removeEventListener("pagehide", onPageHide);
+  window.removeEventListener("beforeunload", onPageHide);
+  document.removeEventListener("visibilitychange", onVisibility);
+};

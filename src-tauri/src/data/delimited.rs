@@ -76,6 +76,7 @@ pub(crate) fn read_with_operation(
     Ok((headers, rows))
 }
 
+#[cfg(test)]
 pub(crate) fn write(
     writer: impl Write,
     columns: &[String],

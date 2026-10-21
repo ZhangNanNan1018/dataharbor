@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../../src/sqlIntelligence";
-import { parseCell } from "../../src/format";
+import { isNumericType, parseCell } from "../../src/format";
 import type { ColumnMeta } from "../../src/types";
 
 function monacoFixture() {
@@ -12,7 +12,7 @@ function monacoFixture() {
       uri: uri(key), getValue: () => text, getWordUntilPosition: () => ({ startColumn: 1, endColumn: 1 }),
       getValueInRange: () => "", getWordAtPosition: () => ({ word: "books" }),
       getPositionAt: (offset: number) => ({ lineNumber: 1, column: offset + 1 }),
-      setValue: vi.fn(), isDisposed: () => false, dispose: vi.fn(() => models.delete(key)),
+      setValue: vi.fn((value: string) => { text = value; }), isDisposed: () => false, dispose: vi.fn(() => models.delete(key)),
     };
   }
   const monaco = {
@@ -64,6 +64,32 @@ describe("多连接 SQL 结构隔离", () => {
     refreshSqlMarkers(monaco, owner as any);
     expect(monaco.editor.setModelMarkers).toHaveBeenLastCalledWith(owner, "dataharbor-sql", []);
   });
+
+  it("分批更新目录只改动对应定义，复用其他表模型并回收删除的表", () => {
+    const { monaco, model, models } = monacoFixture();
+    const owner = model("inmemory://queries/incremental.sql");
+    const tables = [
+      { name: "books", columns: [], columnsLoaded: false },
+      { name: "authors", columns: [], columnsLoaded: false },
+    ];
+    setSqlSchema(monaco, owner as any, tables);
+    const [books, authors] = [...models.values()];
+    setSqlSchema(monaco, owner as any, tables);
+    expect([...models.values()]).toEqual([books, authors]);
+    expect(books.dispose).not.toHaveBeenCalled();
+    expect(books.setValue).not.toHaveBeenCalled();
+    expect(authors.setValue).not.toHaveBeenCalled();
+    const updatedBooks = { name: "books", columns: [{ name: "title", dataType: "TEXT" }], columnsLoaded: true };
+    setSqlSchema(monaco, owner as any, [updatedBooks, tables[1]]);
+    expect(books.setValue).toHaveBeenCalledTimes(1);
+    expect(authors.setValue).not.toHaveBeenCalled();
+    setSqlSchema(monaco, owner as any, [updatedBooks]);
+    expect(authors.dispose).toHaveBeenCalledTimes(1);
+    expect(books.dispose).not.toHaveBeenCalled();
+    expect(books.setValue).toHaveBeenCalledTimes(1);
+    expect(models.size).toBe(1);
+    clearSqlSchema(monaco, owner as any);
+  });
 });
 
 describe("精确数值编辑", () => {
@@ -72,6 +98,9 @@ describe("精确数值编辑", () => {
     const exact = "123456789012345678.123456789012345678";
     expect(parseCell(exact, column("DECIMAL(38,18)"), false)).toBe(exact);
     expect(parseCell(exact, column("NUMERIC"), false)).toBe(exact);
+    expect(isNumericType("fixed")).toBe(true);
+    expect(parseCell(exact, column("fixed"), false)).toBe(exact);
+    expect(parseCell(" 123.4500 ", column("FIXED"), false)).toBe("123.4500");
     expect(parseCell("9007199254740993", column("BIGINT"), false)).toBe("9007199254740993");
     expect(parseCell("00123", column("VARCHAR(20)"), false)).toBe("00123");
   });

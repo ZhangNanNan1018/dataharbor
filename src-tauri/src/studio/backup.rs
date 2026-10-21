@@ -1,9 +1,10 @@
+use super::read_batches::{ReadSession, TableReader};
 use super::storage::{engine_of, profile_of};
-use super::table_data::{ensure_complete, load_all_with_ceiling_operation, CEILING};
+use super::table_data::ensure_complete;
 use super::types::{BackupRequest, FileExportResult, RestoreRequest};
 use crate::error::{AppError, AppResult};
 use crate::models::{Engine, ExecuteSqlRequest, StoredProfile};
-use crate::operations::OperationContext;
+use crate::operations::{AtomicOutput, OperationContext};
 use crate::query::execute_sql_with_operation;
 use crate::sqlutil::{qualified_name, quote_ident, sql_literal, value_sql};
 use crate::state::AppState;
@@ -23,7 +24,7 @@ pub fn backup_sql_with_operation(
     request: &BackupRequest,
     operation: &OperationContext,
 ) -> AppResult<FileExportResult> {
-    backup_with_ceiling_operation(state, request, CEILING, operation)
+    backup_with_ceiling_operation(state, request, None, operation)
 }
 
 #[cfg(test)]
@@ -32,13 +33,13 @@ pub(super) fn backup_with_ceiling(
     request: &BackupRequest,
     ceiling: u32,
 ) -> AppResult<FileExportResult> {
-    backup_with_ceiling_operation(state, request, ceiling, &OperationContext::detached())
+    backup_with_ceiling_operation(state, request, Some(ceiling), &OperationContext::detached())
 }
 
 fn backup_with_ceiling_operation(
     state: &AppState,
     request: &BackupRequest,
-    ceiling: u32,
+    ceiling: Option<u32>,
     operation: &OperationContext,
 ) -> AppResult<FileExportResult> {
     operation.checkpoint()?;
@@ -52,54 +53,30 @@ fn backup_with_ceiling_operation(
             return Err(AppError::msg("已指定只用本机工具，但工具不存在或执行失败。可改成自动模式以回退到内置 INSERT 脚本。"));
         }
     }
-    if engine == Engine::Mongodb || engine == Engine::Redis {
-        return Err(AppError::msg(
-            "没有找到 mongodump。文档库请用 JSON 导出，或安装 mongodump 后把备份模式设为本机工具。",
-        ));
-    }
     if !engine.is_sql() {
         return Err(AppError::msg(
-            "文档库请用 JSON 导出。逻辑备份目前覆盖 SQL 引擎。",
+            "文档库请用 JSON 导出，或安装原生备份工具。逻辑脚本备份目前覆盖 SQL 引擎。",
         ));
     }
-    let tables = state.with_session_operation(
-        &request.connection_id,
-        &request.database,
-        operation,
-        |session| session.list_tables(&request.database, &request.schema),
-    )?;
+    let mut read = ReadSession::open(state, &request.connection_id, &request.database, operation)?;
+    let engine = read.session.engine();
+    let tables = read
+        .session
+        .list_tables(&request.database, &request.schema)?;
     let (kind, note) = if engine == Engine::Sqlite {
-        ("sqlite-script", "SQLite 表结构和数据脚本；不含独立索引、视图和触发器。读取期间需停止写入，本脚本不提供一致性快照。")
+        ("sqlite-script", "SQLite 表结构和数据脚本；不含独立索引、视图和触发器。全部表来自同一个独立只读快照，有非空主键的表分批写出；其他表保留受限完整读取。")
     } else {
-        ("data-only", "仅含 INSERT 数据，目标端必须预先具备兼容表结构。不包含建表、索引、约束、权限等对象，不是完整数据库备份。读取期间需停止写入。")
+        ("data-only", "仅含 INSERT 数据，目标端必须预先具备兼容表结构。不包含建表、索引、约束、权限等对象，不是完整数据库备份。PostgreSQL/MySQL InnoDB 的非空主键表复用独立快照分批读取；其他路径受限且读取期间需停止写入。")
     };
-    let header = format!(
-        "-- DataHarbor {kind}\n-- engine: {}\n-- {note}\n\n",
-        engine.label()
-    );
-    let temporary =
-        Path::new(&request.path).with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(temporary.clone());
-    let mut output_options = fs::OpenOptions::new();
-    output_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        output_options.mode(0o600);
-    }
-    let file = output_options
-        .open(&temporary)
-        .map_err(|err| AppError::msg(err.to_string()))?;
+    let output = AtomicOutput::new(Path::new(&request.path))?;
+    let file = fs::File::create(output.path()).map_err(|err| AppError::msg(err.to_string()))?;
     let mut writer = std::io::BufWriter::new(file);
-    writer
-        .write_all(header.as_bytes())
-        .map_err(|err| AppError::msg(err.to_string()))?;
+    writeln!(
+        writer,
+        "-- DataHarbor {kind}\n-- engine: {}\n-- {note}\n",
+        engine.label()
+    )
+    .map_err(|err| AppError::msg(err.to_string()))?;
     let mut count = 0u64;
     for (table_index, table) in tables.iter().enumerate() {
         operation.checkpoint()?;
@@ -109,38 +86,16 @@ fn backup_with_ceiling_operation(
             Some(tables.len() as u64),
             &format!("正在读取 {table}；取消不会替换旧备份"),
         );
-        let (columns, rows, total, truncated) = load_all_with_ceiling_operation(
-            state,
-            &request.connection_id,
-            &request.database,
-            &request.schema,
-            table,
-            ceiling,
-            operation,
-        )?;
-        ensure_complete(
-            total,
-            rows.len(),
-            truncated,
-            &format!("内置备份（表 {table}）"),
-        )?;
         let name = qualified_name(engine, &request.database, &request.schema, table)?;
         writeln!(writer, "-- {name}").map_err(|err| AppError::msg(err.to_string()))?;
         if engine == Engine::Sqlite {
-            let outcome = state.with_session_operation(
-                &request.connection_id,
+            let outcome = read.session.execute(
                 &request.database,
-                operation,
-                |session| {
-                    session.execute(
-                        &request.database,
-                        &format!(
-                            "SELECT sql FROM sqlite_master WHERE name = {}",
-                            sql_literal(Engine::Sqlite, &JsonValue::String(table.clone()))?
-                        ),
-                        Some(1),
-                    )
-                },
+                &format!(
+                    "SELECT sql FROM sqlite_master WHERE name = {}",
+                    sql_literal(Engine::Sqlite, &JsonValue::String(table.clone()))?
+                ),
+                Some(1),
             )?;
             let definition = outcome
                 .rows
@@ -150,41 +105,52 @@ fn backup_with_ceiling_operation(
                 .ok_or_else(|| AppError::msg(format!("无法读取 {table} 的建表语句，已取消备份")))?;
             write_statement(&mut writer, definition)?;
         }
-        let cols = columns
+        let mut reader = TableReader::new(
+            &mut *read.session,
+            read.snapshot,
+            &request.database,
+            &request.schema,
+            table,
+            ceiling,
+            operation,
+        )?;
+        let cols = reader
+            .columns
             .iter()
             .map(|column| quote_ident(engine, &column.name))
             .collect::<AppResult<Vec<_>>>()?
             .join(", ");
-        for (row_index, row) in rows.iter().enumerate() {
-            operation.checkpoint()?;
-            if row_index % 500 == 0 {
-                operation.report(
-                    "写入备份（行）",
-                    row_index as u64,
-                    Some(total),
-                    &format!("{table}，临时文件尚未替换目标"),
-                );
+        while let Some(rows) = reader.next(operation)? {
+            for row in rows {
+                operation.checkpoint()?;
+                let values = row
+                    .iter()
+                    .zip(&reader.columns)
+                    .map(|(value, column)| value_sql(engine, &column.data_type, value))
+                    .collect::<AppResult<Vec<_>>>()?
+                    .join(", ");
+                write_statement(
+                    &mut writer,
+                    &format!("INSERT INTO {name} ({cols}) VALUES ({values})"),
+                )?;
+                count += 1;
             }
-            let values = row
-                .iter()
-                .zip(&columns)
-                .map(|(value, column)| value_sql(engine, &column.data_type, value))
-                .collect::<AppResult<Vec<_>>>()?
-                .join(", ");
-            write_statement(
-                &mut writer,
-                &format!("INSERT INTO {name} ({cols}) VALUES ({values})"),
-            )?;
-            count += 1;
         }
+        ensure_complete(
+            reader.total,
+            reader.loaded as usize,
+            reader.truncated(),
+            &format!("内置备份（表 {table}）"),
+        )?;
         writeln!(writer).map_err(|err| AppError::msg(err.to_string()))?;
     }
     writer
         .flush()
         .map_err(|err| AppError::msg(err.to_string()))?;
     drop(writer);
+    read.finish()?;
     operation.checkpoint()?;
-    fs::rename(temporary, &request.path).map_err(|err| AppError::msg(err.to_string()))?;
+    output.commit()?;
     Ok(FileExportResult {
         path: request.path.clone(),
         row_count: count,

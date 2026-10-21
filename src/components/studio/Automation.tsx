@@ -118,8 +118,9 @@ export function Jobs() {
       <Space wrap>
         <Button disabled={!!busy} loading={busy === "save"} onClick={() => void save(false)}>保存为暂停</Button>
         <Button type="primary" disabled={!!busy} loading={busy === "enable"} onClick={() => void save(true)}>保存并启用</Button>
-        <Button disabled={!!busy} onClick={() => void run("schedule", async () => { message.success(await api.installSchedule(Math.max(1, Math.round(draft.intervalSecs / 60)))); })}>安装系统计划</Button>
+        <Button disabled={!!busy} onClick={() => void run("schedule", async () => { message.success(await api.installSchedule(1)); })}>安装系统计划</Button>
       </Space>
+      <div className="text-xs text-[var(--xb-muted)]">系统计划每分钟检查到期任务，执行间隔以各任务已保存的设置为准。</div>
       <Table size="small" pagination={false} rowKey="id" dataSource={jobs} columns={[
         { title: "名称", dataIndex: "name" },
         { title: "类型", dataIndex: "kind" },

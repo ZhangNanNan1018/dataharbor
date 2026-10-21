@@ -59,14 +59,14 @@ DataHarbor 是独立产品。这份清单用来记录已经做到的能力和还
 | --- | --- | --- |
 | 网格筛选、排序、编辑、提交 | 部分 | 修改先完整预校验，再按驱动提交同会话事务；SQL Server 用 BEGIN TRANSACTION，Oracle 为单次 SQL*Plus 事务块（生成语句单条上限 8KB，待实机验收）。Snowflake SQL API 无持久会话事务，拒绝网格/CSV 原子批量修改。网格提交检查原始快照和实际影响行数，SQL 冲突整批回滚。文档库逐条提交，部分失败阻止网格直接整批重放。 |
 | 表单视图、JSON 查看 | 已实现 | |
-| CSV / TXT / JSON / XML / XLSX / DBF / PDF | 已实现 | 单次最多 20 万行，这是内存上限，不再是 2000 行产品限制。PDF 嵌入本机中文字体。 |
+| CSV / TXT / JSON / XML / XLSX / DBF / PDF | 已实现 | 工作台 CSV/TXT/JSON/XML 表导出在 SQLite/PostgreSQL/MySQL/MariaDB InnoDB 的安全非空主键快照路径按最多 500 行续读，无 20 万行总量限制；其他路径单次受限读取并提示截断。XLSX/DBF/PDF 保留 20 万行组装上限。PDF 嵌入本机中文字体。 |
 | Parquet | 已实现 | `parquet` 59 + Arrow。导入导出把单元格写成可空 UTF-8，默认 Snappy。读写 Snappy、gzip、zstd、lz4。lz4 用纯 Rust 的 `lz4_flex`。zstd 用官方 crate 自带的 C 源码，靠 cc 编译，和 Tauri 在 Windows、macOS 上需要的 C 工具链相同。没有 brotli。 |
 | 外键取值 | 已实现 | 网格和表单里，有外键的列可以打开引用表，搜索任意文本列，点一行写回被引用列。一次最多 40 行。跨模式外键按当前模式查找。 |
 | 二进制 / 图片 / HTML | 已实现 | 二进制列可看可改十六进制，超过 1MB 只读前 4096 字节。BLOB / bytea 可预览 PNG、JPEG、GIF、WebP、BMP，并用本地文件替换（8MB 内）。文本列可预览 HTML（不执行脚本）或 http(s) 网址。写回数据库时二进制用各引擎的十六进制字面量。 |
 | Access / ODBC | 部分 | 有 `mdb-export` 时读 Access；有 `isql` 时按 DSN 导入。没有这些工具就报清楚，不内嵌驱动。 |
 | 结构同步 | 已实现 | 对比列、索引、外键、视图。可生成删除和修改。跨引擎保留可证明的精度、长度和整数范围，无法保证无损时拒绝自动转换；修改已有类型也需危险操作确认。语句可勾选。SQLite 的类型变更和外键以警告注释给出。 |
 | 数据传输 / 同步 | 部分 | SQLite/MySQL/MariaDB/PostgreSQL 有主键表采用独立快照、keyset 分页和临时磁盘索引，全量无 20 万行上限，应用批次最多 500 行；其他引擎及无主键传输保留受限完整读取。读取不完整时拒绝开始写入。同步要求源、目标真实完整且兼容的主键，复合键用 JSON 数组编码，拒绝重复键。更新/删除核对目标原值；每批独立提交，失败报告已提交批次和条数，不保证全任务原子回滚；执行时停止其他写入。 |
-| 备份 / 还原 | 部分 | 优先 `mysqldump`、`pg_dump`、`mongodump` / `mongorestore`。SQL Server 提交 `BACKUP` / `RESTORE`，路径必须在服务器上。内置遍历全部表，任一表读取不完整即拒绝成功；SQLite 回退为表结构和数据脚本（不含独立索引、视图、触发器），其他 SQL 引擎仅为 INSERT 数据脚本，无完整对象或一致性快照保证。外部 PostgreSQL 普通脚本使用支持 restricted 模式的 psql，自定义格式使用 pg_restore；内置脚本流式预检及还原，单语句限 20MB，总文件可超过 20MB。不能等价继承连接安全策略时拒绝原生工具。 |
+| 备份 / 还原 | 部分 | 优先 `mysqldump`、`pg_dump`、`mongodump` / `mongorestore`。SQL Server 提交 `BACKUP` / `RESTORE`，路径必须在服务器上。内置在独立连接中遍历全部表，安全非空主键快照路径按最多 500 行续读，无 20 万行总量限制；其他路径单次受限读取，任一表不完整即保留原件并拒绝成功。SQLite 回退为表结构和数据脚本（不含独立索引、视图、触发器），其他 SQL 引擎仅为 INSERT 数据脚本；不支持快照的路径需停止源端写入。外部 PostgreSQL 普通脚本使用支持 restricted 模式的 psql，自定义格式使用 pg_restore；内置脚本流式预检及还原，单语句限 20MB，总文件可超过 20MB。不能等价继承连接安全策略时拒绝原生工具。 |
 | 数据生成、脱敏、字典、结构分析 | 已实现 | 生成最多 500 行。脱敏是整列替换。 |
 | Mongo 导入导出 | 部分 | 集合可走 JSON 导入导出。没有单独的 mongoimport 兼容全部选项。 |
 | Redis Pub/Sub | 部分 | 发布走已有连接。订阅另开直连，SSH 下要求端口可达。 |

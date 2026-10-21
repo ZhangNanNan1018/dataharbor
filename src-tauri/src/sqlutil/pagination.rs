@@ -39,6 +39,21 @@ pub fn is_read_query(sql: &str) -> bool {
         return false;
     }
     let tokens = scan.words;
+    let top_level = tokens.iter().filter(|word| word.depth == 0).collect::<Vec<_>>();
+    let mut selects = 0;
+    for (index, word) in top_level.iter().enumerate() {
+        if word.text != "SELECT" { continue; }
+        selects += 1;
+        if selects > 1 {
+            let mut previous = index.checked_sub(1);
+            if previous.is_some_and(|at| matches!(top_level[at].text.as_str(), "ALL" | "DISTINCT")) {
+                previous = previous.and_then(|at| at.checked_sub(1));
+            }
+            if !previous.is_some_and(|at| matches!(top_level[at].text.as_str(), "UNION" | "INTERSECT" | "EXCEPT")) {
+                return false;
+            }
+        }
+    }
     matches!(
         tokens.first().map(|word| word.text.as_str()),
         Some("SELECT" | "WITH")
@@ -46,9 +61,25 @@ pub fn is_read_query(sql: &str) -> bool {
         .iter()
         .any(|word| word.depth == 0 && word.text == "SELECT")
         && !tokens.iter().any(|word| {
+            // MySQL string/numeric functions share these DML/DDL spellings.
+            // A call has an opening parenthesis after the token; a write
+            // statement requires a relation/INTO/TABLE at that position.
+            if matches!(word.text.as_str(), "INSERT" | "REPLACE" | "TRUNCATE")
+                && super::strip_leading_comments(&sql[word.end..]).starts_with('(')
+            {
+                return false;
+            }
             matches!(
                 word.text.as_str(),
                 "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "INTO" | "CALL" | "EXEC" | "EXECUTE"
+                // Some SQL dialects accept adjacent statements without a
+                // semicolon. A leading SELECT cannot authorize those batches.
+                | "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "REPLACE" | "UPSERT"
+                | "GRANT" | "REVOKE" | "DENY" | "BEGIN" | "COMMIT" | "ROLLBACK"
+                | "SAVEPOINT" | "RELEASE" | "SET" | "USE" | "PRAGMA" | "ATTACH"
+                | "DETACH" | "VACUUM" | "REINDEX" | "COPY" | "LOAD" | "UNLOAD"
+                | "BACKUP" | "RESTORE" | "DBCC" | "DO" | "DECLARE" | "KILL"
+                | "LOCK" | "UNLOCK" | "HANDLER"
             )
         })
 }
@@ -62,14 +93,11 @@ fn query_parts(engine: Engine, sql: &str) -> Option<()> {
         return None;
     }
     if tokens.iter().any(|word| {
-        matches!(
-            word.text.as_str(),
-            "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "INTO"
-        ) || (word.depth == 0
+        word.depth == 0
             && matches!(
                 word.text.as_str(),
                 "LIMIT" | "OFFSET" | "FETCH" | "TOP" | "FOR" | "OPTION"
-            ))
+            )
     }) {
         return None;
     }

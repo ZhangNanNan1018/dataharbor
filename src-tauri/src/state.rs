@@ -177,9 +177,24 @@ impl AppState {
                     || existing.ssl_insecure != request.ssl_insecure
                     || existing.ssh_enabled != request.ssh_enabled
                     || existing.ssh_host != request.ssh_host.trim()
+                    || existing.ssh_port != ssh_port
+                    || existing.ssh_username != request.ssh_username.trim()
+                    || existing.ssh_key_path != request.ssh_key_path.trim()
+                    || request.clear_ssh_password
+                    || request
+                        .ssh_password
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty())
                     || existing.http_tunnel != request.http_tunnel
+                    || existing.http_proxy_host != request.http_proxy_host.trim()
+                    || existing.http_proxy_port
+                        != if request.http_proxy_port == 0 {
+                            8080
+                        } else {
+                            request.http_proxy_port
+                        }
                     || existing.server_mode != request.server_mode.trim()
-                    || existing.auth_method != request.auth_method.trim()
+                    || existing.auth_method != normalize_auth(&request.auth_method)
                     || existing.warehouse != request.warehouse.trim()
                     || existing.schema_name != request.schema_name.trim()
                     || existing.address_map != request.address_map.trim();
@@ -1048,6 +1063,52 @@ mod tests {
             assert_eq!(reopened.list_connections().len(), 12);
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transport_parameter_changes_retire_the_live_session_but_cosmetic_edits_do_not() {
+        let directory =
+            std::env::temp_dir().join(format!("dataharbor-reconnect-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        {
+            let state = AppState::open_in(directory.clone(), true).unwrap();
+            let mut request = SaveConnectionRequest {
+                name: "fixture".into(),
+                engine: Engine::Sqlite,
+                file_path: directory.join("fixture.sqlite").display().to_string(),
+                ssh_port: 22,
+                http_proxy_port: 8080,
+                ..Default::default()
+            };
+            let saved = state.save_connection(request.clone()).unwrap();
+            let id = saved.connection.id;
+            request.id = Some(id.clone());
+            state.connect(&id).unwrap();
+            request.name = "renamed".into();
+            let cosmetic = state.save_connection(request.clone()).unwrap();
+            assert!(!cosmetic.needs_reconnect);
+            assert!(cosmetic.connection.connected);
+            let changes: [fn(&mut SaveConnectionRequest); 7] = [
+                |r| r.ssh_port = 2222,
+                |r| r.ssh_username = "new-user".into(),
+                |r| r.ssh_key_path = "new-key".into(),
+                |r| r.ssh_password = Some("new-secret".into()),
+                |r| r.clear_ssh_password = true,
+                |r| r.http_proxy_host = "new-proxy.example".into(),
+                |r| r.http_proxy_port = 3128,
+            ];
+            for change in changes {
+                state.connect(&id).unwrap();
+                request.ssh_password = None;
+                request.clear_ssh_password = false;
+                change(&mut request);
+                let updated = state.save_connection(request.clone()).unwrap();
+                assert!(updated.needs_reconnect);
+                assert!(!updated.connection.connected);
+                assert!(state.live_config(&id).is_err());
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

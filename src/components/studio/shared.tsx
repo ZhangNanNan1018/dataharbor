@@ -4,6 +4,7 @@ import { api, errorText, isOperationCancelled, type GridResult, type PairRequest
 import { engineLabel, usesSchema } from "../../engines";
 import { useConnectionStore } from "../../stores/useConnectionStore";
 import { type ConnectionPublic, type JsonValue, type StudioContext } from "../../types";
+import { ensureConnection } from "../../connectionReady";
 
 export const StudioSeedContext = createContext<StudioContext | null>(null);
 
@@ -33,7 +34,6 @@ export function ConnFields({
 }) {
   const { message } = App.useApp();
   const profiles = useProfiles();
-  const markConnected = useConnectionStore((state) => state.markConnected);
   const profile = profiles.find((item) => item.id === id);
   const schemaEngine = usesSchema(profile?.engine);
   const showTable = table !== undefined;
@@ -48,6 +48,8 @@ export function ConnFields({
   const [schemas, setSchemas] = useState<string[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [tableLoaded, setTableLoaded] = useState(false);
+  const [readyProfile, setReadyProfile] = useState<ConnectionPublic | null>(null);
+  const ready = profile?.connected === true && readyProfile === profile;
   const seedKey = applySeed && seed ? `${seed.connectionId}|${seed.database}|${seed.schema}|${seed.table}` : "";
 
   useEffect(() => {
@@ -62,6 +64,7 @@ export function ConnFields({
   }, [seedKey]);
 
   useEffect(() => {
+    setReadyProfile(null);
     if (!id || !profile) return;
     let cancelled = false;
     setDatabases([]);
@@ -70,11 +73,10 @@ export function ConnFields({
     setTableLoaded(false);
     void (async () => {
       try {
-        if (!profile.connected) {
-          const result = await api.connect(id);
-          markConnected(id, true);
-          if (!cancelled) message.success(`已连接 ${profile.name} · ${result.version}`);
-        }
+        await ensureConnection(id);
+        if (cancelled) return;
+        const connected = useConnectionStore.getState().profiles.find((item) => item.id === id)!;
+        setReadyProfile(connected);
         if (profile.engine === "sqlite") {
           if (database !== "main" || schema !== "main") onChangeRef.current({ database: "main", schema: "main" });
           return;
@@ -90,10 +92,10 @@ export function ConnFields({
     };
     // Catalog reload follows the connection. Database and schema updates are handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, profile]);
 
   useEffect(() => {
-    if (!id || !profile || profile.engine === "sqlite" || !database) return;
+    if (!id || !ready || !profile || profile.engine === "sqlite" || !database) return;
     if (!schemaEngine) {
       if (schema !== database) onChangeRef.current({ schema: database });
       return;
@@ -111,10 +113,10 @@ export function ConnFields({
     };
     // `message` is only used to report a failed catalog read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, database, schema, schemaEngine]);
+  }, [id, ready, database, schema, schemaEngine]);
 
   useEffect(() => {
-    if (!showTable || !id || !database) return;
+    if (!showTable || !id || !ready || !database) return;
     const schemaName = schemaEngine ? schema : database;
     if (!schemaName) return;
     let cancelled = false;
@@ -137,7 +139,7 @@ export function ConnFields({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showTable, id, database, schema, schemaEngine]);
+  }, [showTable, id, ready, database, schema, schemaEngine]);
 
   const name = (suffix: string) => (legend ? `${legend}${suffix}` : suffix);
   const manualTable = showTable && tableLoaded && tables.length === 0;

@@ -1,4 +1,5 @@
 import { App, Alert, Tabs } from "antd";
+import { lazy, Suspense } from "react";
 import { errorText } from "../api";
 import { openSampleBookstore } from "../actions";
 import { useTabStore } from "../stores/useTabStore";
@@ -6,9 +7,10 @@ import { cancelTabOperations, OperationOwnerContext, useOperationStore } from ".
 import type { WorkspaceTab } from "../types";
 import { DataGridPanel } from "./DataGridPanel";
 import { StudioPanel } from "./StudioPanel";
-import { QueryPanel } from "./QueryPanel";
 import { StructurePanel } from "./StructurePanel";
 import { Welcome } from "./Welcome";
+
+const QueryPanel = lazy(() => import("./QueryPanel").then((module) => ({ default: module.QueryPanel })));
 
 export function Workspace() {
   const { message, modal } = App.useApp();
@@ -88,7 +90,7 @@ export function Workspace() {
 function renderTab(tab: WorkspaceTab) {
   switch (tab.kind) {
     case "query":
-      return <QueryPanel tab={tab} />;
+      return <Suspense fallback={<div className="p-3 text-xs">正在加载查询编辑器…</div>}><QueryPanel tab={tab} /></Suspense>;
     case "data":
       return <DataGridPanel tab={tab} />;
     case "structure":

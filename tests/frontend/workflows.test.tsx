@@ -69,7 +69,9 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 async function choose(label: string, value: string) {
-  fireEvent.mouseDown(screen.getByRole("combobox", { name: label }));
+  // aria-label locates the input directly. Repeated whole-tree role scans through
+  // Ant Design's portals dominate this workflow in jsdom under parallel builds.
+  fireEvent.mouseDown(screen.getByLabelText(label, { selector: "input" }));
   const options = await screen.findAllByText(value, { selector: ".ant-select-item-option-content" });
   fireEvent.click(options.at(-1)!);
 }
@@ -372,7 +374,7 @@ it("同步界面把操作ID传给后台，取消中锁住目标并保留部分�
   fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
   await waitFor(() => expect(api.cancelOperation).toHaveBeenCalledWith("sync-task"));
   expect(screen.getByRole("button", { name: /按主键同步/ })).toBeDisabled();
-  expect(screen.getByRole("combobox", { name: "目标表" })).toBeDisabled();
+  expect(screen.getByLabelText("目标表", { selector: "input" })).toBeDisabled();
   vi.mocked(api.operationStatus).mockResolvedValue({ ...operation, status: "cancelled", cancelRequested: true, message: "已完成的第一批保留" });
   await act(async () => pending.reject({ kind: "cancelled", message: "已完成的第一批保留", committed: 500, batches: 1 }));
   await screen.findByText("任务已取消");

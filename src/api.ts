@@ -91,6 +91,13 @@ export const api = {
     pageSize: number;
     onlyStatement?: number | null;
   }, operationId?: string) => call<ExecuteSqlResponse>("execute_sql", { request, operationId }),
+  executeReadQuery: (request: {
+    connectionId: string;
+    database: string;
+    sql: string;
+    page: number;
+    pageSize: number;
+  }, operationId?: string) => call<ExecuteSqlResponse>("execute_read_query", { request, operationId }),
   fetchRows: (request: FetchRowsRequest) => call<DataPage>("fetch_rows", { request }),
   commitChanges: (request: {
     connectionId: string;

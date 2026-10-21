@@ -6,7 +6,6 @@ import "@fontsource/inter/600.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
 import "antd/dist/reset.css";
-import "./monacoSetup";
 import "./styles.css";
 import App from "./App";
 

@@ -7,7 +7,7 @@ export function isBoolType(dataType: string): boolean {
 export function isNumericType(dataType: string): boolean {
   const dataTypeLower = dataType.toLowerCase();
   if (dataTypeLower.startsWith("interval")) return false;
-  return ["int", "serial", "decimal", "numeric", "float", "double", "real", "money", "number", "dec"].some(
+  return ["int", "serial", "decimal", "numeric", "float", "double", "real", "money", "number", "dec", "fixed"].some(
     (token) => dataTypeLower.startsWith(token),
   );
 }
@@ -97,6 +97,38 @@ export function sameValue(left: JsonValue | undefined, right: JsonValue | undefi
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
+/** BSON uses Extended JSON so objects, scalar types and typed wrappers survive editing. */
+export function cellEditorText(value: JsonValue, column: ColumnMeta): string {
+  if (/^jsonb?$/i.test(column.dataType) && typeof value === "string") return value;
+  if (isJsonCell(column, value)) return JSON.stringify(value);
+  return value === null ? "" : displayCell(value, column.dataType);
+}
+
+function isJsonCell(column: ColumnMeta, value: JsonValue): boolean {
+  return /^(bson|jsonb?)$/i.test(column.dataType) || (value !== null && typeof value === "object");
+}
+
+export function parseEditedCell(raw: string, column: ColumnMeta, original: JsonValue): JsonValue {
+  if (raw === cellEditorText(original, column)) return original;
+  if (!isJsonCell(column, original)) return parseCell(raw, column, false);
+  try {
+    const value = JSON.parse(raw) as JsonValue;
+    // SQL JSON columns arrive as encoded text and must return text to preserve JSON scalars.
+    if (/^jsonb?$/i.test(column.dataType)) return raw;
+    const validate = (item: JsonValue): void => {
+      if (typeof item === "number" && (!Number.isFinite(item) || (Number.isInteger(item) && !Number.isSafeInteger(item)))) {
+        throw new Error("不精确数值");
+      }
+      if (Array.isArray(item)) item.forEach(validate);
+      else if (item !== null && typeof item === "object") Object.values(item).forEach(validate);
+    };
+    validate(value);
+    return value;
+  } catch {
+    throw new Error("请输入有效 JSON；字符串需加双引号，大整数请使用 Extended JSON 数值包装。");
+  }
+}
+
 export function parseCell(raw: string, column: ColumnMeta, asNull: boolean): JsonValue {
   if (asNull) return null;
   if (isBoolType(column.dataType)) {
@@ -109,7 +141,7 @@ export function parseCell(raw: string, column: ColumnMeta, asNull: boolean): Jso
     const trimmed = raw.trim();
     if (!trimmed) return null;
     // Exact database numbers must not pass through JavaScript's binary floating point.
-    if (/^(decimal|numeric|number|money|dec)\b/i.test(column.dataType)) return trimmed;
+    if (/^(decimal|numeric|number|money|dec|fixed)\b/i.test(column.dataType)) return trimmed;
     if (/^-?\d+$/.test(trimmed)) {
       const integer = Number(trimmed);
       return Number.isSafeInteger(integer) ? integer : trimmed;
