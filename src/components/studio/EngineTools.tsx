@@ -1,5 +1,5 @@
 import { App, Alert, Button, Input, InputNumber, Select, Space, Table } from "antd";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, errorText } from "../../api";
 import { useTabStore } from "../../stores/useTabStore";
 import { useProfiles, defaultDb } from "./shared";
@@ -11,8 +11,30 @@ export function RedisPubSub() {
   const [channel, setChannel] = useState("orders");
   const [text, setText] = useState("hello");
   const [log, setLog] = useState<string[]>([]);
+  const [listening, setListening] = useState(false);
   const [ttlKey, setTtlKey] = useState("orders");
   const [ttl, setTtl] = useState(60);
+
+  useEffect(() => {
+    if (!listening || !id) return;
+    let stopped = false;
+    const listen = () => {
+      void api.redisListen(id, channel, 1500).then((items) => {
+        if (stopped) return;
+        if (items.length) setLog((current) => [...current, ...items].slice(-200));
+        window.setTimeout(listen, 200);
+      }).catch((err) => {
+        if (!stopped) {
+          setListening(false);
+          message.error(errorText(err));
+        }
+      });
+    };
+    listen();
+    return () => {
+      stopped = true;
+    };
+  }, [listening, id, channel, message]);
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <Alert type="info" showIcon message="发布走当前连接。订阅会再开一条直连，SSH 隧道下需要 Redis 端口对本机可达。查询编辑器里也可以直接输入 Redis 命令。" />
@@ -26,7 +48,7 @@ export function RedisPubSub() {
       </Space>
       <Space>
         <Button type="primary" onClick={() => id && void api.redisPublish(id, channel, text).then((count) => message.success(`已送达 ${count} 个订阅者`)).catch((err) => message.error(errorText(err)))}>发布</Button>
-        <Button onClick={() => id && void api.redisListen(id, channel, 1500).then((items) => setLog(items)).catch((err) => message.error(errorText(err)))}>听 1.5 秒</Button>
+        <Button onClick={() => setListening((value) => !value)} disabled={!id}>{listening ? "停止监听" : "持续监听"}</Button>
       </Space>
       <Input.TextArea rows={6} value={log.join("\n")} readOnly />
     </div>
@@ -39,15 +61,26 @@ export function MongoBuilder() {
   const openQuery = useTabStore((state) => state.openQuery);
   const [id, setId] = useState<string>();
   const [collection, setCollection] = useState("books");
+  const [collections, setCollections] = useState<string[]>([]);
   const [filter, setFilter] = useState('{ "price": { "$gt": 10 } }');
   const [pipeline, setPipeline] = useState('[{ "$match": { "price": { "$gt": 10 } } }, { "$limit": 20 }]');
   const profile = profiles.find((item) => item.id === id);
+
+  useEffect(() => {
+    if (!id || !profile) return;
+    const database = profile.database || "";
+    void api.listTables(id, database, database).then(setCollections).catch((err) => message.error(errorText(err)));
+  }, [id, profile, message]);
 
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <Alert type="info" showIcon message="生成的 find / aggregate 会在查询页执行。集合树就是左侧对象浏览器里的集合；结构分析在“生成、脱敏与字典”。" />
       <Select style={{ minWidth: 200 }} placeholder="MongoDB" value={id} options={profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={setId} />
-      <Input value={collection} onChange={(event) => setCollection(event.target.value)} />
+      {collections.length > 0 ? (
+        <Select showSearch style={{ minWidth: 220 }} value={collection} options={collections.map((name) => ({ value: name, label: name }))} onChange={setCollection} />
+      ) : (
+        <Input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="集合" />
+      )}
       <Input.TextArea rows={3} value={filter} onChange={(event) => setFilter(event.target.value)} />
       <Button onClick={() => openQuery({ connectionId: id, database: profile?.database || "", sql: `find ${collection} ${filter}`, title: `find ${collection}` })}>打开 find</Button>
       <Input.TextArea rows={4} value={pipeline} onChange={(event) => setPipeline(event.target.value)} />

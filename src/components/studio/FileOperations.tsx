@@ -46,7 +46,7 @@ export function ImportExport() {
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <Alert type="info" showIcon message="支持 JSON、XML、TXT、CSV、XLSX、DBF、PDF、Parquet。Parquet 单元格按文本保存，可读写 Snappy、gzip、zstd 和 lz4。Access 需要 mdb-export，ODBC 需要本机 isql，DSN 写在导入路径里。" />
-      <ConnFields {...ref} disabled={!!busy} onChange={(patch) => { setRef({ ...ref, ...patch }); setFeedback(null); }} />
+      <ConnFields {...ref} applySeed disabled={!!busy} onChange={(patch) => { setRef({ ...ref, ...patch }); setFeedback(null); }} />
       <Select disabled={!!busy} value={format} style={{ width: 160 }} options={["json", "xml", "txt", "csv", "xlsx", "dbf", "pdf", "parquet", "mdb", "odbc"].map((value) => ({ value, label: value.toUpperCase() }))} onChange={setFormat} />
       <Space>
         <Button disabled={!!busy || !ready} loading={busy === "export"} onClick={() => void transfer(true)}>导出</Button>
@@ -104,7 +104,7 @@ export function Backup() {
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <Alert type="info" showIcon message="自动模式优先使用 mysqldump、pg_dump、mongodump；SQL Server 提交 BACKUP DATABASE，路径必须在服务器上。SQLite 可导出结构与数据脚本。其他引擎缺少原生工具时只导出数据 INSERT 脚本，不含完整结构，也不保证一致性快照。结果会标明实际产物。" />
-      <ConnFields id={id} database={database} schema={schema} disabled={!!busy} onChange={(patch) => {
+      <ConnFields id={id} database={database} schema={schema} applySeed disabled={!!busy} onChange={(patch) => {
         if (patch.id !== undefined) setId(patch.id);
         if (patch.database !== undefined) setDatabase(patch.database);
         if (patch.schema !== undefined) setSchema(patch.schema);

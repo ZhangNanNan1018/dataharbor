@@ -1,6 +1,6 @@
 import { App, Alert, Button, Input, InputNumber, Select, Space, Table, Tag } from "antd";
 import { useEffect, useState } from "react";
-import { api, errorText, type Job } from "../../api";
+import { api, errorText, pickSavePath, type Job } from "../../api";
 import { defaultDb, useOperation, useProfiles } from "./shared";
 
 function newJob(): Job {
@@ -16,7 +16,6 @@ export function Jobs() {
   const profiles = useProfiles();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [draft, setDraft] = useState<Job>(newJob);
-  const [batch, setBatch] = useState("");
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState(587);
   const [smtpUser, setSmtpUser] = useState("");
@@ -35,12 +34,11 @@ export function Jobs() {
 
   function edit(job: Job) {
     setDraft({ ...job, profileIds: [...(job.profileIds || [])] });
-    setBatch((job.profileIds || []).join(","));
   }
 
   async function save(enabled: boolean) {
     await run(enabled ? "enable" : "save", async () => {
-      const profileIds = batch.split(",").map((id) => id.trim()).filter(Boolean);
+      const profileIds = draft.profileIds || [];
       if (!draft.name.trim()) throw new Error("请填写任务名称");
       if (!["query", "backup", "export"].includes(draft.kind)) throw new Error("请重新选择任务类型");
       if (enabled) {
@@ -103,9 +101,20 @@ export function Jobs() {
         <Input disabled={!!busy} value={draft.table} onChange={(event) => patch({ table: event.target.value })} placeholder="表（导出任务必填）" aria-label="表" />
       </Space>
       <Input.TextArea disabled={!!busy} rows={4} value={draft.sql} onChange={(event) => patch({ sql: event.target.value })} placeholder="任务 SQL（查询 / 执行 SQL 类型会执行此内容）" aria-label="任务 SQL" />
-      <Input disabled={!!busy} value={draft.path} onChange={(event) => patch({ path: event.target.value })} placeholder="输出路径（导出必填；备份留空使用配置目录）" aria-label="输出路径" />
+      <Space.Compact className="w-full max-w-xl">
+        <Input disabled={!!busy} value={draft.path} onChange={(event) => patch({ path: event.target.value })} placeholder="输出路径（导出必填；备份留空使用配置目录）" aria-label="输出路径" />
+        <Button disabled={!!busy} onClick={() => void pickSavePath(draft.path || "export.csv").then((path) => { if (path) patch({ path }); })}>浏览</Button>
+      </Space.Compact>
       <Input disabled={!!busy} value={draft.notifyEmail || ""} onChange={(event) => patch({ notifyEmail: event.target.value })} placeholder="通知邮箱，可空" />
-      <Input disabled={!!busy} value={batch} onChange={(event) => setBatch(event.target.value)} placeholder="批量连接 ID，逗号分隔；启用后也会在这些连接执行" />
+      <Select
+        disabled={!!busy}
+        mode="multiple"
+        style={{ width: "100%" }}
+        placeholder="同时在这些连接上执行"
+        value={draft.profileIds || []}
+        options={profiles.filter((item) => item.id !== draft.connectionId).map((item) => ({ value: item.id, label: item.name }))}
+        onChange={(profileIds) => patch({ profileIds })}
+      />
       <Space wrap>
         <Button disabled={!!busy} loading={busy === "save"} onClick={() => void save(false)}>保存为暂停</Button>
         <Button type="primary" disabled={!!busy} loading={busy === "enable"} onClick={() => void save(true)}>保存并启用</Button>
@@ -120,10 +129,17 @@ export function Jobs() {
         { title: "操作", render: (_: unknown, job: Job) => <Space wrap>
           <Button size="small" disabled={!!busy} onClick={() => edit(job)}>查看 / 编辑</Button>
           {job.enabled && <Button size="small" disabled={!!busy} loading={busy === `pause:${job.id}`} onClick={() => void pause(job)}>暂停</Button>}
-          <Button size="small" danger disabled={!!busy} onClick={() => void run(`delete:${job.id}`, async () => {
-            await api.deleteJob(job.id);
-            if (draft.id === job.id) edit(newJob());
-            await reload();
+          <Button size="small" danger disabled={!!busy} onClick={() => modal.confirm({
+            title: `删除任务「${job.name}」？`,
+            content: "只删除本机任务配置，不会撤销已经执行过的 SQL。",
+            okText: "删除",
+            okButtonProps: { danger: true },
+            cancelText: "取消",
+            onOk: () => run(`delete:${job.id}`, async () => {
+              await api.deleteJob(job.id);
+              if (draft.id === job.id) edit(newJob());
+              await reload();
+            }),
           })}>删除</Button>
         </Space> },
       ]} />

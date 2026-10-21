@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Checkbox,
+  Dropdown,
   Input,
   Modal,
   Pagination,
@@ -446,59 +447,56 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         <Button size="small" disabled={readOnly || task.active || loading || submitting || importing || refreshRequired} onClick={() => setImportOpen(true)}>
           导入 CSV
         </Button>
-        <Button size="small" onClick={() => setFormView((value) => !value)}>
-          {formView ? "网格" : "表单"}
-        </Button>
-        <Button
-          size="small"
-          onClick={() => {
-            void api
-              .profileTable({ connectionId: tab.connectionId, database: tab.database, schema: tab.schema, table: tab.table })
-              .then((grid) => setJsonText([grid.note, grid.columns.join(" | "), ...grid.rows.map((row) => row.map((cell) => String(cell ?? "")).join(" | "))].join("\n")))
-              .catch((err) => message.error(errorText(err)));
-          }}
-        >
-          画像
-        </Button>
-        <Button
-          size="small"
-          disabled={readOnly || loading || submitting || importing || refreshRequired}
-          onClick={() => {
-            const row = rows[formIndex] ?? rows[0];
-            if (!row) return;
-            const schemaText = columns.map((column) => `${column.name} ${column.dataType}`).join(", ");
-            const current = Object.fromEntries(columns.map((column, index) => [column.name, row.cells[index]]));
-            void api
-              .aiAsk({ task: "fill", sql: JSON.stringify(current), schemaText, prompt: "只补空值", engine: "sqlite" })
-              .then((text) => {
-                const match = text.match(/\{[\s\S]*\}/);
-                if (!match) throw new Error("模型没有返回 JSON 对象");
-                const object = JSON.parse(match[0]) as Record<string, JsonValue>;
-                columns.forEach((column, index) => {
-                  if (row.cells[index] == null && object[column.name] !== undefined) updateCell(row.rid, index, object[column.name]);
+        <Dropdown
+          menu={{
+            items: [
+              { key: "form", label: formView ? "回到网格" : "表单视图" },
+              { key: "json", label: "查看 JSON" },
+              { key: "profile", label: "表画像" },
+              { key: "ai", label: "AI 填充空值", disabled: readOnly || loading || submitting || importing || refreshRequired },
+            ],
+            onClick: ({ key }) => {
+              if (key === "form") setFormView((value) => !value);
+              if (key === "json") {
+                const row = rows.find((item) => selected.includes(item.rid)) ?? rows[0];
+                if (!row) return;
+                const object: Record<string, JsonValue> = {};
+                columns.forEach((column, index) => { object[column.name] = row.cells[index] ?? null; });
+                setJsonText(JSON.stringify(object, null, 2));
+              }
+              if (key === "profile") {
+                void api.profileTable({ connectionId: tab.connectionId, database: tab.database, schema: tab.schema, table: tab.table })
+                  .then((grid) => setJsonText([grid.note, grid.columns.join(" | "), ...grid.rows.map((row) => row.map((cell) => String(cell ?? "")).join(" | "))].join("\n")))
+                  .catch((err) => message.error(errorText(err)));
+              }
+              if (key === "ai") {
+                const row = rows[formIndex] ?? rows[0];
+                if (!row) return;
+                modal.confirm({
+                  title: "用 AI 填充空单元格？",
+                  content: "会把当前行和表结构发送到你配置的 AI 接口。结果先写进未提交的更改，提交后才落库。",
+                  okText: "填充",
+                  cancelText: "取消",
+                  onOk: () => {
+                    const schemaText = columns.map((column) => `${column.name} ${column.dataType}`).join(", ");
+                    const current = Object.fromEntries(columns.map((column, index) => [column.name, row.cells[index]]));
+                    return api.aiAsk({ task: "fill", sql: JSON.stringify(current), schemaText, prompt: "只补空值", engine: "sqlite" }).then((text) => {
+                      const match = text.match(/\{[\s\S]*\}/);
+                      if (!match) throw new Error("模型没有返回 JSON 对象");
+                      const object = JSON.parse(match[0]) as Record<string, JsonValue>;
+                      columns.forEach((column, index) => {
+                        if (row.cells[index] == null && object[column.name] !== undefined) updateCell(row.rid, index, object[column.name]);
+                      });
+                      message.success("已写入未保存的补全，提交后才会落库");
+                    });
+                  },
                 });
-                message.success("已写入未保存的补全，提交后才会落库");
-              })
-              .catch((err) => message.error(errorText(err)));
+              }
+            },
           }}
         >
-          AI 填充
-        </Button>
-        <span className="text-xs text-[var(--xb-muted)]">AI 填充会将当前行和表结构发送至你配置的 AI 接口</span>
-        <Button
-          size="small"
-          onClick={() => {
-            const row = rows.find((item) => selected.includes(item.rid)) ?? rows[0];
-            if (!row) return;
-            const object: Record<string, JsonValue> = {};
-            columns.forEach((column, index) => {
-              object[column.name] = row.cells[index] ?? null;
-            });
-            setJsonText(JSON.stringify(object, null, 2));
-          }}
-        >
-          JSON
-        </Button>
+          <Button size="small">更多</Button>
+        </Dropdown>
       </div>
       {!importOpen && <TaskProgress task={task} />}
       {dirty && (

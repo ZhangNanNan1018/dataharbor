@@ -1,5 +1,5 @@
 import Editor, { type OnMount } from "@monaco-editor/react";
-import { App, Alert, Button, Pagination, Select, Space, Table, Tag } from "antd";
+import { App, Alert, Button, Dropdown, Input, Modal, Pagination, Select, Space, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useRef, useState } from "react";
 import { api, errorText, isOperationCancelled, pickSaveCsv, type PlanNode } from "../api";
@@ -47,6 +47,8 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   const [active, setActive] = useState(0);
   const [plan, setPlan] = useState<PlanNode | null>(null);
   const [resultView, setResultView] = useState<"grid" | "messages" | "plan">("grid");
+  const [paramOpen, setParamOpen] = useState(false);
+  const [paramText, setParamText] = useState("");
   const [history, setHistory] = useState<string[]>(() => readHistory());
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const [editorReady, setEditorReady] = useState(0);
@@ -407,42 +409,57 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         >
           美化
         </Button>
-        <Button
-          onClick={() => {
-            void transformDraft((sql) => api.formatSql(sql, true));
+        <Button onClick={() => void explain()}>图形解释</Button>
+        <Button onClick={() => { setParamText(""); setParamOpen(true); }}>参数</Button>
+        <Dropdown
+          menu={{
+            items: [
+              { key: "minify", label: "压缩" },
+              { type: "divider" },
+              ...history.map((sql, index) => ({ key: `history-${index}`, label: sql.replaceAll("\n", " ").slice(0, 80) })),
+            ],
+            onClick: ({ key }) => {
+              if (key === "minify") {
+                void transformDraft((sql) => api.formatSql(sql, true));
+                return;
+              }
+              const index = Number(String(key).replace("history-", ""));
+              const sql = history[index];
+              if (sql) patchQuery(tab.id, { sql });
+            },
           }}
         >
-          压缩
-        </Button>
-        <Button
-          onClick={() => void explain()}
-        >
-          图形解释
-        </Button>
-        <Select
-          style={{ minWidth: 160 }}
-          placeholder="历史语句"
-          value={undefined}
-          options={history.map((sql) => ({ value: sql, label: sql.replaceAll("\n", " ").slice(0, 48) }))}
-          onChange={(sql: string) => patchQuery(tab.id, { sql })}
-        />
-        <Button
-          onClick={() => {
-            const raw = window.prompt("参数，格式 name=value，多个用逗号", "title=活着");
-            if (!raw || !profile) return;
-            const params = raw
-              .split(",")
-              .map((part) => part.split("="))
-              .filter((pair) => pair[0])
-              .map(([name, ...rest]) => ({ name: name.trim(), value: rest.join("=").trim() }));
-            void transformDraft((sql) => api.bindSql(sql, profile.engine, params));
-          }}
-        >
-          参数
-        </Button>
+          <Button>更多</Button>
+        </Dropdown>
         <span className="text-xs text-[var(--xb-muted)]">Ctrl+Enter 运行全部。草稿和历史以 SQL 原文保存在本机。</span>
       </div>
       <TaskProgress task={task} />
+      <Modal
+        title="替换查询参数"
+        open={paramOpen}
+        okText="应用参数"
+        cancelText="取消"
+        onCancel={() => setParamOpen(false)}
+        onOk={() => {
+          if (!profile) {
+            message.error("先选择连接");
+            return Promise.reject(new Error("missing connection"));
+          }
+          const params = paramText
+            .split(",")
+            .map((part) => part.split("="))
+            .filter((pair) => pair[0]?.trim())
+            .map(([name, ...rest]) => ({ name: name.trim(), value: rest.join("=").trim() }));
+          if (!params.length) {
+            message.error("格式是 name=value，多个用逗号分隔");
+            return Promise.reject(new Error("invalid params"));
+          }
+          setParamOpen(false);
+          void transformDraft((sql) => api.bindSql(sql, profile.engine, params));
+        }}
+      >
+        <Input aria-label="参数" placeholder="name=value，多个用逗号" value={paramText} onChange={(event) => setParamText(event.target.value)} />
+      </Modal>
       <div className="xb-editor">
         <Editor
           path={`inmemory://queries/${encodeURIComponent(tab.id)}.sql`}

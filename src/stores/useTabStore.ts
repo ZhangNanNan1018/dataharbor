@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { placeholderById } from "../placeholders";
-import type { DataTab, QueryTab, StructureTab, WorkspaceTab } from "../types";
+import type { DataTab, QueryTab, StructureTab, StudioContext, WorkspaceTab } from "../types";
 
 interface OpenQueryInput {
   connectionId?: string | null;
@@ -26,7 +26,7 @@ interface TabState {
   openQuery: (input?: OpenQueryInput) => string;
   openData: (input: OpenDataInput) => string;
   openStructure: (input: Omit<OpenDataInput, "readOnly">) => string;
-  openPlaceholder: (feature: string) => string;
+  openPlaceholder: (feature: string, context?: StudioContext) => string;
   close: (id: string) => void;
   setActive: (id: string) => void;
   patchQuery: (id: string, patch: Partial<Pick<QueryTab, "connectionId" | "database" | "sql" | "title">>) => void;
@@ -135,11 +135,16 @@ export const useTabStore = create<TabState>((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeId: id });
     return id;
   },
-  openPlaceholder: (feature) => {
+  openPlaceholder: (feature, context) => {
     const spec = placeholderById(feature);
     const existing = get().tabs.find((tab) => tab.kind === "placeholder" && tab.feature === feature);
     if (existing) {
-      set({ activeId: existing.id });
+      set({
+        activeId: existing.id,
+        tabs: context
+          ? get().tabs.map((tab) => (tab.id === existing.id && tab.kind === "placeholder" ? { ...tab, context } : tab))
+          : get().tabs,
+      });
       return existing.id;
     }
     const id = uid();
@@ -153,6 +158,7 @@ export const useTabStore = create<TabState>((set, get) => ({
           feature: spec.id,
           summary: spec.summary,
           points: spec.points,
+          context,
         },
       ],
       activeId: id,

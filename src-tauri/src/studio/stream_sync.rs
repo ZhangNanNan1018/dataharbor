@@ -188,6 +188,19 @@ fn run_with_hook(
         operation,
         hook,
     )?;
+    if request.preview {
+        operation.report("预览", total, Some(total), "预览完成，尚未写入目标");
+        return Ok(SyncResult {
+            inserted: planned.inserted,
+            updated: planned.updated,
+            deleted: planned.deleted,
+            truncated: false,
+            note: format!(
+                "预览未写入目标。将插入 {} 行，更新 {} 行，删除 {} 行。确认写入前请停止相关表的其他写入。",
+                planned.inserted, planned.updated, planned.deleted
+            ),
+        });
+    }
     let mut committed = SyncResult {
         inserted: 0,
         updated: 0,

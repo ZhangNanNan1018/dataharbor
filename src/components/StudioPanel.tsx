@@ -1,6 +1,7 @@
 import { Alert } from "antd";
 import { lazy, Suspense } from "react";
 import type { PlaceholderTab } from "../types";
+import { StudioSeedContext } from "./studio/shared";
 
 const QueryBuilder = lazy(() => import("./studio/QueryDesign").then((module) => ({ default: module.QueryBuilder })));
 const Designer = lazy(() => import("./studio/QueryDesign").then((module) => ({ default: module.Designer })));
@@ -22,7 +23,11 @@ const MongoBuilder = lazy(() => import("./studio/EngineTools").then((module) => 
 const DebugPanel = lazy(() => import("./studio/EngineTools").then((module) => ({ default: module.DebugPanel })));
 
 export function StudioPanel({ tab }: { tab: PlaceholderTab }) {
-  return <Suspense fallback={<div className="xb-panel" role="status">正在打开工具…</div>}>{renderTool(tab.feature)}</Suspense>;
+  return (
+    <StudioSeedContext.Provider value={tab.context ?? null}>
+      <Suspense fallback={<div className="xb-panel" role="status">正在打开工具…</div>}>{renderTool(tab.feature)}</Suspense>
+    </StudioSeedContext.Provider>
+  );
 }
 
 function renderTool(feature: string) {

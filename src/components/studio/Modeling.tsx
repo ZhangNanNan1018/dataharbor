@@ -1,5 +1,5 @@
 import { App, Alert, Button, Input, Select, Space } from "antd";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorText, pickSavePath, type DataModel, type ErGraph } from "../../api";
 import { ENGINES } from "../../engines";
 import { type Engine } from "../../types";
@@ -25,8 +25,9 @@ export function ErView() {
       setGraph(next);
       const saved = readLayout(layoutKey);
       const placed: Record<string, { x: number; y: number }> = {};
+      const columns = Math.max(2, Math.ceil(Math.sqrt(next.tables.length || 1)));
       next.tables.forEach((table, index) => {
-        placed[table.name] = saved[table.name] ?? { x: 24 + (index % 3) * 300, y: 24 + Math.floor(index / 3) * 190 };
+        placed[table.name] = saved[table.name] ?? { x: 24 + (index % columns) * 280, y: 24 + Math.floor(index / columns) * 220 };
       });
       setPositions(placed);
     } catch (err) {
@@ -36,13 +37,14 @@ export function ErView() {
 
   function svgText() {
     const tables = graph?.tables ?? [];
-    const width = 1600;
-    const height = 1200;
+    const colors = themeColors();
+    const width = Math.max(960, ...tables.map((table) => (positions[table.name]?.x ?? 0) + 280));
+    const height = Math.max(640, ...tables.map((table) => (positions[table.name]?.y ?? 0) + cardHeight(table.columns.length) + 40));
     const boxes = tables
       .map((table) => {
         const pos = positions[table.name] ?? { x: 0, y: 0 };
-        const lines = table.columns.slice(0, 12).map((column, index) => `<text x="${pos.x + 8}" y="${pos.y + 36 + index * 14}" font-size="11" fill="#d7dde6">${column.primaryKey ? "PK " : ""}${escapeXml(column.name)} ${escapeXml(column.dataType)}</text>`).join("");
-        return `<rect x="${pos.x}" y="${pos.y}" width="240" height="${56 + Math.min(table.columns.length, 12) * 14}" rx="6" fill="#1b212b" stroke="#8B93FF"/><text x="${pos.x + 8}" y="${pos.y + 18}" font-size="13" fill="#f3efe4">${escapeXml(table.name)}</text>${lines}`;
+        const lines = table.columns.map((column, index) => `<text x="${pos.x + 8}" y="${pos.y + 36 + index * 16}" font-size="11" fill="${colors.muted}">${column.primaryKey ? "PK " : ""}${escapeXml(column.name)} ${escapeXml(column.dataType)}</text>`).join("");
+        return `<rect x="${pos.x}" y="${pos.y}" width="240" height="${cardHeight(table.columns.length)}" rx="6" fill="${colors.panel}" stroke="${colors.accent}"/><text x="${pos.x + 8}" y="${pos.y + 18}" font-size="13" fill="${colors.text}">${escapeXml(table.name)}</text>${lines}`;
       })
       .join("");
     const lines = (graph?.edges ?? [])
@@ -50,15 +52,23 @@ export function ErView() {
         const from = positions[edge.fromTable];
         const to = positions[edge.toTable];
         if (!from || !to) return "";
-        return `<line x1="${from.x + 120}" y1="${from.y + 20}" x2="${to.x + 120}" y2="${to.y + 20}" stroke="#8B93FF"/>`;
+        const line = linkBoxes(from, cardHeight(columnCount(graph, edge.fromTable)), to, cardHeight(columnCount(graph, edge.toTable)));
+        return `<line x1="${line.x1}" y1="${line.y1}" x2="${line.x2}" y2="${line.y2}" stroke="${colors.accent}"/>`;
       })
       .join("");
     return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${lines}${boxes}</svg>`;
   }
 
+  const diagramSize = useMemo(() => {
+    const tables = graph?.tables ?? [];
+    const width = Math.max(960, ...tables.map((table) => (positions[table.name]?.x ?? 0) + 280));
+    const height = Math.max(640, ...tables.map((table) => (positions[table.name]?.y ?? 0) + cardHeight(table.columns.length) + 40));
+    return { width, height };
+  }, [graph, positions]);
+
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
-      <ConnFields id={id} database={database} schema={schema} onChange={(patch) => {
+      <ConnFields applySeed id={id} database={database} schema={schema} onChange={(patch) => {
         if (patch.id !== undefined) setId(patch.id);
         if (patch.database !== undefined) setDatabase(patch.database);
         if (patch.schema !== undefined) setSchema(patch.schema);
@@ -88,13 +98,14 @@ export function ErView() {
           setZoom((value) => Math.min(2, Math.max(0.4, value + (event.deltaY < 0 ? 0.05 : -0.05))));
         }}
       >
-        <div style={{ transform: `scale(${zoom})`, transformOrigin: "0 0", width: 1600, height: 1200, position: "relative" }}>
-          <svg width={1600} height={1200} className="absolute inset-0">
+        <div style={{ transform: `scale(${zoom})`, transformOrigin: "0 0", width: diagramSize.width, height: diagramSize.height, position: "relative" }}>
+          <svg width={diagramSize.width} height={diagramSize.height} className="absolute inset-0">
             {(graph?.edges ?? []).map((edge, index) => {
               const from = positions[edge.fromTable];
               const to = positions[edge.toTable];
               if (!from || !to) return null;
-              return <line key={index} x1={from.x + 120} y1={from.y + 20} x2={to.x + 120} y2={to.y + 20} stroke="var(--xb-accent)" />;
+              const line = linkBoxes(from, cardHeight(columnCount(graph, edge.fromTable)), to, cardHeight(columnCount(graph, edge.toTable)));
+              return <line key={index} x1={line.x1} y1={line.y1} x2={line.x2} y2={line.y2} stroke="var(--xb-accent)" />;
             })}
           </svg>
           {graph?.tables.map((table) => {
@@ -130,7 +141,7 @@ export function ErView() {
                 }}
               >
                 <strong>{table.name}</strong>
-                <div className="max-h-28 overflow-auto">
+                <div>
                   {table.columns.map((column) => (
                     <div key={column.name}>
                       {column.primaryKey ? "PK " : ""}
@@ -169,7 +180,7 @@ export function ModelStudio() {
         <Select value={level} style={{ width: 140 }} options={["conceptual", "logical", "physical"].map((value) => ({ value, label: value }))} onChange={setLevel} />
         <Select value={engine} style={{ width: 140 }} options={ENGINES.map((item) => ({ value: item.value, label: item.label }))} onChange={(value) => setEngine(value)} />
       </Space>
-      <ConnFields id={id} database={database} schema={schema} onChange={(patch) => {
+      <ConnFields applySeed id={id} database={database} schema={schema} onChange={(patch) => {
         if (patch.id !== undefined) setId(patch.id);
         if (patch.database !== undefined) setDatabase(patch.database);
         if (patch.schema !== undefined) setSchema(patch.schema);
@@ -210,6 +221,39 @@ function readLayout(key: string): Record<string, { x: number; y: number }> {
   } catch {
     return {};
   }
+}
+
+function cardHeight(count: number) {
+  return 28 + Math.max(count, 1) * 16 + 12;
+}
+
+function columnCount(graph: ErGraph | null, name: string) {
+  return graph?.tables.find((table) => table.name === name)?.columns.length ?? 1;
+}
+
+function linkBoxes(from: { x: number; y: number }, fromHeight: number, to: { x: number; y: number }, toHeight: number) {
+  const width = 240;
+  const ax = from.x + width / 2;
+  const ay = from.y + fromHeight / 2;
+  const bx = to.x + width / 2;
+  const by = to.y + toHeight / 2;
+  const dx = bx - ax;
+  const dy = by - ay;
+  if (!dx && !dy) return { x1: ax, y1: ay, x2: bx, y2: by };
+  const fromScale = Math.max(Math.abs(dx) / (width / 2), Math.abs(dy) / (fromHeight / 2));
+  const toScale = Math.max(Math.abs(dx) / (width / 2), Math.abs(dy) / (toHeight / 2));
+  return { x1: ax + dx / fromScale, y1: ay + dy / fromScale, x2: bx - dx / toScale, y2: by - dy / toScale };
+}
+
+function themeColors() {
+  const style = getComputedStyle(document.documentElement);
+  const read = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
+  return {
+    panel: read("--xb-panel", "#ffffff"),
+    text: read("--xb-text", "#1c1f26"),
+    muted: read("--xb-muted", "#667085"),
+    accent: read("--xb-accent", "#4f46e5"),
+  };
 }
 
 function escapeXml(value: string) {

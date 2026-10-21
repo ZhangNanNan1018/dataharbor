@@ -1,9 +1,9 @@
-import { App, Alert, Button, Input, Space } from "antd";
-import { useEffect, useState } from "react";
+import { App, Alert, Button, Input, Select, Space } from "antd";
+import { useContext, useEffect, useState } from "react";
 import { api, errorText, pickOpenPath, pickSavePath, type Favorite, type Snippet } from "../../api";
 import { useTabStore } from "../../stores/useTabStore";
 import { useConnectionStore } from "../../stores/useConnectionStore";
-import { useOperation, useProfiles } from "./shared";
+import { StudioSeedContext, useOperation, useProfiles } from "./shared";
 
 export function Collab() {
   const { message } = App.useApp();
@@ -16,6 +16,12 @@ export function Collab() {
   const loadConnections = useConnectionStore((state) => state.load);
   const { busy, run } = useOperation();
   const [projectNote, setProjectNote] = useState("");
+  const seed = useContext(StudioSeedContext);
+  const [favoriteId, setFavoriteId] = useState<string>();
+
+  useEffect(() => {
+    if (seed?.connectionId) setFavoriteId(seed.connectionId);
+  }, [seed?.connectionId]);
 
   async function reload() {
     setSnippets(await api.listSnippets());
@@ -55,11 +61,27 @@ export function Collab() {
           <Button size="small" danger onClick={() => void api.deleteSnippet(snippet.id).then(reload)}>删除</Button>
         </div>
       ))}
-      <Button onClick={() => {
-        const profile = profiles[0];
-        if (!profile) return;
-        void api.saveFavorite({ connectionId: profile.id, database: profile.database, schema: "", objectName: profile.name, kind: "connection" }).then(reload);
-      }}>把第一个连接加入收藏</Button>
+      <Space wrap>
+        <Select
+          style={{ minWidth: 180 }}
+          placeholder="要收藏的连接"
+          value={favoriteId}
+          options={profiles.map((item) => ({ value: item.id, label: item.name }))}
+          onChange={setFavoriteId}
+        />
+        <Button disabled={!favoriteId} onClick={() => {
+          const profile = profiles.find((item) => item.id === favoriteId);
+          if (!profile) return;
+          const same = seed?.connectionId === profile.id;
+          void api.saveFavorite({
+            connectionId: profile.id,
+            database: same ? seed?.database || profile.database : profile.database,
+            schema: same ? seed?.schema || "" : "",
+            objectName: same && seed?.table ? seed.table : profile.name,
+            kind: same && seed?.table ? "table" : "connection",
+          }).then(reload).catch((err) => message.error(errorText(err)));
+        }}>{seed?.table && seed.connectionId === favoriteId ? `收藏 ${seed.table}` : "收藏连接"}</Button>
+      </Space>
       {favorites.map((item) => <div key={item.id} className="text-xs">{item.objectName}</div>)}
     </div>
   );

@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { api, errorText } from "../../api";
 import { quoteIdent } from "../../engines";
 import { useTabStore } from "../../stores/useTabStore";
-import { ConnFields, useProfiles } from "./shared";
+import { ConnFields, useDestructiveConfirm, useProfiles } from "./shared";
 
 export function QueryBuilder() {
   const { message } = App.useApp();
@@ -13,7 +13,7 @@ export function QueryBuilder() {
   const [database, setDatabase] = useState("");
   const [schema, setSchema] = useState("");
   const [tables, setTables] = useState<string[]>([]);
-  const [picked, setPicked] = useState<{ name: string; alias: string; columns: string[] }[]>([]);
+  const [picked, setPicked] = useState<{ name: string; alias: string; columns: string[]; selected: string[] }[]>([]);
   const [joins, setJoins] = useState<{ left: string; right: string; leftCol: string; rightCol: string; type: string }[]>([]);
   const [wheres, setWheres] = useState<{ column: string; op: string; value: string }[]>([]);
   const [joinDraft, setJoinDraft] = useState({ left: "", right: "", leftCol: "", rightCol: "", type: "INNER" });
@@ -35,11 +35,12 @@ export function QueryBuilder() {
   function addTable(name: string) {
     if (!name || picked.some((item) => item.name === name)) return;
     const alias = `t${picked.length + 1}`;
-    setPicked((items) => [...items, { name, alias, columns: [] }]);
+    setPicked((items) => [...items, { name, alias, columns: [], selected: [] }]);
     if (id) {
       void api.listColumns(id, database, schema || database, name).then((columns) => {
+        const names = columns.map((column) => column.name);
         setPicked((items) =>
-          items.map((item) => (item.name === name ? { ...item, columns: columns.map((column) => column.name) } : item)),
+          items.map((item) => (item.name === name ? { ...item, columns: names, selected: names } : item)),
         );
       });
     }
@@ -49,9 +50,10 @@ export function QueryBuilder() {
     if (!picked.length || !engine) return "";
     const cols = picked.flatMap((table) =>
       table.columns.length
-        ? table.columns.map((column) => `${table.alias}.${quoteIdent(engine, column)}`)
+        ? table.selected.map((column) => `${table.alias}.${quoteIdent(engine, column)}`)
         : [`${table.alias}.*`],
     );
+    if (!cols.length) return "";
     let text = `SELECT\n  ${cols.join(",\n  ")}\nFROM ${quoteIdent(engine, picked[0].name)} ${picked[0].alias}`;
     for (const join of joins) {
       const right = picked.find((item) => item.name === join.right);
@@ -63,7 +65,7 @@ export function QueryBuilder() {
       text +=
         "\nWHERE " +
         wheres
-          .map((item) => `${item.column} ${item.op} '${item.value.replaceAll("'", "''")}'`)
+          .map((item) => `${item.column} ${item.op} ${sqlLiteral(item.value, item.op)}`)
           .join("\n  AND ");
     }
     return text;
@@ -72,6 +74,7 @@ export function QueryBuilder() {
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <ConnFields
+        applySeed
         id={id}
         database={database}
         schema={schema}
@@ -107,22 +110,38 @@ export function QueryBuilder() {
           addTable(event.dataTransfer.getData("text/plain"));
         }}
       >
-        {picked.length === 0 && <span className="text-xs text-[var(--xb-muted)]">把表拖到这里，或点击表名。再勾选字段、JOIN 和 WHERE。</span>}
+        {picked.length === 0 && <span className="text-xs text-[var(--xb-muted)]">把表拖到这里，或点击表名。勾选要查询的列，再添加 JOIN 和 WHERE。</span>}
         {picked.map((table) => (
           <div key={table.name} className="mb-2">
             <strong>
               {table.name} {table.alias}
             </strong>
-            <div className="text-xs text-[var(--xb-muted)]">{table.columns.join(", ") || "读取列中"}</div>
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+              {table.columns.length === 0 && <span className="text-xs text-[var(--xb-muted)]">读取列中</span>}
+              {table.columns.map((column) => (
+                <label key={column} className="text-xs">
+                  <input
+                    className="mr-1"
+                    type="checkbox"
+                    checked={table.selected.includes(column)}
+                    onChange={(event) => setPicked((items) => items.map((item) => item.name === table.name ? {
+                      ...item,
+                      selected: event.target.checked ? [...item.selected, column] : item.selected.filter((name) => name !== column),
+                    } : item))}
+                  />
+                  {column}
+                </label>
+              ))}
+            </div>
           </div>
         ))}
       </div>
       <Space wrap>
         <Select style={{ width: 110 }} value={joinDraft.type} options={["INNER", "LEFT", "RIGHT"].map((value) => ({ value, label: value }))} onChange={(type) => setJoinDraft({ ...joinDraft, type })} />
-        <Select style={{ width: 120 }} placeholder="左表" value={joinDraft.left || undefined} options={picked.map((item) => ({ value: item.name, label: item.name }))} onChange={(left) => setJoinDraft({ ...joinDraft, left })} />
-        <Input style={{ width: 100 }} placeholder="左列" value={joinDraft.leftCol} onChange={(event) => setJoinDraft({ ...joinDraft, leftCol: event.target.value })} />
-        <Select style={{ width: 120 }} placeholder="右表" value={joinDraft.right || undefined} options={picked.map((item) => ({ value: item.name, label: item.name }))} onChange={(right) => setJoinDraft({ ...joinDraft, right })} />
-        <Input style={{ width: 100 }} placeholder="右列" value={joinDraft.rightCol} onChange={(event) => setJoinDraft({ ...joinDraft, rightCol: event.target.value })} />
+        <Select style={{ width: 120 }} placeholder="左表" value={joinDraft.left || undefined} options={picked.map((item) => ({ value: item.name, label: item.name }))} onChange={(left) => setJoinDraft({ ...joinDraft, left, leftCol: "" })} />
+        <Select style={{ width: 120 }} placeholder="左列" value={joinDraft.leftCol || undefined} options={columnChoices(picked, joinDraft.left)} onChange={(leftCol) => setJoinDraft({ ...joinDraft, leftCol })} />
+        <Select style={{ width: 120 }} placeholder="右表" value={joinDraft.right || undefined} options={picked.map((item) => ({ value: item.name, label: item.name }))} onChange={(right) => setJoinDraft({ ...joinDraft, right, rightCol: "" })} />
+        <Select style={{ width: 120 }} placeholder="右列" value={joinDraft.rightCol || undefined} options={columnChoices(picked, joinDraft.right)} onChange={(rightCol) => setJoinDraft({ ...joinDraft, rightCol })} />
         <Button
           onClick={() => {
             if (!joinDraft.left || !joinDraft.right || !joinDraft.leftCol || !joinDraft.rightCol) return;
@@ -133,7 +152,16 @@ export function QueryBuilder() {
         </Button>
       </Space>
       <Space wrap>
-        <Input style={{ width: 160 }} placeholder="列，如 t1.id" value={whereDraft.column} onChange={(event) => setWhereDraft({ ...whereDraft, column: event.target.value })} />
+        <Select
+          style={{ width: 180 }}
+          placeholder="列"
+          value={whereDraft.column || undefined}
+          options={picked.flatMap((table) => table.columns.map((column) => {
+            const value = `${table.alias}.${quoteIdent(engine, column)}`;
+            return { value, label: `${table.alias}.${column}` };
+          }))}
+          onChange={(column) => setWhereDraft({ ...whereDraft, column })}
+        />
         <Select style={{ width: 80 }} value={whereDraft.op} options={["=", "<>", ">", "<", "LIKE"].map((value) => ({ value, label: value }))} onChange={(op) => setWhereDraft({ ...whereDraft, op })} />
         <Input style={{ width: 140 }} placeholder="值" value={whereDraft.value} onChange={(event) => setWhereDraft({ ...whereDraft, value: event.target.value })} />
         <Button onClick={() => whereDraft.column && setWheres((items) => [...items, whereDraft])}>添加 WHERE</Button>
@@ -150,8 +178,22 @@ export function QueryBuilder() {
   );
 }
 
+export function sqlLiteral(value: string, op: string): string {
+  if (op !== "LIKE") {
+    const trimmed = value.trim();
+    if (/^null$/i.test(trimmed)) return "NULL";
+    if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(trimmed)) return trimmed;
+  }
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function columnChoices(picked: { name: string; columns: string[] }[], tableName: string) {
+  return (picked.find((item) => item.name === tableName)?.columns ?? []).map((column) => ({ value: column, label: column }));
+}
+
 export function Designer() {
   const { message } = App.useApp();
+  const confirm = useDestructiveConfirm();
   const profiles = useProfiles();
   const [id, setId] = useState<string>();
   const [database, setDatabase] = useState("");
@@ -174,6 +216,7 @@ export function Designer() {
 
   async function run() {
     if (!id || !sql) return;
+    if (!await confirm("确认执行设计 SQL", sql)) return;
     try {
       await api.connect(id);
       const result = await api.executeSql({ connectionId: id, database, sql, page: 1, pageSize: 20 });
@@ -187,7 +230,7 @@ export function Designer() {
 
   return (
     <div className="xb-panel space-y-3 overflow-auto p-3">
-      <ConnFields id={id} database={database} schema={schema} onChange={(patch) => {
+      <ConnFields applySeed id={id} database={database} schema={schema} onChange={(patch) => {
         if (patch.id !== undefined) setId(patch.id);
         if (patch.database !== undefined) setDatabase(patch.database);
         if (patch.schema !== undefined) setSchema(patch.schema);

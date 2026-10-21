@@ -39,6 +39,11 @@ export function isServerEngine(engine: Engine): boolean {
   return engine !== "sqlite";
 }
 
+/** Engines whose object tree has a schema level between database and table. */
+export function usesSchema(engine: Engine | undefined): boolean {
+  return engine === "postgres" || engine === "mssql" || engine === "oracle";
+}
+
 export function quoteIdent(engine: Engine | undefined, name: string): string {
   if (engine === "mysql" || engine === "mariadb") {
     return `\`${name.replaceAll("`", "``")}\``;

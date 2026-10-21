@@ -297,6 +297,8 @@ export interface PairRequest {
   deleteMissing?: boolean;
   allowDestructive?: boolean;
   selectedIds?: string[];
+  /** Read and compare only. The target is not modified. */
+  preview?: boolean;
 }
 
 export interface BackupRequest {

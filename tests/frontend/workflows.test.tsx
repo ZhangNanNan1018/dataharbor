@@ -16,7 +16,8 @@ vi.mock("../../src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/api")>();
   return { ...actual, api: { ...actual.api,
     fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn(),
-    listDatabases: vi.fn(), executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
+    listDatabases: vi.fn(), listSchemas: vi.fn(), listTables: vi.fn(), listViews: vi.fn(), connect: vi.fn(),
+    executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
     aiSettings: vi.fn(), saveAiSettings: vi.fn(),
     createOperation: vi.fn(), operationStatus: vi.fn(), cancelOperation: vi.fn(), releaseOperation: vi.fn(),
     syncRows: vi.fn(), transferRows: vi.fn(),
@@ -88,6 +89,10 @@ beforeEach(() => {
   vi.mocked(api.foreignKeys).mockResolvedValue([]);
   vi.mocked(api.commitChanges).mockResolvedValue({ applied: 1 });
   vi.mocked(api.listDatabases).mockResolvedValue(["A", "B"]);
+  vi.mocked(api.listSchemas).mockResolvedValue(["public"]);
+  vi.mocked(api.listTables).mockResolvedValue(["books"]);
+  vi.mocked(api.listViews).mockResolvedValue([]);
+  vi.mocked(api.connect).mockResolvedValue({ version: "test" });
   vi.mocked(api.executeSql).mockResolvedValue({ statements: [statement()], stopped: false });
   vi.mocked(pickSaveCsv).mockResolvedValue("fixture.csv");
   vi.mocked(api.exportSqlCsv).mockResolvedValue({ path: "fixture.csv", rowCount: 1, truncated: false });
@@ -288,12 +293,13 @@ describe("查询辅助工具的迟到响应", () => {
     expect(screen.getByLabelText("SQL 编辑器")).toHaveValue("SELECT newer_draft");
     const binding = deferred<string>();
     vi.spyOn(api, "bindSql").mockReturnValueOnce(binding.promise);
-    const prompt = vi.spyOn(window, "prompt").mockReturnValue("name=value");
     fireEvent.click(screen.getByRole("button", { name: "参 数" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("参数"), { target: { value: "name=value" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "应用参数" }));
     act(() => useTabStore.getState().patchQuery(id, { sql: "SELECT newest_draft" }));
     await act(async () => binding.resolve("SELECT bound_old_draft"));
     expect(screen.getByLabelText("SQL 编辑器")).toHaveValue("SELECT newest_draft");
-    prompt.mockRestore();
   });
 
   it("换库后不显示旧连接的执行计划", async () => {
@@ -348,25 +354,25 @@ it("关闭运行中的查询标签会确认取消，并等后台返回后再移�
 it("同步界面把操作ID传给后台，取消中锁住目标并保留部分提交说明", async () => {
   useConnectionStore.setState({ profiles: [{ ...profile, id: "source", name: "源连接" }, { ...profile, id: "target", name: "目标连接" }] });
   const pending = deferred<{ inserted: number; updated: number; deleted: number; truncated: boolean; note: string }>();
+  vi.mocked(api.listTables).mockResolvedValue(["source_rows", "target_rows"]);
   vi.mocked(api.syncRows).mockReturnValueOnce(pending.promise);
   const operation = { id: "sync-task", label: "数据同步", status: "running" as const, phase: "写入目标", completed: 500, total: 1000, committed: 500, batches: 1, cancelRequested: false, interruptible: false, message: "已提交第一批" };
   vi.mocked(api.createOperation).mockResolvedValueOnce({ ...operation, status: "queued", completed: 0, committed: 0, batches: 0 });
   vi.mocked(api.operationStatus).mockResolvedValue(operation);
   vi.mocked(api.cancelOperation).mockResolvedValueOnce({ ...operation, cancelRequested: true });
   mount(<DataSync />);
-  fireEvent.mouseDown(screen.getAllByRole("combobox")[0]);
-  fireEvent.click(await screen.findByText(/源连接 · PostgreSQL/, { selector: ".ant-select-item-option-content" }));
-  fireEvent.mouseDown(screen.getAllByRole("combobox")[1]);
-  fireEvent.click((await screen.findAllByText(/目标连接 · PostgreSQL/, { selector: ".ant-select-item-option-content" })).at(-1)!);
-  fireEvent.change(screen.getAllByPlaceholderText("表")[0], { target: { value: "source_rows" } });
-  fireEvent.change(screen.getAllByPlaceholderText("表")[1], { target: { value: "target_rows" } });
+  await choose("源连接", "源连接 · PostgreSQL");
+  await choose("目标连接", "目标连接 · PostgreSQL");
+  await waitFor(() => expect(api.listTables).toHaveBeenCalled());
+  await choose("源表", "source_rows");
+  await choose("目标表", "target_rows");
   fireEvent.click(screen.getByRole("button", { name: "按主键同步" }));
   await waitFor(() => expect(api.syncRows).toHaveBeenCalledWith(expect.objectContaining({ sourceId: "source", targetId: "target", sourceTable: "source_rows", targetTable: "target_rows" }), "sync-task"));
   await screen.findByText(/已提交 500 条，1 批/);
   fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
   await waitFor(() => expect(api.cancelOperation).toHaveBeenCalledWith("sync-task"));
   expect(screen.getByRole("button", { name: /按主键同步/ })).toBeDisabled();
-  expect(screen.getAllByPlaceholderText("表")[1]).toBeDisabled();
+  expect(screen.getByRole("combobox", { name: "目标表" })).toBeDisabled();
   vi.mocked(api.operationStatus).mockResolvedValue({ ...operation, status: "cancelled", cancelRequested: true, message: "已完成的第一批保留" });
   await act(async () => pending.reject({ kind: "cancelled", message: "已完成的第一批保留", committed: 500, batches: 1 }));
   await screen.findByText("任务已取消");

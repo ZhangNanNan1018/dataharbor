@@ -143,6 +143,9 @@ pub struct PairRequest {
     pub allow_destructive: bool,
     #[serde(default)]
     pub selected_ids: Vec<String>,
+    /// Compare and validate without writing the target.
+    #[serde(default)]
+    pub preview: bool,
 }
 
 #[derive(Debug, Serialize)]

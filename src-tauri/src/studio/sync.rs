@@ -194,6 +194,18 @@ fn transfer_legacy(
         .collect::<Vec<_>>();
     operation.checkpoint()?;
     ensure_unchanged_profiles(state, request, &source_profile, &target_profile)?;
+    if request.preview {
+        return Ok(SyncResult {
+            inserted: rows.len(),
+            updated: 0,
+            deleted: 0,
+            truncated: false,
+            note: format!(
+                "预览未写入目标。传输将插入 {} 行，不按主键合并已有行。确认写入前请停止源表的其他写入。",
+                rows.len()
+            ),
+        });
+    }
     let inserted = commit_legacy_batches(
         &mut *target_session,
         operation,
@@ -356,6 +368,18 @@ fn sync_legacy(
         }
     }
     ensure_unchanged_profiles(state, request, &source_profile, &target_profile)?;
+    if request.preview {
+        return Ok(SyncResult {
+            inserted,
+            updated,
+            deleted,
+            truncated: false,
+            note: format!(
+                "预览未写入目标。将插入 {inserted} 行，更新 {updated} 行，删除 {deleted} 行。主键：{}。确认写入前请停止源表和目标表的其他写入。",
+                keys.join(", ")
+            ),
+        });
+    }
     if !changes.is_empty() {
         commit_legacy_batches(
             &mut *target_session,

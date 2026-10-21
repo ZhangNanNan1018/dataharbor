@@ -3,7 +3,9 @@ import { App, Button, Empty, Input, Spin, Tree } from "antd";
 import type { DataNode, EventDataNode } from "antd/es/tree";
 import { useEffect, useMemo, useState } from "react";
 import { api, errorText } from "../api";
-import { engineLabel, qualifiedTable } from "../engines";
+import { engineLabel, qualifiedTable, usesSchema } from "../engines";
+import { touchRecent } from "../recent";
+import type { StudioContext } from "../types";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
@@ -40,6 +42,7 @@ export function Sidebar({ width }: { width: number }) {
   const openQuery = useTabStore((state) => state.openQuery);
   const openData = useTabStore((state) => state.openData);
   const openStructure = useTabStore((state) => state.openStructure);
+  const openPlaceholder = useTabStore((state) => state.openPlaceholder);
   const [keyword, setKeyword] = useState("");
   const [cache, setCache] = useState<Record<string, XNode[]>>({});
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
@@ -63,6 +66,7 @@ export function Sidebar({ width }: { width: number }) {
     if (!profile.connected) {
       const result = await api.connect(id);
       markConnected(id, true);
+      touchRecent(id);
       setStatus(`已连接 ${profile.name} · ${result.version}`);
     }
   }
@@ -244,6 +248,7 @@ export function Sidebar({ width }: { width: number }) {
           },
         },
         { label: "新建查询", run: () => newQuery(meta) },
+        { label: "备份", run: () => openTool("backup", meta) },
         { label: "编辑", run: () => openConnection(id) },
         { label: "删除", run: () => void removeConnection(id) },
         {
@@ -278,12 +283,29 @@ export function Sidebar({ width }: { width: number }) {
           },
         },
         { label: "新建查询", run: () => newQuery(meta) },
+        { label: "导入导出", run: () => openTool("io", meta, meta.name) },
+        { label: "作为同步源", run: () => openTool("data-sync", meta, meta.name) },
+        { label: "加入结构对比", run: () => openTool("schema-sync", meta, meta.name) },
       ];
     }
     if (meta.kind === "database" || meta.kind === "schema") {
-      return [{ label: "新建查询", run: () => newQuery(meta) }];
+      return [
+        { label: "新建查询", run: () => newQuery(meta) },
+        { label: "ER 图", run: () => openTool("er", meta) },
+        { label: "备份", run: () => openTool("backup", meta) },
+        { label: "库内搜索", run: () => openTool("search", meta) },
+      ];
     }
     return [];
+  }
+
+  function openTool(feature: string, meta: NodeMeta, table = "") {
+    if (!meta.connectionId) return;
+    const profile = profiles.find((item) => item.id === meta.connectionId);
+    const database = meta.database || (profile?.engine === "sqlite" ? "main" : profile?.database || "");
+    const schema = meta.schema || (profile?.engine === "sqlite" ? "main" : usesSchema(profile?.engine) ? "" : database);
+    const context: StudioContext = { connectionId: meta.connectionId, database, schema, table };
+    openPlaceholder(feature, context);
   }
 
   return (
