@@ -9,12 +9,12 @@ use uuid::Uuid;
 use crate::crypto::{self, CredentialCipher, KeySource};
 use crate::drivers::{self, DbSession};
 use crate::error::{AppError, AppResult};
-use crate::tunnel::TunnelGuard;
 use crate::models::{
     AppInfo, ConnectResult, ConnectionPublic, Engine, SaveConnectionRequest, SaveConnectionResult,
     SessionConfig, StoredProfile, TestResult,
 };
 use crate::store;
+use crate::tunnel::TunnelGuard;
 
 pub struct SessionSlot {
     pub inner: Mutex<Box<dyn DbSession>>,
@@ -33,6 +33,7 @@ pub struct AppState {
     cipher: CredentialCipher,
     key_source: KeySource,
     profiles: Mutex<Vec<StoredProfile>>,
+    session_lifecycle: Mutex<()>,
     sessions: Mutex<HashMap<String, Arc<SessionSlot>>>,
     debuggers: Mutex<HashMap<String, crate::pldbg::DebugSlot>>,
 }
@@ -54,6 +55,7 @@ impl AppState {
             cipher,
             key_source,
             profiles: Mutex::new(profiles),
+            session_lifecycle: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             debuggers: Mutex::new(HashMap::new()),
         })
@@ -90,7 +92,10 @@ impl AppState {
             .collect()
     }
 
-    pub fn save_connection(&self, request: SaveConnectionRequest) -> AppResult<SaveConnectionResult> {
+    pub fn save_connection(
+        &self,
+        request: SaveConnectionRequest,
+    ) -> AppResult<SaveConnectionResult> {
         let name = request.name.trim();
         if name.is_empty() {
             return Err(AppError::msg("请填写连接名称"));
@@ -122,118 +127,138 @@ impl AppState {
         };
         let now = now_string();
 
-        let mut profiles = lock(&self.profiles).clone();
-        let (public, needs_reconnect) = if let Some(id) = request.id.as_ref().filter(|id| !id.is_empty())
-        {
-            let existing = profiles
-                .iter_mut()
-                .find(|profile| &profile.id == id)
-                .ok_or_else(|| AppError::msg("连接不存在"))?;
-            let mut password_changed = false;
-            if request.clear_password {
-                existing.password_enc.clear();
-                password_changed = true;
-            } else if let Some(password) = request.password.as_ref().map(|item| item.as_str()) {
-                if !password.is_empty() {
-                    existing.password_enc = self.cipher.encrypt(password)?;
+        let _lifecycle = lock(&self.session_lifecycle);
+        let _file_lock = self.profile_store_lock()?;
+        let mut cached_profiles = lock(&self.profiles);
+        let mut profiles = store::load_profiles(&self.config_dir)?;
+        let (public, needs_reconnect) =
+            if let Some(id) = request.id.as_ref().filter(|id| !id.is_empty()) {
+                let existing = profiles
+                    .iter_mut()
+                    .find(|profile| &profile.id == id)
+                    .ok_or_else(|| AppError::msg("连接不存在"))?;
+                let mut password_changed = false;
+                if request.clear_password {
+                    existing.password_enc.clear();
                     password_changed = true;
+                } else if let Some(password) = request.password.as_ref().map(|item| item.as_str()) {
+                    if !password.is_empty() {
+                        existing.password_enc = self.cipher.encrypt(password)?;
+                        password_changed = true;
+                    }
                 }
-            }
-            let params_changed = password_changed
-                || existing.engine != engine
-                || existing.host != host
-                || existing.port != port
-                || existing.username != username
-                || existing.database != database
-                || existing.file_path != file_path
-                || existing.use_ssl != request.use_ssl
-                || existing.ssl_insecure != request.ssl_insecure
-                || existing.ssh_enabled != request.ssh_enabled
-                || existing.ssh_host != request.ssh_host.trim()
-                || existing.http_tunnel != request.http_tunnel
-                || existing.server_mode != request.server_mode.trim()
-                || existing.auth_method != request.auth_method.trim()
-                || existing.warehouse != request.warehouse.trim()
-                || existing.schema_name != request.schema_name.trim()
-                || existing.address_map != request.address_map.trim();
-            existing.name = name.to_string();
-            existing.group = group;
-            existing.color = color;
-            existing.engine = engine;
-            existing.host = host;
-            existing.port = port;
-            existing.username = username;
-            existing.database = database;
-            existing.file_path = file_path;
-            existing.use_ssl = request.use_ssl;
-            existing.ssl_insecure = request.ssl_insecure;
-            if request.clear_ssh_password {
-                existing.ssh_password_enc.clear();
-            } else if let Some(password) = request.ssh_password.as_ref().filter(|item| !item.is_empty()) {
-                existing.ssh_password_enc = self.cipher.encrypt(password)?;
-            }
-            existing.ssh_enabled = request.ssh_enabled;
-            existing.ssh_host = request.ssh_host.trim().to_string();
-            existing.ssh_port = ssh_port;
-            existing.ssh_username = request.ssh_username.trim().to_string();
-            existing.ssh_key_path = request.ssh_key_path.trim().to_string();
-            existing.http_tunnel = request.http_tunnel;
-            existing.http_proxy_host = request.http_proxy_host.trim().to_string();
-            existing.http_proxy_port = if request.http_proxy_port == 0 { 8080 } else { request.http_proxy_port };
-            existing.server_mode = request.server_mode.trim().to_string();
-            existing.auth_method = normalize_auth(&request.auth_method);
-            existing.warehouse = request.warehouse.trim().to_string();
-            existing.schema_name = request.schema_name.trim().to_string();
-            existing.address_map = request.address_map.trim().to_string();
-            existing.updated_at = now;
-            let public = self.to_public(existing, false);
-            (public, params_changed)
-        } else {
-            let mut password_enc = String::new();
-            if let Some(password) = request.password.as_ref().filter(|item| !item.is_empty()) {
-                password_enc = self.cipher.encrypt(password)?;
-            }
-            let mut ssh_password_enc = String::new();
-            if let Some(password) = request.ssh_password.as_ref().filter(|item| !item.is_empty()) {
-                ssh_password_enc = self.cipher.encrypt(password)?;
-            }
-            let profile = StoredProfile {
-                id: Uuid::new_v4().to_string(),
-                name: name.to_string(),
-                group,
-                color,
-                engine,
-                host,
-                port,
-                username,
-                password_enc,
-                database,
-                file_path,
-                use_ssl: request.use_ssl,
-                ssl_insecure: request.ssl_insecure,
-                ssh_enabled: request.ssh_enabled,
-                ssh_host: request.ssh_host.trim().to_string(),
-                ssh_port,
-                ssh_username: request.ssh_username.trim().to_string(),
-                ssh_password_enc,
-                ssh_key_path: request.ssh_key_path.trim().to_string(),
-                http_tunnel: request.http_tunnel,
-                http_proxy_host: request.http_proxy_host.trim().to_string(),
-                http_proxy_port: if request.http_proxy_port == 0 { 8080 } else { request.http_proxy_port },
-                server_mode: request.server_mode.trim().to_string(),
-                auth_method: normalize_auth(&request.auth_method),
-                warehouse: request.warehouse.trim().to_string(),
-                schema_name: request.schema_name.trim().to_string(),
-                address_map: request.address_map.trim().to_string(),
-                created_at: now.clone(),
-                updated_at: now,
+                let params_changed = password_changed
+                    || existing.engine != engine
+                    || existing.host != host
+                    || existing.port != port
+                    || existing.username != username
+                    || existing.database != database
+                    || existing.file_path != file_path
+                    || existing.use_ssl != request.use_ssl
+                    || existing.ssl_insecure != request.ssl_insecure
+                    || existing.ssh_enabled != request.ssh_enabled
+                    || existing.ssh_host != request.ssh_host.trim()
+                    || existing.http_tunnel != request.http_tunnel
+                    || existing.server_mode != request.server_mode.trim()
+                    || existing.auth_method != request.auth_method.trim()
+                    || existing.warehouse != request.warehouse.trim()
+                    || existing.schema_name != request.schema_name.trim()
+                    || existing.address_map != request.address_map.trim();
+                existing.name = name.to_string();
+                existing.group = group;
+                existing.color = color;
+                existing.engine = engine;
+                existing.host = host;
+                existing.port = port;
+                existing.username = username;
+                existing.database = database;
+                existing.file_path = file_path;
+                existing.use_ssl = request.use_ssl;
+                existing.ssl_insecure = request.ssl_insecure;
+                if request.clear_ssh_password {
+                    existing.ssh_password_enc.clear();
+                } else if let Some(password) = request
+                    .ssh_password
+                    .as_ref()
+                    .filter(|item| !item.is_empty())
+                {
+                    existing.ssh_password_enc = self.cipher.encrypt(password)?;
+                }
+                existing.ssh_enabled = request.ssh_enabled;
+                existing.ssh_host = request.ssh_host.trim().to_string();
+                existing.ssh_port = ssh_port;
+                existing.ssh_username = request.ssh_username.trim().to_string();
+                existing.ssh_key_path = request.ssh_key_path.trim().to_string();
+                existing.http_tunnel = request.http_tunnel;
+                existing.http_proxy_host = request.http_proxy_host.trim().to_string();
+                existing.http_proxy_port = if request.http_proxy_port == 0 {
+                    8080
+                } else {
+                    request.http_proxy_port
+                };
+                existing.server_mode = request.server_mode.trim().to_string();
+                existing.auth_method = normalize_auth(&request.auth_method);
+                existing.warehouse = request.warehouse.trim().to_string();
+                existing.schema_name = request.schema_name.trim().to_string();
+                existing.address_map = request.address_map.trim().to_string();
+                existing.updated_at = now;
+                let public = self.to_public(existing, false);
+                (public, params_changed)
+            } else {
+                let mut password_enc = String::new();
+                if let Some(password) = request.password.as_ref().filter(|item| !item.is_empty()) {
+                    password_enc = self.cipher.encrypt(password)?;
+                }
+                let mut ssh_password_enc = String::new();
+                if let Some(password) = request
+                    .ssh_password
+                    .as_ref()
+                    .filter(|item| !item.is_empty())
+                {
+                    ssh_password_enc = self.cipher.encrypt(password)?;
+                }
+                let profile = StoredProfile {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    group,
+                    color,
+                    engine,
+                    host,
+                    port,
+                    username,
+                    password_enc,
+                    database,
+                    file_path,
+                    use_ssl: request.use_ssl,
+                    ssl_insecure: request.ssl_insecure,
+                    ssh_enabled: request.ssh_enabled,
+                    ssh_host: request.ssh_host.trim().to_string(),
+                    ssh_port,
+                    ssh_username: request.ssh_username.trim().to_string(),
+                    ssh_password_enc,
+                    ssh_key_path: request.ssh_key_path.trim().to_string(),
+                    http_tunnel: request.http_tunnel,
+                    http_proxy_host: request.http_proxy_host.trim().to_string(),
+                    http_proxy_port: if request.http_proxy_port == 0 {
+                        8080
+                    } else {
+                        request.http_proxy_port
+                    },
+                    server_mode: request.server_mode.trim().to_string(),
+                    auth_method: normalize_auth(&request.auth_method),
+                    warehouse: request.warehouse.trim().to_string(),
+                    schema_name: request.schema_name.trim().to_string(),
+                    address_map: request.address_map.trim().to_string(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                let public = self.to_public(&profile, false);
+                profiles.push(profile);
+                (public, false)
             };
-            let public = self.to_public(&profile, false);
-            profiles.push(profile);
-            (public, false)
-        };
         store::save_profiles(&self.config_dir, &profiles)?;
-        *lock(&self.profiles) = profiles;
+        *cached_profiles = profiles;
+        drop(cached_profiles);
         if needs_reconnect {
             self.drop_session(&public.id);
         }
@@ -247,14 +272,18 @@ impl AppState {
     }
 
     pub fn delete_connection(&self, id: &str) -> AppResult<()> {
-        let mut profiles = lock(&self.profiles).clone();
+        let _lifecycle = lock(&self.session_lifecycle);
+        let _file_lock = self.profile_store_lock()?;
+        let mut cached_profiles = lock(&self.profiles);
+        let mut profiles = store::load_profiles(&self.config_dir)?;
         let before = profiles.len();
         profiles.retain(|profile| profile.id != id);
         if profiles.len() == before {
             return Err(AppError::msg("连接不存在"));
         }
         store::save_profiles(&self.config_dir, &profiles)?;
-        *lock(&self.profiles) = profiles;
+        *cached_profiles = profiles;
+        drop(cached_profiles);
         self.drop_session(id);
         Ok(())
     }
@@ -279,6 +308,7 @@ impl AppState {
     }
 
     pub fn connect(&self, id: &str) -> AppResult<ConnectResult> {
+        let _lifecycle = lock(&self.session_lifecycle);
         let profile = self.profile_by_id(id)?;
         if lock(&self.sessions).contains_key(id) {
             match self.with_session(id, |session| session.version()) {
@@ -318,6 +348,7 @@ impl AppState {
     }
 
     pub fn disconnect(&self, id: &str) {
+        let _lifecycle = lock(&self.session_lifecycle);
         self.drop_session(id);
     }
 
@@ -363,6 +394,19 @@ impl AppState {
         Ok(saved.connection)
     }
 
+    fn profile_store_lock(&self) -> AppResult<fs::File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.config_dir.join("connections.json.lock"))
+            .map_err(|err| AppError::msg(format!("无法锁定连接配置：{err}")))?;
+        file.lock()
+            .map_err(|err| AppError::msg(format!("无法锁定连接配置：{err}")))?;
+        Ok(file)
+    }
+
     pub(crate) fn config_dir(&self) -> &std::path::Path {
         &self.config_dir
     }
@@ -379,19 +423,32 @@ impl AppState {
         lock(&self.profiles).clone()
     }
 
-    pub(crate) fn import_profiles(&self, extra: Vec<StoredProfile>) -> AppResult<usize> {
-        let mut profiles = lock(&self.profiles).clone();
+    pub(crate) fn import_profiles(&self, extra: Vec<StoredProfile>) -> AppResult<(usize, usize)> {
+        let _lifecycle = lock(&self.session_lifecycle);
+        let _file_lock = self.profile_store_lock()?;
+        let mut cached_profiles = lock(&self.profiles);
+        let mut profiles = store::load_profiles(&self.config_dir)?;
         let mut added = 0;
-        for item in extra {
+        let mut needs_credentials = 0;
+        for mut item in extra {
             if item.id.is_empty() || profiles.iter().any(|profile| profile.id == item.id) {
                 continue;
             }
+            let mut cleared = false;
+            for secret in [&mut item.password_enc, &mut item.ssh_password_enc] {
+                if !secret.is_empty() && self.cipher.decrypt(secret).is_err() {
+                    secret.clear();
+                    cleared = true;
+                }
+            }
+            needs_credentials += usize::from(cleared);
             profiles.push(item);
             added += 1;
         }
         store::save_profiles(&self.config_dir, &profiles)?;
-        *lock(&self.profiles) = profiles;
-        Ok(added)
+        *cached_profiles = profiles;
+        drop(cached_profiles);
+        Ok((added, needs_credentials))
     }
 
     pub(crate) fn session_config_for(&self, id: &str) -> AppResult<SessionConfig> {
@@ -552,7 +609,9 @@ fn now_string() -> String {
 
 fn normalize_color(color: &str) -> String {
     let color = color.trim();
-    if color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+    if color.len() == 7
+        && color.starts_with('#')
+        && color[1..].chars().all(|ch| ch.is_ascii_hexdigit())
     {
         color.to_ascii_lowercase()
     } else {
@@ -577,7 +636,11 @@ fn profile_from_request(request: &SaveConnectionRequest) -> StoredProfile {
         ssl_insecure: request.ssl_insecure,
         ssh_enabled: request.ssh_enabled,
         ssh_host: request.ssh_host.clone(),
-        ssh_port: if request.ssh_port == 0 { 22 } else { request.ssh_port },
+        ssh_port: if request.ssh_port == 0 {
+            22
+        } else {
+            request.ssh_port
+        },
         ssh_username: request.ssh_username.clone(),
         ssh_password_enc: String::new(),
         ssh_key_path: request.ssh_key_path.clone(),
@@ -607,7 +670,10 @@ fn normalize_auth(value: &str) -> String {
     }
 }
 
-fn open_with_tunnels(profile: &StoredProfile, config: &mut SessionConfig) -> AppResult<Vec<TunnelGuard>> {
+fn open_with_tunnels(
+    profile: &StoredProfile,
+    config: &mut SessionConfig,
+) -> AppResult<Vec<TunnelGuard>> {
     validate_tunnel_security(profile, config)?;
     let cluster = profile.engine == Engine::Redis
         && profile.server_mode.eq_ignore_ascii_case("cluster")
@@ -627,7 +693,9 @@ fn open_with_tunnels(profile: &StoredProfile, config: &mut SessionConfig) -> App
         let mut pairs = Vec::new();
         for (host, port) in nodes {
             let guard = crate::tunnel::start(profile, &config.ssh_password, &host, port)?
-                .ok_or_else(|| AppError::msg(format!("没有为 Redis 节点 {host}:{port} 建立隧道")))?;
+                .ok_or_else(|| {
+                    AppError::msg(format!("没有为 Redis 节点 {host}:{port} 建立隧道"))
+                })?;
             let local = format!("127.0.0.1:{}", guard.local_port());
             locals.push(local.clone());
             pairs.push(format!("{host}:{port}={local}"));
@@ -635,7 +703,8 @@ fn open_with_tunnels(profile: &StoredProfile, config: &mut SessionConfig) -> App
         }
         config.host = locals.join(",");
         config.port = 6379;
-        config.address_map = crate::drivers::redis::merge_address_map(&config.address_map, &pairs.join(","));
+        config.address_map =
+            crate::drivers::redis::merge_address_map(&config.address_map, &pairs.join(","));
         return Ok(guards);
     }
     let tunnel = crate::tunnel::start(profile, &config.ssh_password, &config.host, config.port)?;
@@ -648,7 +717,14 @@ fn open_with_tunnels(profile: &StoredProfile, config: &mut SessionConfig) -> App
 }
 
 fn apply_tunnel_destination(config: &mut SessionConfig, local_port: u16) {
-    config.tls_server_name = Some(config.host.trim().trim_start_matches('[').trim_end_matches(']').to_string());
+    config.tls_server_name = Some(
+        config
+            .host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+    );
     config.host = "127.0.0.1".into();
     config.port = local_port;
 }
@@ -658,10 +734,14 @@ fn validate_tunnel_security(profile: &StoredProfile, config: &SessionConfig) -> 
         return Ok(());
     }
     if config.engine == Engine::Snowflake {
-        return Err(AppError::msg("当前 Snowflake HTTPS 驱动不支持 SSH / HTTP 隧道，请使用可直连的 HTTPS 端点。"));
+        return Err(AppError::msg(
+            "当前 Snowflake HTTPS 驱动不支持 SSH / HTTP 隧道，请使用可直连的 HTTPS 端点。",
+        ));
     }
     if config.host.contains("://") {
-        return Err(AppError::msg("隧道目标需要填写单独的主机名或 IP，不能直接使用连接 URI。"));
+        return Err(AppError::msg(
+            "隧道目标需要填写单独的主机名或 IP，不能直接使用连接 URI。",
+        ));
     }
     if config.use_ssl {
         match config.engine {
@@ -691,8 +771,17 @@ fn split_host_port(item: &str, default_port: u16) -> (String, u16) {
             }
         }
     }
-    let port = if default_port == 0 { 6379 } else { default_port };
-    (item.trim_start_matches('[').trim_end_matches(']').to_string(), port)
+    let port = if default_port == 0 {
+        6379
+    } else {
+        default_port
+    };
+    (
+        item.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+        port,
+    )
 }
 
 fn display_database(profile: &StoredProfile) -> String {
@@ -813,9 +902,21 @@ mod tests {
 
     #[test]
     fn unsupported_verified_tls_tunnels_are_refused_before_connecting() {
-        for engine in [Engine::Mysql, Engine::Mariadb, Engine::Mongodb, Engine::Dameng, Engine::Redis, Engine::Oracle, Engine::Snowflake] {
+        for engine in [
+            Engine::Mysql,
+            Engine::Mariadb,
+            Engine::Mongodb,
+            Engine::Dameng,
+            Engine::Redis,
+            Engine::Oracle,
+            Engine::Snowflake,
+        ] {
             let (profile, config) = tunnel_fixture(engine, false);
-            assert!(validate_tunnel_security(&profile, &config).is_err(), "{}", engine.label());
+            assert!(
+                validate_tunnel_security(&profile, &config).is_err(),
+                "{}",
+                engine.label()
+            );
         }
         let (profile, config) = tunnel_fixture(Engine::Mysql, true);
         assert!(validate_tunnel_security(&profile, &config).is_ok());
@@ -825,9 +926,41 @@ mod tests {
 
     #[test]
     fn cluster_target_parsing_keeps_ipv6_host_and_port_separate() {
-        assert_eq!(split_host_port("[2001:db8::1]:6380", 6379), ("2001:db8::1".into(), 6380));
-        assert_eq!(split_host_port("2001:db8::1", 6379), ("2001:db8::1".into(), 6379));
-        assert_eq!(split_host_port("db.example.test:6380", 6379), ("db.example.test".into(), 6380));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:6380", 6379),
+            ("2001:db8::1".into(), 6380)
+        );
+        assert_eq!(
+            split_host_port("2001:db8::1", 6379),
+            ("2001:db8::1".into(), 6379)
+        );
+        assert_eq!(
+            split_host_port("db.example.test:6380", 6379),
+            ("db.example.test".into(), 6380)
+        );
+    }
+
+    #[test]
+    fn concurrent_profile_updates_from_two_instances_preserve_every_connection() {
+        let dir = std::env::temp_dir().join(format!("dataharbor-profile-race-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        {
+            let first = AppState::open_in(dir.clone(), true).unwrap();
+            let second = AppState::open_in(dir.clone(), true).unwrap();
+            std::thread::scope(|scope| {
+                for index in 0..12 {
+                    let state = if index % 2 == 0 { &first } else { &second };
+                    let path = dir.join(format!("fixture-{index}.sqlite"));
+                    scope.spawn(move || state.save_connection(SaveConnectionRequest {
+                        name: format!("connection-{index}"), engine: Engine::Sqlite,
+                        file_path: path.display().to_string(), ..Default::default()
+                    }).unwrap());
+                }
+            });
+            let reopened = AppState::open_in(dir.clone(), true).unwrap();
+            assert_eq!(reopened.list_connections().len(), 12);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -886,7 +1019,9 @@ mod tests {
         let tables = schema::list_tables(&reopened, &id, "main", "main").unwrap();
         assert!(tables.iter().any(|name| name == "goods"));
         let columns = schema::list_columns(&reopened, &id, "main", "main", "goods").unwrap();
-        assert!(columns.iter().any(|column| column.primary_key && column.name == "id"));
+        assert!(columns
+            .iter()
+            .any(|column| column.primary_key && column.name == "id"));
 
         let page = fetch_rows(
             &reopened,
@@ -921,6 +1056,16 @@ mod tests {
                 table: "goods".into(),
                 changes: vec![RowChange {
                     kind: "update".into(),
+                    original: Some(
+                        page.columns
+                            .iter()
+                            .zip(&page.rows[0])
+                            .map(|(column, value)| FieldValue {
+                                column: column.name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                    ),
                     pk: vec![FieldValue {
                         column: "id".into(),
                         value: page.rows[0][0].clone(),
@@ -1047,9 +1192,17 @@ mod tests {
         assert_eq!(author.ref_table, "authors");
         assert_eq!(author.ref_column.to_ascii_lowercase(), "id");
 
-        let picked = crate::studio::reference_rows(&state, &id, "main", "main", "authors", "id", "老").unwrap();
-        assert!(picked.rows.iter().any(|row| row.iter().any(|cell| cell == &json!("老舍"))));
-        assert!(!picked.rows.iter().any(|row| row.iter().any(|cell| cell == &json!("余华"))));
+        let picked =
+            crate::studio::reference_rows(&state, &id, "main", "main", "authors", "id", "老")
+                .unwrap();
+        assert!(picked
+            .rows
+            .iter()
+            .any(|row| row.iter().any(|cell| cell == &json!("老舍"))));
+        assert!(!picked
+            .rows
+            .iter()
+            .any(|row| row.iter().any(|cell| cell == &json!("余华"))));
 
         let cover = crate::sqlutil::json_blob(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
         commit_changes(
@@ -1061,13 +1214,29 @@ mod tests {
                 table: "books".into(),
                 changes: vec![RowChange {
                     kind: "insert".into(),
+                    original: None,
                     pk: Vec::new(),
                     values: vec![
-                        FieldValue { column: "id".into(), value: json!(1) },
-                        FieldValue { column: "title".into(), value: json!("活着") },
-                        FieldValue { column: "author_id".into(), value: json!(1) },
-                        FieldValue { column: "cover".into(), value: cover.clone() },
-                        FieldValue { column: "blurb".into(), value: json!("<p>余华</p>") },
+                        FieldValue {
+                            column: "id".into(),
+                            value: json!(1),
+                        },
+                        FieldValue {
+                            column: "title".into(),
+                            value: json!("活着"),
+                        },
+                        FieldValue {
+                            column: "author_id".into(),
+                            value: json!(1),
+                        },
+                        FieldValue {
+                            column: "cover".into(),
+                            value: cover.clone(),
+                        },
+                        FieldValue {
+                            column: "blurb".into(),
+                            value: json!("<p>余华</p>"),
+                        },
                     ],
                 }],
             },

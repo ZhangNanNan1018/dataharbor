@@ -157,6 +157,7 @@ export interface FetchRowsRequest {
 export interface DataPage {
   columns: ColumnMeta[];
   rows: JsonValue[][];
+  originalRows?: FieldValue[][] | null;
   total: number;
   page: number;
   pageSize: number;
@@ -172,6 +173,7 @@ export interface RowChange {
   kind: "insert" | "update" | "delete";
   pk: FieldValue[];
   values: FieldValue[];
+  original?: FieldValue[];
 }
 
 export interface CommitResult {

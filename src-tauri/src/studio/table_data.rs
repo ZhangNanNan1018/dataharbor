@@ -32,6 +32,7 @@ pub fn generate_rows(state: &AppState, request: &GenerateRequest) -> AppResult<u
             })
             .collect();
         changes.push(RowChange {
+            original: None,
             kind: "insert".into(),
             pk: Vec::new(),
             values,
@@ -113,7 +114,7 @@ pub(super) fn commit_batches(
         return Ok(0);
     }
     let mut applied = 0;
-    for chunk in changes.chunks(BATCH as usize) {
+    for (index, chunk) in changes.chunks(BATCH as usize).enumerate() {
         applied += commit_changes(
             state,
             CommitRequest {
@@ -123,7 +124,7 @@ pub(super) fn commit_batches(
                 table: table.to_string(),
                 changes: chunk.to_vec(),
             },
-        )?
+        ).map_err(|err| AppError::msg(format!("第 {} 批失败；此前已提交 {} 批、{} 条更改，已提交批次不会回滚，请核对目标数据后重新对比，勿直接重放整个任务：{err}", index + 1, index, applied)))?
         .applied;
     }
     Ok(applied)

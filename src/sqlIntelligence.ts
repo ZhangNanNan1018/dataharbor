@@ -9,6 +9,7 @@ export interface SchemaColumn {
 export interface SchemaTable {
   name: string;
   columns: SchemaColumn[];
+  columnsLoaded?: boolean;
 }
 
 const KEYWORDS = [
@@ -25,14 +26,27 @@ const FUNCTIONS = [
   "LENGTH", "SUBSTR", "TRIM", "NOW", "CURRENT_TIMESTAMP", "ROUND", "ABS",
 ];
 
-let tables: SchemaTable[] = [];
-let registered = false;
+const schemas = new Map<string, SchemaTable[]>();
+const registered = new WeakSet<typeof Monaco>();
 
-export function setSqlSchema(monaco: typeof Monaco, next: SchemaTable[]) {
-  tables = next;
+function definitionUri(monaco: typeof Monaco, model: Monaco.editor.ITextModel, name: string) {
+  return monaco.Uri.parse(`inmemory://schema/${encodeURIComponent(model.uri.toString())}/${encodeURIComponent(name)}.sql`);
+}
+
+export function clearSqlSchema(monaco: typeof Monaco, model: Monaco.editor.ITextModel) {
+  for (const table of schemas.get(model.uri.toString()) ?? []) {
+    monaco.editor.getModel(definitionUri(monaco, model, table.name))?.dispose();
+  }
+  schemas.delete(model.uri.toString());
+  if (!model.isDisposed()) monaco.editor.setModelMarkers(model, "dataharbor-sql", []);
+}
+
+export function setSqlSchema(monaco: typeof Monaco, owner: Monaco.editor.ITextModel, next: SchemaTable[]) {
+  clearSqlSchema(monaco, owner);
+  schemas.set(owner.uri.toString(), next);
   for (const table of next) {
-    const uri = monaco.Uri.parse(`inmemory://schema/${encodeURIComponent(table.name)}.sql`);
-    const body = [`-- ${table.name}`, ...table.columns.map((column) => `-- ${column.primaryKey ? "PK " : ""}${column.name} ${column.dataType}`), ""].join("\n");
+    const uri = definitionUri(monaco, owner, table.name);
+    const body = [`-- ${table.name}`, ...(table.columnsLoaded === false ? ["-- 列信息尚未加载"] : table.columns.map((column) => `-- ${column.primaryKey ? "PK " : ""}${column.name} ${column.dataType}`)), ""].join("\n");
     const model = monaco.editor.getModel(uri);
     if (model) model.setValue(body);
     else monaco.editor.createModel(body, "sql", uri);
@@ -40,11 +54,12 @@ export function setSqlSchema(monaco: typeof Monaco, next: SchemaTable[]) {
 }
 
 export function registerSqlIntelligence(monaco: typeof Monaco) {
-  if (registered) return;
-  registered = true;
+  if (registered.has(monaco)) return;
+  registered.add(monaco);
   monaco.languages.registerCompletionItemProvider("sql", {
     triggerCharacters: [".", " "],
     provideCompletionItems(model, position) {
+      const tables = schemas.get(model.uri.toString()) ?? [];
       const word = model.getWordUntilPosition(position);
       const range = {
         startLineNumber: position.lineNumber,
@@ -70,7 +85,7 @@ export function registerSqlIntelligence(monaco: typeof Monaco) {
       const clause = /\b(from|join|update|into|table)\s+[\w$]*$/i.test(before);
       if (clause || before.trim().length === 0) {
         for (const table of tables) {
-          suggestions.push(item(monaco, table.name, `${table.columns.length} 列`, monaco.languages.CompletionItemKind.Class, range));
+          suggestions.push(item(monaco, table.name, table.columnsLoaded === false ? "列信息尚未加载" : `${table.columns.length} 列`, monaco.languages.CompletionItemKind.Class, range));
         }
       }
       for (const table of tables) {
@@ -90,6 +105,7 @@ export function registerSqlIntelligence(monaco: typeof Monaco) {
   });
   monaco.languages.registerHoverProvider("sql", {
     provideHover(model, position) {
+      const tables = schemas.get(model.uri.toString()) ?? [];
       const word = model.getWordAtPosition(position);
       if (!word) return null;
       const table = tables.find((item) => item.name.toLowerCase() === word.word.toLowerCase());
@@ -109,17 +125,19 @@ export function registerSqlIntelligence(monaco: typeof Monaco) {
   });
   monaco.languages.registerDefinitionProvider("sql", {
     provideDefinition(model, position) {
+      const tables = schemas.get(model.uri.toString()) ?? [];
       const word = model.getWordAtPosition(position);
       if (!word) return null;
       const table = tables.find((item) => item.name.toLowerCase() === word.word.toLowerCase());
       if (!table) return null;
-      const uri = monaco.Uri.parse(`inmemory://schema/${encodeURIComponent(table.name)}.sql`);
+      const uri = definitionUri(monaco, model, table.name);
       return { uri, range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 } };
     },
   });
 }
 
 export function refreshSqlMarkers(monaco: typeof Monaco, model: Monaco.editor.ITextModel) {
+  const tables = schemas.get(model.uri.toString()) ?? [];
   const text = model.getValue();
   const markers: Monaco.editor.IMarkerData[] = [];
   if (unbalanced(text, "'") || unbalanced(text, '"')) {
@@ -139,7 +157,7 @@ export function refreshSqlMarkers(monaco: typeof Monaco, model: Monaco.editor.IT
       if (!known.has(name.toLowerCase())) {
         const start = match.index + match[0].lastIndexOf(name) + 1;
         const pos = model.getPositionAt(start - 1);
-        markers.push(marker(monaco, pos.lineNumber, pos.column, `当前结构里没有表 ${name}`, name.length));
+        markers.push({ ...marker(monaco, pos.lineNumber, pos.column, `当前结构缓存未找到 ${name}，请核对模式、别名或 CTE`, name.length), severity: monaco.MarkerSeverity.Info });
       }
     }
   }

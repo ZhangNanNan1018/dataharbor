@@ -1,7 +1,7 @@
 use super::storage::{cell_string, escape_xml};
 use super::table_data::{load_all, CEILING};
 use super::types::{FileExportRequest, FileExportResult, FileImportRequest};
-use crate::data::commit_changes;
+use crate::data::{commit_changes, delimited};
 use crate::error::{AppError, AppResult};
 use crate::models::{CommitRequest, FieldValue, RowChange};
 use crate::state::AppState;
@@ -36,11 +36,11 @@ pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<Fi
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "txt" => {
-            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, '\t'))
+            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, '\t')?)
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "csv" => {
-            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, ','))
+            fs::write(&request.path, rows_to_delimited(&text_columns, &rows, ',')?)
                 .map_err(|err| AppError::msg(err.to_string()))?;
         }
         "xlsx" => write_xlsx(&request.path, &text_columns, &rows)?,
@@ -94,6 +94,7 @@ pub fn import_file(state: &AppState, request: FileImportRequest) -> AppResult<us
         .into_iter()
         .map(|row| RowChange {
             kind: "insert".into(),
+            original: None,
             pk: Vec::new(),
             values: headers
                 .iter()
@@ -166,27 +167,7 @@ fn read_odbc_table(dsn: &str, table: &str) -> AppResult<(Vec<String>, Vec<Vec<Js
 }
 
 fn parse_delimited_text(text: &str, sep: char) -> AppResult<(Vec<String>, Vec<Vec<JsonValue>>)> {
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(sep as u8)
-        .flexible(true)
-        .from_reader(text.as_bytes());
-    let headers = reader
-        .headers()
-        .map_err(|err| AppError::msg(err.to_string()))?
-        .iter()
-        .map(|item| item.to_string())
-        .collect::<Vec<_>>();
-    let mut rows = Vec::new();
-    for record in reader.records() {
-        let record = record.map_err(|err| AppError::msg(err.to_string()))?;
-        rows.push(
-            record
-                .iter()
-                .map(|cell| JsonValue::String(cell.to_string()))
-                .collect(),
-        );
-    }
-    Ok((headers, rows))
+    delimited::read(text.as_bytes(), sep as u8, CEILING as usize)
 }
 
 fn row_object(columns: &[String], row: &[JsonValue]) -> JsonValue {
@@ -200,26 +181,10 @@ fn row_object(columns: &[String], row: &[JsonValue]) -> JsonValue {
     JsonValue::Object(map)
 }
 
-fn rows_to_delimited(columns: &[String], rows: &[Vec<JsonValue>], sep: char) -> String {
-    let mut text = columns.join(&sep.to_string());
-    text.push('\n');
-    for row in rows {
-        let line = row
-            .iter()
-            .map(|value| {
-                let cell = cell_string(Some(value));
-                if cell.contains(sep) || cell.contains('"') || cell.contains('\n') {
-                    format!("\"{}\"", cell.replace('"', "\"\""))
-                } else {
-                    cell
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&sep.to_string());
-        text.push_str(&line);
-        text.push('\n');
-    }
-    text
+fn rows_to_delimited(columns: &[String], rows: &[Vec<JsonValue>], sep: char) -> AppResult<Vec<u8>> {
+    let mut output = Vec::new();
+    delimited::write(&mut output, columns, rows, sep as u8)?;
+    Ok(output)
 }
 
 fn rows_to_xml(columns: &[String], rows: &[Vec<JsonValue>]) -> String {
@@ -241,45 +206,12 @@ fn rows_to_xml(columns: &[String], rows: &[Vec<JsonValue>]) -> String {
 }
 
 fn read_delimited(path: &str, sep: char) -> AppResult<(Vec<String>, Vec<Vec<JsonValue>>)> {
-    let text = fs::read_to_string(path).map_err(|err| AppError::msg(err.to_string()))?;
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let header = lines.next().ok_or_else(|| AppError::msg("文件是空的"))?;
-    let headers: Vec<String> = split_sep(header, sep);
-    let rows = lines
-        .map(|line| split_sep(line, sep).into_iter().map(parse_cell).collect())
-        .collect();
-    Ok((headers, rows))
-}
-
-fn split_sep(line: &str, sep: char) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for ch in line.chars() {
-        if ch == '"' {
-            quoted = !quoted;
-            continue;
-        }
-        if ch == sep && !quoted {
-            items.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-    }
-    items.push(current);
-    items
+    let file = fs::File::open(path).map_err(|err| AppError::msg(err.to_string()))?;
+    delimited::read(file, sep as u8, CEILING as usize)
 }
 
 fn parse_cell(text: String) -> JsonValue {
-    if text.is_empty() {
-        JsonValue::Null
-    } else if let Ok(number) = text.parse::<i64>() {
-        json!(number)
-    } else if let Ok(number) = text.parse::<f64>() {
-        json!(number)
-    } else {
-        JsonValue::String(text)
-    }
+    JsonValue::String(text)
 }
 
 fn read_json_table(path: &str) -> AppResult<(Vec<String>, Vec<Vec<JsonValue>>)> {

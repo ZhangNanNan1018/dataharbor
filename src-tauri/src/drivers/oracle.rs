@@ -193,14 +193,14 @@ impl DbSession for OracleSession {
         Ok(outcome)
     }
 
-    fn execute_transaction(&mut self, _database: &str, statements: &[String]) -> AppResult<()> {
+    fn execute_checked_transaction(&mut self, _database: &str, statements: &[(String, Option<u64>)]) -> AppResult<usize> {
         if statements.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         // Every statement, rollback handler and commit runs in this one process.
-        let block = transaction_block(statements)?;
+        let block = checked_transaction_block(statements)?;
         self.query(&block)?;
-        Ok(())
+        Ok(statements.len())
     }
 }
 
@@ -216,9 +216,14 @@ fn sqlplus_script(user: &str, password: &str, connect: &str, sql: &str) -> Strin
     )
 }
 
+#[cfg(test)]
 fn transaction_block(statements: &[String]) -> AppResult<String> {
+    checked_transaction_block(&statements.iter().cloned().map(|sql| (sql, None)).collect::<Vec<_>>())
+}
+
+fn checked_transaction_block(statements: &[(String, Option<u64>)]) -> AppResult<String> {
     let mut block = String::from("BEGIN\n");
-    for sql in statements {
+    for (sql, expected) in statements {
         if sql.len() > 8_000 {
             return Err(AppError::msg("Oracle 网格 / CSV 事务已取消：单条变更 SQL 超过 8000 字节。SQL*Plus 的行长和 PL/SQL 字符串长度有限，无法安全编码此语句；没有执行任何变更，请使用原生客户端处理大单元格"));
         }
@@ -243,6 +248,9 @@ fn transaction_block(statements: &[String]) -> AppResult<String> {
         block.push_str(&format!(
             "  EXECUTE IMMEDIATE UTL_I18N.RAW_TO_CHAR(HEXTORAW(\n{chunks}\n  ), 'AL32UTF8');\n"
         ));
+        if let Some(count) = expected {
+            block.push_str(&format!("  IF SQL%ROWCOUNT <> {count} THEN RAISE_APPLICATION_ERROR(-20001, 'Data changed or deleted; reload before saving'); END IF;\n"));
+        }
     }
     block
         .push_str("  COMMIT;\nEXCEPTION\n  WHEN OTHERS THEN\n    ROLLBACK;\n    RAISE;\nEND;\n/\n");
@@ -279,6 +287,7 @@ fn parse_sqlplus(text: &str) -> QueryOutcome {
         .collect::<Vec<_>>();
     if lines.is_empty() {
         return QueryOutcome {
+            original_rows: None,
             columns: Vec::new(),
             rows: Vec::new(),
             rows_affected: 0,
@@ -320,6 +329,7 @@ fn parse_sqlplus(text: &str) -> QueryOutcome {
         })
         .collect();
     QueryOutcome {
+        original_rows: None,
         columns,
         rows,
         rows_affected: 0,

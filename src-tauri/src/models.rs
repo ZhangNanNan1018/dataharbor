@@ -89,6 +89,7 @@ impl ColumnMeta {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryOutcome {
+    pub original_rows: Option<Vec<Vec<FieldValue>>>,
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<JsonValue>>,
     pub rows_affected: u64,
@@ -98,6 +99,7 @@ pub struct QueryOutcome {
 impl QueryOutcome {
     pub fn empty() -> Self {
         Self {
+            original_rows: None,
             columns: Vec::new(),
             rows: Vec::new(),
             rows_affected: 0,
@@ -450,6 +452,7 @@ pub struct FetchRowsRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataPage {
+    pub original_rows: Option<Vec<Vec<FieldValue>>>,
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<JsonValue>>,
     pub total: u64,
@@ -458,7 +461,7 @@ pub struct DataPage {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldValue {
     pub column: String,
@@ -469,6 +472,9 @@ pub struct FieldValue {
 #[serde(rename_all = "camelCase")]
 pub struct RowChange {
     pub kind: String,
+    /// Values observed by the editor. Used as an optimistic concurrency guard.
+    #[serde(default)]
+    pub original: Option<Vec<FieldValue>>,
     #[serde(default)]
     pub pk: Vec<FieldValue>,
     #[serde(default)]

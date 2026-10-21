@@ -264,7 +264,7 @@ impl DbSession for PostgresSession {
         let schema_lit = sql_literal(Engine::Postgres, &JsonValue::String(schema))?;
         let table_lit = sql_literal(Engine::Postgres, &JsonValue::String(object_name.to_string()))?;
         let sql = format!(
-            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+            "SELECT c.column_name, pg_catalog.format_type(a.atttypid, a.atttypmod), c.is_nullable, c.column_default, \
                     CASE WHEN EXISTS ( \
                         SELECT 1 FROM information_schema.table_constraints tc \
                         JOIN information_schema.key_column_usage kcu \
@@ -277,6 +277,9 @@ impl DbSession for PostgresSession {
                           AND kcu.column_name = c.column_name \
                     ) THEN 'YES' ELSE 'NO' END AS is_pk \
              FROM information_schema.columns c \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema \
+             JOIN pg_catalog.pg_class r ON r.relnamespace = n.oid AND r.relname = c.table_name \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid AND a.attname = c.column_name AND NOT a.attisdropped \
              WHERE c.table_schema = {schema_lit} AND c.table_name = {table_lit} \
              ORDER BY c.ordinal_position"
         );
@@ -404,6 +407,7 @@ pub(crate) fn run_simple(client: &mut Client, sql: &str, max_rows: Option<usize>
         }
     }
     Ok(QueryOutcome {
+        original_rows: None,
         columns,
         rows,
         rows_affected: if saw_rows { 0 } else { affected },

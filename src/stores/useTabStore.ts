@@ -22,6 +22,7 @@ interface TabState {
   tabs: WorkspaceTab[];
   activeId: string | null;
   dirty: Record<string, boolean>;
+  draftSaveError: string | null;
   openQuery: (input?: OpenQueryInput) => string;
   openData: (input: OpenDataInput) => string;
   openStructure: (input: Omit<OpenDataInput, "readOnly">) => string;
@@ -36,10 +37,38 @@ function uid(): string {
   return crypto.randomUUID();
 }
 
+const DRAFTS_KEY = "dataharbor-query-workspace-v1";
+
+function readDraftWorkspace(): Pick<TabState, "tabs" | "activeId" | "dirty" | "draftSaveError"> {
+  try {
+    const raw = localStorage.getItem(DRAFTS_KEY);
+    if (!raw) return { tabs: [], activeId: null, dirty: {}, draftSaveError: null };
+    const saved = JSON.parse(raw) as { version?: number; tabs?: unknown; activeId?: unknown; dirty?: Record<string, unknown> };
+    if (saved.version !== 1 || !Array.isArray(saved.tabs)) throw new Error("无法读取查询草稿");
+    const seen = new Set<string>();
+    const tabs = saved.tabs.filter((value): value is QueryTab => {
+      if (!value || typeof value !== "object") return false;
+      const tab = value as QueryTab;
+      if (tab.kind !== "query" || typeof tab.id !== "string" || !tab.id || seen.has(tab.id)
+        || typeof tab.title !== "string" || typeof tab.sql !== "string" || typeof tab.database !== "string"
+        || !(tab.connectionId === null || typeof tab.connectionId === "string")) return false;
+      seen.add(tab.id);
+      return true;
+    });
+    if (tabs.length !== saved.tabs.length) throw new Error("查询草稿包含损坏或重复记录");
+    return {
+      tabs,
+      activeId: tabs.some((tab) => tab.id === saved.activeId) ? String(saved.activeId) : tabs[0]?.id ?? null,
+      dirty: Object.fromEntries(tabs.map((tab) => [tab.id, saved.dirty?.[tab.id] !== false])),
+      draftSaveError: null,
+    };
+  } catch {
+    return { tabs: [], activeId: null, dirty: {}, draftSaveError: "查询草稿恢复失败；原始恢复资料仍保留，请勿关闭需要保留的查询。" };
+  }
+}
+
 export const useTabStore = create<TabState>((set, get) => ({
-  tabs: [],
-  activeId: null,
-  dirty: {},
+  ...readDraftWorkspace(),
   openQuery: (input) => {
     const id = uid();
     const tab: QueryTab = {
@@ -50,7 +79,7 @@ export const useTabStore = create<TabState>((set, get) => ({
       database: input?.database ?? "",
       sql: input?.sql ?? "-- Ctrl+Enter 运行\nSELECT 1;\n",
     };
-    set({ tabs: [...get().tabs, tab], activeId: id });
+    set({ tabs: [...get().tabs, tab], activeId: id, dirty: { ...get().dirty, [id]: Boolean(input?.sql) } });
     return id;
   },
   openData: (input) => {
@@ -138,13 +167,29 @@ export const useTabStore = create<TabState>((set, get) => ({
     set({ tabs, activeId, dirty });
   },
   setActive: (id) => set({ activeId: id }),
-  patchQuery: (id, patch) =>
+  patchQuery: (id, patch) => {
+    const previous = get().tabs.find((tab) => tab.id === id && tab.kind === "query") as QueryTab | undefined;
     set({
       tabs: get().tabs.map((tab) => (tab.id === id && tab.kind === "query" ? { ...tab, ...patch } : tab)),
-    }),
+      dirty: previous && patch.sql !== undefined && patch.sql !== previous.sql ? { ...get().dirty, [id]: true } : get().dirty,
+    });
+  },
   setDirty: (id, dirty) =>
     set((state) => {
       if (Boolean(state.dirty[id]) === dirty) return state;
       return { dirty: { ...state.dirty, [id]: dirty } };
     }),
 }));
+
+useTabStore.subscribe((state, previous) => {
+  if (state.tabs === previous.tabs && state.activeId === previous.activeId && state.dirty === previous.dirty) return;
+  // Do not overwrite an unreadable recovery record with an empty workspace.
+  if (state.draftSaveError?.startsWith("查询草稿恢复失败")) return;
+  const tabs = state.tabs.filter((tab) => tab.kind === "query");
+  try {
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify({ version: 1, tabs, activeId: state.activeId, dirty: state.dirty }));
+    if (state.draftSaveError) useTabStore.setState({ draftSaveError: null });
+  } catch {
+    if (!state.draftSaveError) useTabStore.setState({ draftSaveError: "查询草稿自动保存失败，请复制需要保留的 SQL 后再关闭应用。" });
+  }
+});

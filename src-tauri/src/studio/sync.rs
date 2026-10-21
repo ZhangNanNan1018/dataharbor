@@ -12,6 +12,9 @@ use crate::sqlutil::qualified_name;
 use crate::state::AppState;
 use serde_json::Value as JsonValue;
 
+#[path = "type_mapping.rs"]
+mod type_mapping;
+
 pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<DiffResult> {
     if request.apply && request.selected_ids.is_empty() {
         return Err(AppError::msg(
@@ -37,7 +40,9 @@ pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<Diff
     let mut source = source;
     if source_engine != target_engine {
         for column in &mut source.columns {
-            column.data_type = map_type(target_engine, &column.data_type);
+            column.data_type =
+                type_mapping::map_type(source_engine, target_engine, &column.data_type)
+                    .map_err(|err| AppError::msg(format!("列 {}：{err}", column.name)))?;
         }
     }
     let target_name = qualified_name(
@@ -66,6 +71,16 @@ pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<Diff
     if !request.selected_ids.is_empty() {
         statements.retain(|item| request.selected_ids.iter().any(|id| id == &item.id));
         notes.push(format!("只保留勾选的 {} 条语句", statements.len()));
+    }
+    if request.apply
+        && !request.allow_destructive
+        && statements.iter().any(|item| {
+            item.kind == "modify" || item.kind == "view" || item.kind.starts_with("drop-")
+        })
+    {
+        return Err(AppError::msg(
+            "所选变更会修改现有结构，可能缩窄类型或丢失数据；请先允许危险结构变更并重新确认",
+        ));
     }
     let sql = statements
         .iter()
@@ -130,6 +145,7 @@ pub(super) fn transfer_with_ceiling(
         .map(|row| RowChange {
             kind: "insert".into(),
             pk: Vec::new(),
+            original: None,
             values: names
                 .iter()
                 .cloned()
@@ -220,6 +236,7 @@ pub(super) fn sync_with_ceiling(
                 changes.push(RowChange {
                     kind: "update".into(),
                     pk: pk_values(&keys, &source_columns, row),
+                    original: Some(zip_values(&target_columns, existing)),
                     values: values
                         .into_iter()
                         .filter(|item| !keys.iter().any(|key| key == &item.column))
@@ -230,6 +247,7 @@ pub(super) fn sync_with_ceiling(
             changes.push(RowChange {
                 kind: "insert".into(),
                 pk: Vec::new(),
+                original: None,
                 values,
             });
         }
@@ -241,6 +259,7 @@ pub(super) fn sync_with_ceiling(
                 changes.push(RowChange {
                     kind: "delete".into(),
                     pk: pk_values(&keys, &target_columns, row),
+                    original: Some(zip_values(&target_columns, row)),
                     values: Vec::new(),
                 });
                 deleted += 1;
@@ -465,34 +484,6 @@ fn pk_values(keys: &[String], columns: &[ColumnMeta], row: &[JsonValue]) -> Vec<
             })
         })
         .collect()
-}
-
-fn map_type(engine: Engine, source: &str) -> String {
-    let kind = source.to_ascii_lowercase();
-    let text = if kind.contains("int") {
-        "INTEGER"
-    } else if kind.contains("real")
-        || kind.contains("float")
-        || kind.contains("double")
-        || kind.contains("numeric")
-    {
-        "REAL"
-    } else if kind.contains("bool") {
-        "INTEGER"
-    } else if kind.contains("blob") || kind.contains("binary") {
-        "BLOB"
-    } else {
-        "TEXT"
-    };
-    match engine {
-        Engine::Mysql | Engine::Mariadb if text == "REAL" => "DOUBLE".into(),
-        Engine::Mysql | Engine::Mariadb if text == "INTEGER" => "BIGINT".into(),
-        Engine::Postgres if text == "REAL" => "DOUBLE PRECISION".into(),
-        Engine::Mssql if text == "TEXT" => "NVARCHAR(MAX)".into(),
-        Engine::Mssql if text == "INTEGER" => "BIGINT".into(),
-        Engine::Mssql if text == "REAL" => "FLOAT".into(),
-        _ => text.into(),
-    }
 }
 
 #[cfg(test)]

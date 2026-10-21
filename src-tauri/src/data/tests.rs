@@ -289,6 +289,7 @@ fn sqlite_grid_and_csv_failure_preserve_the_entire_previous_state() {
             })
             .unwrap();
         let change = |id| RowChange {
+            original: None,
             kind: "insert".into(),
             pk: vec![],
             values: vec![FieldValue {
@@ -351,4 +352,109 @@ fn sqlite_grid_and_csv_failure_preserve_the_entire_previous_state() {
         state.disconnect(&id);
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+
+struct EditFixture {
+    state: AppState,
+    id: String,
+    dir: std::path::PathBuf,
+}
+
+impl EditFixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("dataharbor-edit-{}", Uuid::new_v4()));
+        let state = AppState::open_in(dir.clone(), true).unwrap();
+        let id = state.save_connection(SaveConnectionRequest {
+            name: "编辑回归".into(), engine: Engine::Sqlite,
+            file_path: dir.join("test.sqlite").display().to_string(), ..Default::default()
+        }).unwrap().connection.id;
+        state.connect(&id).unwrap();
+        Self { state, id, dir }
+    }
+    fn sql(&self, sql: &str) -> Vec<Vec<JsonValue>> {
+        self.state.with_session(&self.id, |session| session.execute("main", sql, None)).unwrap().rows
+    }
+    fn commit(&self, changes: Vec<RowChange>) -> AppResult<CommitResult> {
+        commit_changes(&self.state, CommitRequest { connection_id: self.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), changes })
+    }
+}
+impl Drop for EditFixture {
+    fn drop(&mut self) {
+        self.state.disconnect(&self.id);
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+fn edit(id: i64, before: JsonValue, after: JsonValue) -> RowChange {
+    RowChange {
+        kind: "update".into(),
+        original: Some(vec![FieldValue { column: "id".into(), value: json!(id) }, FieldValue { column: "label".into(), value: before }]),
+        pk: vec![FieldValue { column: "id".into(), value: json!(id) }],
+        values: vec![FieldValue { column: "label".into(), value: after }],
+    }
+}
+
+#[test]
+fn concurrent_update_or_delete_rolls_back_the_entire_edit_batch() {
+    let fixture = EditFixture::new();
+    fixture.sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
+    fixture.sql("INSERT INTO items VALUES(1,'first'),(2,'second'),(3,NULL)");
+    let changes = vec![edit(1, json!("first"), json!("mine")), edit(2, json!("second"), json!("mine"))];
+    // A separate connection simulates another client, not another local edit.
+    let other = rusqlite::Connection::open(fixture.dir.join("test.sqlite")).unwrap();
+    other.execute("UPDATE items SET label='theirs' WHERE id=2", []).unwrap();
+    let error = fixture.commit(changes.clone()).unwrap_err().to_string();
+    assert!(error.contains("数据已被修改或删除"), "{error}");
+    assert_eq!(fixture.sql("SELECT label FROM items WHERE id=1"), vec![vec![json!("first")]]);
+    other.execute("DELETE FROM items WHERE id=2", []).unwrap();
+    assert!(fixture.commit(changes).is_err());
+    assert_eq!(fixture.sql("SELECT label FROM items WHERE id=1"), vec![vec![json!("first")]]);
+    assert_eq!(fixture.commit(vec![edit(3, JsonValue::Null, json!("now"))]).unwrap().applied, 1);
+    assert_eq!(fixture.sql("SELECT label FROM items WHERE id=3"), vec![vec![json!("now")]]);
+    let mut deletion = edit(1, json!("wrong"), JsonValue::Null);
+    deletion.kind = "delete".into(); deletion.values.clear();
+    assert!(fixture.commit(vec![deletion]).is_err());
+    let mut missing = edit(1, json!("first"), json!("mine")); missing.original = None;
+    assert!(fixture.commit(vec![missing]).is_err());
+    drop(other);
+}
+
+#[test]
+fn csv_routes_round_trip_quotes_newlines_null_empty_and_text_numbers() {
+    let fixture = EditFixture::new();
+    fixture.sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
+    let values = [json!("00123"), json!("a\"b\n第二行"), json!(""), JsonValue::Null, json!("\\N"), json!("18446744073709551615.123456789")];
+    let changes = values.iter().enumerate().map(|(i, value)| RowChange { kind: "insert".into(), original: None, pk: vec![], values: vec![FieldValue { column: "id".into(), value: json!(i+1) }, FieldValue { column: "label".into(), value: value.clone() }] }).collect();
+    fixture.commit(changes).unwrap();
+    let expected = fixture.sql("SELECT * FROM items ORDER BY id");
+    for studio_export in [false, true] {
+        let path = fixture.dir.join("roundtrip.csv").display().to_string();
+        if studio_export {
+            crate::studio::export_file(&fixture.state, crate::studio::FileExportRequest { connection_id: fixture.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), format: "csv".into(), path: path.clone() }).unwrap();
+        } else {
+            export_table_csv(&fixture.state, ExportTableRequest { connection_id: fixture.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), filters: vec![], sorts: vec![], path: path.clone() }).unwrap();
+        }
+        for studio_import in [false, true] {
+            fixture.sql("DELETE FROM items");
+            if studio_import {
+                crate::studio::import_file(&fixture.state, crate::studio::FileImportRequest { connection_id: fixture.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), format: "csv".into(), path: path.clone() }).unwrap();
+            } else {
+                import_table_csv(&fixture.state, ImportCsvRequest { connection_id: fixture.id.clone(), database: "main".into(), schema: "".into(), table: "items".into(), path: path.clone(), truncate: false }).unwrap();
+            }
+            assert_eq!(fixture.sql("SELECT * FROM items ORDER BY id"), expected);
+        }
+    }
+}
+
+#[test]
+fn numeric_literals_keep_decimal_precision_and_reject_sql_tokens() {
+    use crate::sqlutil::value_sql;
+    for kind in ["numeric(38,18)", "decimal(38,18)", "bigint unsigned"] {
+        for text in ["18446744073709551615", "12345678901234567890.123456789012345678", "-1.2300e+12"] {
+            assert_eq!(value_sql(Engine::Postgres, kind, &json!(text)).unwrap(), text);
+        }
+        for bad in ["", "NaN", "Infinity", "1e", "1; DELETE FROM items", "0 OR 1=1"] {
+            assert!(value_sql(Engine::Postgres, kind, &json!(bad)).is_err());
+        }
+    }
 }

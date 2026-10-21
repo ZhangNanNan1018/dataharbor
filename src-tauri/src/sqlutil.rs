@@ -7,6 +7,15 @@ mod pagination;
 mod scan;
 pub use pagination::{is_read_query, paginate_query_sql, paginate_sql};
 
+pub(crate) fn terminated_sql_prefix(sql: &str) -> Option<usize> {
+    let scan = scan::scan(sql);
+    scan.statements.iter().rev().nth(1).map(|(_, end)| end + 1)
+}
+
+pub(crate) fn sql_is_complete(sql: &str) -> bool {
+    scan::scan(sql).complete
+}
+
 const JS_MAX: i64 = 9_007_199_254_740_991;
 
 pub fn quote_ident(engine: Engine, name: &str) -> AppResult<String> {
@@ -210,7 +219,19 @@ pub fn blob_literal(engine: Engine, bytes: &[u8]) -> AppResult<String> {
 }
 
 pub fn value_sql(engine: Engine, data_type: &str, value: &JsonValue) -> AppResult<String> {
-    if is_binary_type(data_type) {
+    if let JsonValue::String(text) = value {
+        if is_numeric_type(data_type) {
+            return exact_numeric_literal(text);
+        }
+        if data_type.to_ascii_lowercase().starts_with("bool") {
+            match text.to_ascii_lowercase().as_str() {
+                "1" | "t" | "true" | "yes" => return sql_literal(engine, &JsonValue::Bool(true)),
+                "0" | "f" | "false" | "no" => return sql_literal(engine, &JsonValue::Bool(false)),
+                _ => return Err(AppError::msg("布尔列需要 true/false 或 1/0")),
+            }
+        }
+    }
+    if is_binary_type(data_type) || (engine == Engine::Mssql && matches!(data_type.to_ascii_lowercase().as_str(), "rowversion" | "timestamp")) {
         if value.is_null() {
             return Ok("NULL".into());
         }
@@ -225,6 +246,37 @@ pub fn value_sql(engine: Engine, data_type: &str, value: &JsonValue) -> AppResul
         return blob_literal(engine, &bytes);
     }
     sql_literal(engine, value)
+}
+
+pub(crate) fn is_numeric_type(data_type: &str) -> bool {
+    let kind = data_type.to_ascii_lowercase();
+    !kind.starts_with("interval") && !kind.contains('[') && ["int", "tinyint", "smallint", "mediumint", "bigint", "serial", "bigserial", "smallserial", "decimal", "numeric", "float", "double", "real", "money", "smallmoney", "number", "dec"]
+        .iter().any(|prefix| kind.starts_with(prefix))
+}
+
+/// Validate decimal syntax without ever rounding through f64. The database
+/// remains responsible for precision/range constraints of the target column.
+pub(crate) fn exact_numeric_literal(text: &str) -> AppResult<String> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; digits += 1; }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; digits += 1; }
+    }
+    if digits > 0 && matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) { i += 1; }
+        let start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+        if start == i { return Err(AppError::msg("数值的指数不完整")); }
+    }
+    if digits == 0 || i != bytes.len() {
+        return Err(AppError::msg("数值列包含无效数字；空字符串不能自动转换为 NULL，请使用 \\N"));
+    }
+    Ok(text.to_string())
 }
 
 pub fn reference_sql(

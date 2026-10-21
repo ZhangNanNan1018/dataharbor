@@ -29,6 +29,7 @@ pub fn connect(config: &SessionConfig) -> AppResult<MysqlSession> {
         .user(Some(config.username.clone()))
         .pass(Some(config.password.clone()))
         .prefer_socket(false)
+        .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS)
         .tcp_connect_timeout(Some(Duration::from_secs(8)))
         .read_timeout(Some(Duration::from_secs(60)))
         .write_timeout(Some(Duration::from_secs(60)));
@@ -101,7 +102,7 @@ impl DbSession for MysqlSession {
         let db = sql_literal(self.engine, &JsonValue::String(database.to_string()))?;
         let table = sql_literal(self.engine, &JsonValue::String(object_name.to_string()))?;
         let sql = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA \
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA \
              FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {db} AND TABLE_NAME = {table} \
              ORDER BY ORDINAL_POSITION"
         );
@@ -142,6 +143,12 @@ impl DbSession for MysqlSession {
         }))
     }
 
+    fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
+        self.activate(database)?;
+        self.conn.query_drop(sql).map_err(|err| AppError::msg(err.to_string()))?;
+        Ok(self.conn.affected_rows())
+    }
+
     fn execute(
         &mut self,
         database: &str,
@@ -157,6 +164,10 @@ impl DbSession for MysqlSession {
             .conn
             .query_iter(sql)
             .map_err(|err| AppError::msg(err.to_string()))?;
+        let binary_columns = result.columns().as_ref().iter().map(|column| {
+            use mysql::consts::ColumnType::*;
+            column.character_set() == 63 && matches!(column.column_type(), MYSQL_TYPE_BLOB | MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_STRING | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_VARCHAR)
+        }).collect::<Vec<_>>();
         let columns: Vec<ColumnMeta> = result
             .columns()
             .as_ref()
@@ -168,6 +179,7 @@ impl DbSession for MysqlSession {
             })
             .collect();
         if columns.is_empty() {
+            let affected = result.affected_rows();
             while result
                 .next()
                 .transpose()
@@ -175,7 +187,7 @@ impl DbSession for MysqlSession {
                 .is_some()
             {}
             let mut outcome = QueryOutcome::empty();
-            outcome.rows_affected = result.affected_rows();
+            outcome.rows_affected = affected;
             return Ok(outcome);
         }
         let mut rows = Vec::new();
@@ -192,11 +204,15 @@ impl DbSession for MysqlSession {
             let mut cells = Vec::with_capacity(columns.len());
             for index in 0..columns.len() {
                 let value = row.get(index).unwrap_or(Value::NULL);
-                cells.push(mysql_to_json(value));
+                cells.push(match value {
+                    Value::Bytes(bytes) if binary_columns[index] => json_blob(&bytes),
+                    other => mysql_to_json(other),
+                });
             }
             rows.push(cells);
         }
         Ok(QueryOutcome {
+            original_rows: None,
             columns,
             rows,
             rows_affected: 0,
@@ -256,24 +272,19 @@ fn mysql_to_json(value: Value) -> JsonValue {
         Value::UInt(number) => json_u64(number),
         Value::Float(number) => json_f64(number as f64),
         Value::Double(number) => json_f64(number),
-        Value::Date(year, month, day, hour, minute, second, _micros) => {
-            if hour == 0 && minute == 0 && second == 0 {
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            if hour == 0 && minute == 0 && second == 0 && micros == 0 {
                 JsonValue::String(format!("{year:04}-{month:02}-{day:02}"))
             } else {
-                JsonValue::String(format!(
-                    "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
-                ))
+                let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}") };
+                JsonValue::String(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}{fraction}"))
             }
         }
-        Value::Time(negative, days, hour, minute, second, _micros) => {
+        Value::Time(negative, days, hour, minute, second, micros) => {
             let sign = if negative { "-" } else { "" };
-            if days > 0 {
-                JsonValue::String(format!(
-                    "{sign}{days}d {hour:02}:{minute:02}:{second:02}"
-                ))
-            } else {
-                JsonValue::String(format!("{sign}{hour:02}:{minute:02}:{second:02}"))
-            }
+            let hours = u64::from(days) * 24 + u64::from(hour);
+            let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}") };
+            JsonValue::String(format!("{sign}{hours:02}:{minute:02}:{second:02}{fraction}"))
         }
     }
 }
@@ -284,4 +295,14 @@ fn first_text(outcome: &QueryOutcome) -> Option<String> {
         JsonValue::Null => String::new(),
         other => other.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn temporal_values_keep_microseconds_and_mysql_duration_syntax() {
+        assert_eq!(mysql_to_json(Value::Date(2026, 10, 21, 0, 0, 0, 1)), JsonValue::String("2026-10-21 00:00:00.000001".into()));
+        assert_eq!(mysql_to_json(Value::Time(true, 2, 1, 2, 3, 456789)), JsonValue::String("-49:02:03.456789".into()));
+    }
 }

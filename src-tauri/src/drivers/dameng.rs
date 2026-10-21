@@ -76,6 +76,7 @@ impl DamengSession {
             rows.push(cells);
         }
         Ok(QueryOutcome {
+            original_rows: None,
             columns,
             rows,
             rows_affected: 0,
@@ -203,6 +204,7 @@ impl DbSession for DamengSession {
             .execute(sql)
             .map_err(|err| AppError::msg(err.to_string()))?;
         Ok(QueryOutcome {
+            original_rows: None,
             columns: Vec::new(),
             rows: Vec::new(),
             rows_affected: affected,

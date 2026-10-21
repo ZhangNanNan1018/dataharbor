@@ -142,7 +142,15 @@ impl DbSession for MssqlSession {
         let outcome = self.execute(
             "",
             &format!(
-                "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, CASE WHEN k.COLUMN_NAME IS NULL THEN 0 ELSE 1 END, COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity'), c.COLUMN_DEFAULT
+                "SELECT c.COLUMN_NAME,
+                   CASE WHEN c.DATA_TYPE IN ('varchar','nvarchar','char','nchar','binary','varbinary')
+                        THEN c.DATA_TYPE + '(' + CASE WHEN c.CHARACTER_MAXIMUM_LENGTH = -1 THEN 'max' ELSE CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR(20)) END + ')'
+                        WHEN c.DATA_TYPE IN ('decimal','numeric')
+                        THEN c.DATA_TYPE + '(' + CAST(c.NUMERIC_PRECISION AS VARCHAR(20)) + ',' + CAST(c.NUMERIC_SCALE AS VARCHAR(20)) + ')'
+                        WHEN c.DATA_TYPE IN ('datetime2','datetimeoffset','time')
+                        THEN c.DATA_TYPE + '(' + CAST(c.DATETIME_PRECISION AS VARCHAR(20)) + ')'
+                        ELSE c.DATA_TYPE END,
+                   c.IS_NULLABLE, CASE WHEN k.COLUMN_NAME IS NULL THEN 0 ELSE 1 END, COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity'), c.COLUMN_DEFAULT
                  FROM INFORMATION_SCHEMA.COLUMNS c
                  LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k
                    ON k.TABLE_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.COLUMN_NAME = c.COLUMN_NAME
@@ -181,6 +189,15 @@ impl DbSession for MssqlSession {
         }))
     }
 
+    fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
+        self.use_db(database)?;
+        block_on(async {
+            self.client.execute(sql, &[]).await
+                .map(|result| result.total())
+                .map_err(|err| AppError::msg(err.to_string()))
+        })
+    }
+
     fn execute(&mut self, database: &str, sql: &str, max_rows: Option<usize>) -> AppResult<QueryOutcome> {
         if !database.is_empty() {
             self.use_db(database)?;
@@ -217,7 +234,7 @@ impl DbSession for MssqlSession {
                         }
                         let mut cells = Vec::new();
                         for index in 0..columns.len().max(row.len()) {
-                            cells.push(cell_value(&row, index));
+                            cells.push(cell_value(&row, index)?);
                         }
                         rows.push(cells);
                     }
@@ -225,6 +242,7 @@ impl DbSession for MssqlSession {
             }
             let affected = if columns.is_empty() { rows.len() as u64 } else { 0 };
             Ok(QueryOutcome {
+                original_rows: None,
                 columns,
                 rows,
                 rows_affected: affected,
@@ -258,30 +276,57 @@ fn json_flag(value: &JsonValue) -> Option<bool> {
     }
 }
 
-fn cell_value(row: &tiberius::Row, index: usize) -> JsonValue {
+fn cell_value(row: &tiberius::Row, index: usize) -> AppResult<JsonValue> {
     macro_rules! pull {
         ($ty:ty, $map:expr) => {
             match row.try_get::<$ty, _>(index) {
-                Ok(Some(value)) => return $map(value),
-                Ok(None) => return JsonValue::Null,
+                Ok(Some(value)) => return Ok($map(value)),
+                Ok(None) => return Ok(JsonValue::Null),
                 Err(_) => {}
             }
         };
     }
     pull!(&str, |value: &str| JsonValue::String(value.to_string()));
+    pull!(u8, |value: u8| JsonValue::Number(value.into()));
+    pull!(i16, |value: i16| JsonValue::Number(value.into()));
     pull!(i32, |value: i32| JsonValue::Number(value.into()));
-    pull!(i64, |value: i64| Number::from_i128(i128::from(value)).map(JsonValue::Number).unwrap_or_else(|| JsonValue::String(value.to_string())));
+    pull!(i64, crate::sqlutil::json_i64);
+    pull!(tiberius::numeric::Numeric, |value: tiberius::numeric::Numeric| JsonValue::String(numeric_text(value)));
+    pull!(&[u8], crate::sqlutil::json_blob);
+    pull!(tiberius::Uuid, |value: tiberius::Uuid| JsonValue::String(value.to_string()));
+    pull!(f32, |value: f32| crate::sqlutil::json_f64(f64::from(value)));
     pull!(f64, |value: f64| Number::from_f64(value).map(JsonValue::Number).unwrap_or(JsonValue::Null));
     pull!(bool, JsonValue::Bool);
     pull!(chrono::NaiveDateTime, |value: chrono::NaiveDateTime| JsonValue::String(value.to_string()));
     pull!(chrono::NaiveDate, |value: chrono::NaiveDate| JsonValue::String(value.to_string()));
     pull!(chrono::NaiveTime, |value: chrono::NaiveTime| JsonValue::String(value.to_string()));
-    JsonValue::Null
+    pull!(chrono::DateTime<chrono::FixedOffset>, |value: chrono::DateTime<chrono::FixedOffset>| JsonValue::String(value.to_rfc3339()));
+    Err(AppError::msg(format!("第 {} 列的数据类型暂不支持无损读取，已停止显示以避免将真实值误当成 NULL", index + 1)))
+}
+
+fn numeric_text(value: tiberius::numeric::Numeric) -> String {
+    let scale = usize::from(value.scale());
+    let digits = format!("{:0width$}", value.value().unsigned_abs(), width = scale + 1);
+    let sign = if value.value() < 0 { "-" } else { "" };
+    if scale == 0 { format!("{sign}{digits}") }
+    else {
+        let (whole, fraction) = digits.split_at(digits.len() - scale);
+        format!("{sign}{whole}.{fraction}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_numeric_text_preserves_sign_scale_and_large_values() {
+        use tiberius::numeric::Numeric;
+        assert_eq!(numeric_text(Numeric::new_with_scale(-123, 2)), "-1.23");
+        assert_eq!(numeric_text(Numeric::new_with_scale(-1, 18)), "-0.000000000000000001");
+        assert_eq!(numeric_text(Numeric::new_with_scale(18446744073709551615, 0)), "18446744073709551615");
+        assert_eq!(numeric_text(Numeric::new_with_scale(12300, 4)), "1.2300");
+    }
 
     #[test]
     fn windows_auth_is_compiled_only_with_sspi() {

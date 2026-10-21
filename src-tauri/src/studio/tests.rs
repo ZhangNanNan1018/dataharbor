@@ -346,7 +346,7 @@ fn imported_jobs_stay_disabled_and_cannot_replace_existing_jobs() {
         .any(|profile| profile.id == "new-imported-profile"));
     assert!(result.contains("均已禁用"));
     assert!(result.contains("跳过同 ID 任务 1 个"));
-    let jobs: Vec<Job> = read_vec(&fixture.state, "jobs.json");
+    let jobs: Vec<Job> = read_vec(&fixture.state, "jobs.json").unwrap();
     let existing = jobs.iter().find(|job| job.id == "local").unwrap();
     assert_eq!(existing.sql, "SELECT 1");
     assert!(existing.enabled);
@@ -361,4 +361,39 @@ fn imported_jobs_stay_disabled_and_cannot_replace_existing_jobs() {
         .unwrap()
         .is_empty());
     assert_eq!(fixture.rows(&id, "items"), vec![vec![json!(1)]]);
+}
+
+
+#[test]
+fn failed_later_transfer_batch_reports_committed_progress_without_replaying() {
+    let fixture = Fixture::new();
+    let source = fixture.database("batch-source", "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
+    let target = fixture.database("batch-target", "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT); INSERT INTO items VALUES(501,'existing')");
+    let values = (1..=501).map(|id| format!("({id},'source')")).collect::<Vec<_>>().join(",");
+    fixture.execute(&source, &format!("INSERT INTO items VALUES {values}"));
+    let error = transfer_with_ceiling(&fixture.state, &pair(&source, &target), 1000).unwrap_err().to_string();
+    assert!(error.contains("此前已提交 1 批、500 条更改"), "{error}");
+    let rows = fixture.rows(&target, "items");
+    assert_eq!(rows.len(), 501);
+    assert_eq!(rows.last().unwrap()[1], json!("existing"));
+}
+
+
+#[test]
+fn foreign_project_credentials_do_not_poison_the_local_key_store() {
+    let fixture = Fixture::new();
+    let foreign = Fixture::new();
+    let id = foreign.database("foreign", "CREATE TABLE items(id INTEGER)");
+    let mut profile = foreign.state.profiles_snapshot().into_iter().find(|p| p.id == id).unwrap();
+    profile.password_enc = foreign.state.encrypt_secret("external-password").unwrap();
+    profile.ssh_password_enc = foreign.state.encrypt_secret("external-ssh").unwrap();
+    let project = fixture.directory.join("foreign-project.json");
+    let raw = serde_json::to_string(&json!({"version":1,"profiles":[profile],"snippets":[],"jobs":[],"dashboards":[],"models":[],"favorites":[]})).unwrap();
+    fs::write(&project, &raw).unwrap();
+    let result = import_project(&fixture.state, project.to_str().unwrap()).unwrap();
+    assert!(result.contains("其中 1 个连接"));
+    let imported = fixture.state.profiles_snapshot().into_iter().find(|p| p.id == id).unwrap();
+    assert!(imported.password_enc.is_empty());
+    assert!(imported.ssh_password_enc.is_empty());
+    assert_eq!(fs::read_to_string(project).unwrap(), raw);
 }

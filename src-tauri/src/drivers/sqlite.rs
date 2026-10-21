@@ -206,6 +206,7 @@ impl DbSession for SqliteSession {
             rows.push(cells);
         }
         Ok(QueryOutcome {
+            original_rows: None,
             columns,
             rows,
             rows_affected: 0,

@@ -81,6 +81,7 @@ npm run tauri build
 只做前端类型检查和静态构建：
 
 ```bash
+npm test
 npm run build
 ```
 
@@ -139,8 +140,8 @@ PostgreSQL 和 SQL Server 的隧道 TLS 保留真实证书主机名。MySQL/Mari
 | Linux | `${XDG_CONFIG_HOME:-~/.config}/dataharbor` |
 
 - `connections.json` 只保存连接资料。密码字段是 `xb1:` 开头的 AES-256-GCM 密文。
-- 主密钥优先放进系统凭据：服务名 `dataharbor`，账户 `master-key`（Windows 凭据管理器、macOS 钥匙串、Linux Secret Service）。
-- 读不到凭据服务时，主密钥退回到配置目录里的 `master.key`（权限 `0600`）。无图形会话的 Linux 会在大约两秒后走这条退路，避免启动卡住。
+- 主密钥首次创建时优先放进系统凭据：服务名 `dataharbor`，账户 `master-key`（Windows 凭据管理器、macOS 钥匙串、Linux Secret Service）。
+- 首次使用且没有既有密文时，凭据服务不可用会退回配置目录的 `master.key`（Unix 权限 `0600`，Windows 继承配置目录 ACL）。已有密文时不会因为超时创建替代密钥；文件与系统密钥冲突时仅在已有密文能唯一确认正确候选时继续，否则保留全部资料并要求恢复。
 - 第一次启动时，如果本机还留着上一版的配置目录、WebView 数据和系统凭据，程序会在生成新主密钥之前把它们迁过来。新目录里已经有的文件不会被覆盖。迁不走的凭据服务不会挡住启动，`master.key` 仍可解密。
 - 编辑连接时密码留空表示沿用原密码；勾选清除才会抹掉。
 - 安装系统计划任务时，macOS 的 LaunchAgent 标签是 `com.dataharbor.app.jobs`，Windows 任务名是 `DataHarbor`，Linux 只在 `DATAHARBOR_INSTALL_CRON=1` 时写入 crontab。
@@ -166,3 +167,14 @@ docs/FEATURE_ROADMAP.md
 网格和 CSV 的 SQL 修改先完整校验整批语句，再提交到同一会话事务。SQL Server 使用 BEGIN TRANSACTION；Oracle 通过单次 SQL*Plus 事务块执行，单条生成语句超过 8KB 会在写入前拒绝，仍需实机验收。Snowflake SQL API 当前不能保证跨请求会话事务，因此拒绝网格/CSV 原子批量修改，可在查询编辑器执行明确的单条操作。
 
 AI 请求会将用户操作中的问题、SQL、结构说明或待补全单元格内容发送到所配置接口。项目包包含地址、账号、路径和 SQL 等资料；导入的新任务默认禁用，已有同 ID 本地任务不会被覆盖。
+
+## 数据可靠性与使用边界
+
+- 保存快捷键只处理当前表，提交期间禁止重复写入；网格按读取时原值检查并发冲突。SQL 批量冲突会回滚，MongoDB/Redis 仍逐条提交，部分失败会显示已提交条数并要求刷新核对，不能直接重放整批。
+- CSV/TXT 空单元格表示空字符串，`\N` 表示 NULL。字面文本 `\N` 写成 `\\N`；仅对反斜杠加 N 的保留值族转义，普通文件路径保持原样。数值按目标字段验证并保留精确文本，不能用空字符串代替数值 NULL。
+- 查询结果、翻页、导出和执行计划固定关联原连接与数据库，切换后旧响应失效。查询草稿及执行历史包含 SQL 原文，保存在本机 WebView 存储；关闭查询标签会删除对应恢复草稿，执行历史与草稿分开存储。请避免在草稿中长期保留明文凭据。
+- 跨引擎结构同步只自动生成有明确类型映射的变更；无法保证精度、时区或长度等语义时会拒绝并要求人工处理。已有字段类型修改也属于危险变更，需查看 SQL 后明确选择。
+- 内置脚本可流式恢复超过 20MB 的总文件，但单条 SQL 仍限 20MB；恢复失败会报告已执行条数。外部 PostgreSQL 普通脚本需要支持 restricted 模式的 psql，自定义归档使用 pg_restore；旧工具会明确拒绝。原生备份工具不能继承隧道、TLS 或特殊认证时不会静默改用不等价连接。
+- 系统计划任务会主动建连，实际任务失败返回非零退出码；进程锁防止多个实例同时执行同一批任务。进程崩溃后的外部数据库副作用仍需核对，不能把任务互斥当作全任务原子事务。
+
+验证方法与尚未实机验收的边界见 [docs/TESTING.md](docs/TESTING.md)。

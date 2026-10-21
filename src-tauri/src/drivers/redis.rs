@@ -5,7 +5,9 @@ use serde_json::{json, Value as JsonValue};
 
 use super::DbSession;
 use crate::error::{AppError, AppResult};
-use crate::models::{ColumnMeta, Engine, FilterSpec, QueryOutcome, RowChange, SessionConfig, SortSpec};
+use crate::models::{
+    ColumnMeta, Engine, FilterSpec, QueryOutcome, RowChange, SessionConfig, SortSpec,
+};
 
 enum RedisLink {
     Single(redis::Connection),
@@ -49,7 +51,9 @@ pub struct RedisSession {
 
 pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
     if config.use_ssl {
-        return Err(AppError::msg("当前 Redis 构建未包含 TLS 支持，不能启用 SSL；程序不会退回明文连接。"));
+        return Err(AppError::msg(
+            "当前 Redis 构建未包含 TLS 支持，不能启用 SSL；程序不会退回明文连接。",
+        ));
     }
     let mode = config.server_mode.trim().to_ascii_lowercase();
     let conn = if mode == "cluster" {
@@ -71,14 +75,20 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
         }
         let map = parse_address_map(&config.address_map);
         if map.is_empty() {
-            let client = redis::cluster::ClusterClient::new(nodes).map_err(|err| AppError::msg(err.to_string()))?;
+            let client = redis::cluster::ClusterClient::new(nodes)
+                .map_err(|err| AppError::msg(err.to_string()))?;
             RedisLink::Cluster(
                 client
                     .get_connection()
                     .map_err(|err| AppError::msg(format!("Redis Cluster 连接失败: {err}")))?,
             )
         } else {
-            RedisLink::Mapped(MappedCluster::open(nodes, map, &config.username, &config.password)?)
+            RedisLink::Mapped(MappedCluster::open(
+                nodes,
+                map,
+                &config.username,
+                &config.password,
+            )?)
         }
     } else if mode == "sentinel" {
         let master = if config.database.trim().is_empty() {
@@ -93,9 +103,17 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
             .map_err(|err| AppError::msg(format!("Redis Sentinel 主节点连接失败: {err}")))?;
         RedisLink::Single(conn)
     } else {
-        let client = redis::Client::open(redis_url(&config.host, config.port, &config.username, &config.password, 0))
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        let conn = client.get_connection().map_err(|err| AppError::msg(format!("Redis 连接失败: {err}")))?;
+        let client = redis::Client::open(redis_url(
+            &config.host,
+            config.port,
+            &config.username,
+            &config.password,
+            0,
+        ))
+        .map_err(|err| AppError::msg(err.to_string()))?;
+        let conn = client
+            .get_connection()
+            .map_err(|err| AppError::msg(format!("Redis 连接失败: {err}")))?;
         conn.set_read_timeout(Some(Duration::from_secs(15))).ok();
         conn.set_write_timeout(Some(Duration::from_secs(15))).ok();
         RedisLink::Single(conn)
@@ -112,7 +130,14 @@ fn split_host_port(item: &str, default_port: u16) -> (String, u16) {
             }
         }
     }
-    (item.to_string(), if default_port == 0 { 6379 } else { default_port })
+    (
+        item.to_string(),
+        if default_port == 0 {
+            6379
+        } else {
+            default_port
+        },
+    )
 }
 
 fn redis_url(host: &str, port: u16, username: &str, password: &str, db: i64) -> String {
@@ -123,7 +148,11 @@ fn redis_url(host: &str, port: u16, username: &str, password: &str, db: i64) -> 
     } else if username.trim().is_empty() {
         format!("redis://:{}@{host}:{port}/{db}", encode(password))
     } else {
-        format!("redis://{}:{}@{host}:{port}/{db}", encode(username.trim()), encode(password))
+        format!(
+            "redis://{}:{}@{host}:{port}/{db}",
+            encode(username.trim()),
+            encode(password)
+        )
     }
 }
 
@@ -140,9 +169,17 @@ fn encode(value: &str) -> String {
 }
 
 fn sentinel_master(config: &SessionConfig, service: &str) -> AppResult<String> {
-    let client = redis::Client::open(redis_url(&config.host, config.port, &config.username, &config.password, 0))
-        .map_err(|err| AppError::msg(err.to_string()))?;
-    let mut conn = client.get_connection().map_err(|err| AppError::msg(format!("无法连接 Sentinel: {err}")))?;
+    let client = redis::Client::open(redis_url(
+        &config.host,
+        config.port,
+        &config.username,
+        &config.password,
+        0,
+    ))
+    .map_err(|err| AppError::msg(err.to_string()))?;
+    let mut conn = client
+        .get_connection()
+        .map_err(|err| AppError::msg(format!("无法连接 Sentinel: {err}")))?;
     let reply: Vec<String> = redis::cmd("SENTINEL")
         .arg("get-master-addr-by-name")
         .arg(service)
@@ -152,7 +189,13 @@ fn sentinel_master(config: &SessionConfig, service: &str) -> AppResult<String> {
         return Err(AppError::msg(format!("Sentinel 服务 {service} 没有主节点")));
     }
     let port: u16 = reply[1].parse().unwrap_or(6379);
-    Ok(redis_url(&reply[0], port, &config.username, &config.password, 0))
+    Ok(redis_url(
+        &reply[0],
+        port,
+        &config.username,
+        &config.password,
+        0,
+    ))
 }
 
 impl RedisSession {
@@ -160,7 +203,11 @@ impl RedisSession {
         if self.mode == "cluster" {
             return Ok(());
         }
-        let db = database.trim().trim_start_matches("db").parse::<i64>().unwrap_or(0);
+        let db = database
+            .trim()
+            .trim_start_matches("db")
+            .parse::<i64>()
+            .unwrap_or(0);
         redis::cmd("SELECT")
             .arg(db)
             .query::<()>(self.conn.as_mut())
@@ -178,13 +225,23 @@ impl DbSession for RedisSession {
     }
 
     fn version(&mut self) -> AppResult<String> {
-        let info: String = redis::cmd("INFO").arg("server").query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
+        let info: String = redis::cmd("INFO")
+            .arg("server")
+            .query(self.conn.as_mut())
+            .map_err(|err| AppError::msg(err.to_string()))?;
         let version = info
             .lines()
             .find_map(|line| line.strip_prefix("redis_version:"))
             .unwrap_or("redis")
             .to_string();
-        Ok(format!("Redis {version} ({})", if self.mode.is_empty() { "standalone" } else { self.mode.as_str() }))
+        Ok(format!(
+            "Redis {version} ({})",
+            if self.mode.is_empty() {
+                "standalone"
+            } else {
+                self.mode.as_str()
+            }
+        ))
     }
 
     fn list_databases(&mut self) -> AppResult<Vec<String>> {
@@ -237,13 +294,23 @@ impl DbSession for RedisSession {
         Ok(Vec::new())
     }
 
-    fn list_columns(&mut self, database: &str, _schema: &str, object_name: &str) -> AppResult<Vec<ColumnMeta>> {
+    fn list_columns(
+        &mut self,
+        database: &str,
+        _schema: &str,
+        object_name: &str,
+    ) -> AppResult<Vec<ColumnMeta>> {
         self.select_db(database)?;
         let kind = key_type(self.conn.as_mut(), object_name)?;
         Ok(columns_for(&kind))
     }
 
-    fn relation_kind(&mut self, database: &str, _schema: &str, object_name: &str) -> AppResult<Option<String>> {
+    fn relation_kind(
+        &mut self,
+        database: &str,
+        _schema: &str,
+        object_name: &str,
+    ) -> AppResult<Option<String>> {
         self.select_db(database)?;
         let kind = key_type(self.conn.as_mut(), object_name)?;
         if kind == "none" {
@@ -253,7 +320,12 @@ impl DbSession for RedisSession {
         }
     }
 
-    fn execute(&mut self, database: &str, sql: &str, max_rows: Option<usize>) -> AppResult<QueryOutcome> {
+    fn execute(
+        &mut self,
+        database: &str,
+        sql: &str,
+        max_rows: Option<usize>,
+    ) -> AppResult<QueryOutcome> {
         self.select_db(database)?;
         let line = sql.trim().trim_end_matches(';').trim();
         if line.is_empty() {
@@ -268,7 +340,9 @@ impl DbSession for RedisSession {
         for part in parts {
             cmd.arg(part);
         }
-        let value: redis::Value = cmd.query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
+        let value: redis::Value = cmd
+            .query(self.conn.as_mut())
+            .map_err(|err| AppError::msg(err.to_string()))?;
         Ok(value_to_outcome(value, max_rows.unwrap_or(500)))
     }
 
@@ -277,41 +351,103 @@ impl DbSession for RedisSession {
         database: &str,
         _schema: &str,
         table: &str,
-        _filters: &[FilterSpec],
-        _sorts: &[SortSpec],
+        filters: &[FilterSpec],
+        sorts: &[SortSpec],
         limit: u32,
         offset: u32,
     ) -> AppResult<QueryOutcome> {
+        if !filters.is_empty() || !sorts.is_empty() {
+            return Err(AppError::msg(
+                "Redis 网格不支持自定义筛选或排序，请使用 Redis 命令",
+            ));
+        }
         self.select_db(database)?;
         let kind = key_type(self.conn.as_mut(), table)?;
         let columns = columns_for(&kind);
         let mut rows = match kind.as_str() {
             "string" => {
-                let value: Option<String> = redis::cmd("GET").arg(table).query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-                vec![vec![JsonValue::String(table.into()), JsonValue::String(value.unwrap_or_default())]]
+                let value: Option<String> = redis::cmd("GET")
+                    .arg(table)
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                vec![vec![
+                    JsonValue::String(table.into()),
+                    JsonValue::String(value.unwrap_or_default()),
+                ]]
             }
             "hash" => {
-                let map: Vec<(String, String)> = redis::cmd("HGETALL").arg(table).query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-                map.into_iter().map(|(field, value)| vec![JsonValue::String(field), JsonValue::String(value)]).collect()
+                let mut map: Vec<(String, String)> = redis::cmd("HGETALL")
+                    .arg(table)
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                map.sort_by(|left, right| left.0.cmp(&right.0));
+                map.into_iter()
+                    .map(|(field, value)| vec![JsonValue::String(field), JsonValue::String(value)])
+                    .collect()
             }
             "list" => {
-                let values: Vec<String> = redis::cmd("LRANGE").arg(table).arg(0).arg(499).query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-                values.into_iter().enumerate().map(|(index, value)| vec![json!(index as i64), JsonValue::String(value)]).collect()
+                let values: Vec<String> = redis::cmd("LRANGE")
+                    .arg(table)
+                    .arg(offset)
+                    .arg(u64::from(offset) + u64::from(limit) - 1)
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        vec![
+                            json!(u64::from(offset) + index as u64),
+                            JsonValue::String(value),
+                        ]
+                    })
+                    .collect()
             }
             "set" => {
-                let values: Vec<String> = redis::cmd("SMEMBERS").arg(table).query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-                values.into_iter().map(|value| vec![JsonValue::String(value)]).collect()
+                let mut values: Vec<String> = redis::cmd("SMEMBERS")
+                    .arg(table)
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                values.sort();
+                values
+                    .into_iter()
+                    .map(|value| vec![JsonValue::String(value)])
+                    .collect()
             }
             "zset" => {
-                let values: Vec<(String, f64)> = redis::cmd("ZRANGE").arg(table).arg(0).arg(499).arg("WITHSCORES").query(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-                values.into_iter().map(|(member, score)| vec![JsonValue::String(member), json!(score)]).collect()
+                let values: Vec<(String, String)> = redis::cmd("ZRANGE")
+                    .arg(table)
+                    .arg(offset)
+                    .arg(u64::from(offset) + u64::from(limit) - 1)
+                    .arg("WITHSCORES")
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                values
+                    .into_iter()
+                    .map(|(member, score)| {
+                        vec![JsonValue::String(member), JsonValue::String(score)]
+                    })
+                    .collect()
             }
-            _ => return Err(AppError::msg(format!("键不存在或类型 {kind} 暂不能以表格打开"))),
+            _ => {
+                return Err(AppError::msg(format!(
+                    "键不存在或类型 {kind} 暂不能以表格打开"
+                )))
+            }
         };
-        let start = offset as usize;
+        let start = if matches!(kind.as_str(), "list" | "zset") {
+            0
+        } else {
+            offset as usize
+        };
         let end = (start + limit as usize).min(rows.len());
-        let page = if start < rows.len() { rows.drain(start..end).collect() } else { Vec::new() };
+        let page = if start < rows.len() {
+            rows.drain(start..end).collect()
+        } else {
+            Vec::new()
+        };
         Ok(QueryOutcome {
+            original_rows: None,
             columns,
             rows: page,
             rows_affected: 0,
@@ -324,69 +460,227 @@ impl DbSession for RedisSession {
         let kind = key_type(self.conn.as_mut(), table)?;
         let count: i64 = match kind.as_str() {
             "string" => 1,
-            "hash" => redis::cmd("HLEN").arg(table).query(self.conn.as_mut()).unwrap_or(0),
-            "list" => redis::cmd("LLEN").arg(table).query(self.conn.as_mut()).unwrap_or(0),
-            "set" => redis::cmd("SCARD").arg(table).query(self.conn.as_mut()).unwrap_or(0),
-            "zset" => redis::cmd("ZCARD").arg(table).query(self.conn.as_mut()).unwrap_or(0),
+            "hash" => redis::cmd("HLEN")
+                .arg(table)
+                .query::<i64>(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "list" => redis::cmd("LLEN")
+                .arg(table)
+                .query::<i64>(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "set" => redis::cmd("SCARD")
+                .arg(table)
+                .query::<i64>(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "zset" => redis::cmd("ZCARD")
+                .arg(table)
+                .query::<i64>(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
             _ => 0,
         };
         Ok(count.max(0) as u64)
     }
 
-    fn apply_mutation(&mut self, database: &str, _schema: &str, table: &str, change: &RowChange) -> AppResult<()> {
+    fn apply_mutation(
+        &mut self,
+        database: &str,
+        _schema: &str,
+        table: &str,
+        change: &RowChange,
+    ) -> AppResult<()> {
         self.select_db(database)?;
-        let kind = key_type(self.conn.as_mut(), table).unwrap_or_else(|_| "none".into());
-        match (kind.as_str(), change.kind.as_str()) {
-            ("string", "update" | "insert") => {
-                let value = change.values.iter().find(|item| item.column == "value").map(|item| json_text(&item.value)).unwrap_or_default();
-                redis::cmd("SET").arg(table).arg(value).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
+        if matches!(change.kind.as_str(), "update" | "delete") {
+            let args = cas_args(table, change)?;
+            let result: i64 = redis::cmd("EVAL")
+                .arg(CAS_SCRIPT)
+                .arg(1)
+                .arg(table)
+                .arg(args)
+                .query(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?;
+            return if result == 1 {
+                Ok(())
+            } else {
+                Err(AppError::msg(
+                    "Redis 数据已被修改、删除或类型改变，本条更改未写入；请重新加载",
+                ))
+            };
+        }
+        if change.kind != "insert" {
+            return Err(AppError::msg("未知的更改类型"));
+        }
+        let kind = key_type(self.conn.as_mut(), table)?;
+        let value = change
+            .values
+            .iter()
+            .find(|item| item.column == "value")
+            .map(|item| json_text(&item.value))
+            .unwrap_or_default();
+        let added: i64 = match kind.as_str() {
+            "string" | "none" => {
+                let result: Option<String> = redis::cmd("SET")
+                    .arg(table)
+                    .arg(value)
+                    .arg("NX")
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?;
+                i64::from(result.is_some())
             }
-            ("hash", "insert" | "update") => {
-                let field = field_of(change, "field")?;
-                let value = change.values.iter().find(|item| item.column == "value").map(|item| json_text(&item.value)).unwrap_or_default();
-                redis::cmd("HSET").arg(table).arg(field).arg(value).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
+            "hash" => redis::cmd("HSETNX")
+                .arg(table)
+                .arg(field_of(change, "field")?)
+                .arg(value)
+                .query(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "list" => redis::cmd("RPUSH")
+                .arg(table)
+                .arg(value)
+                .query(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "set" => redis::cmd("SADD")
+                .arg(table)
+                .arg(field_of(change, "member")?)
+                .query(self.conn.as_mut())
+                .map_err(|err| AppError::msg(err.to_string()))?,
+            "zset" => {
+                let score = change
+                    .values
+                    .iter()
+                    .find(|item| item.column == "score")
+                    .map(|item| json_text(&item.value))
+                    .unwrap_or_else(|| "0".into());
+                redis::cmd("ZADD")
+                    .arg(table)
+                    .arg("NX")
+                    .arg(score)
+                    .arg(field_of(change, "member")?)
+                    .query(self.conn.as_mut())
+                    .map_err(|err| AppError::msg(err.to_string()))?
             }
-            ("hash", "delete") => {
-                let field = field_of(change, "field")?;
-                redis::cmd("HDEL").arg(table).arg(field).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("list", "update") => {
-                let index = field_of(change, "index")?;
-                let value = change.values.iter().find(|item| item.column == "value").map(|item| json_text(&item.value)).unwrap_or_default();
-                redis::cmd("LSET").arg(table).arg(index).arg(value).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("list", "insert") => {
-                let value = change.values.iter().find(|item| item.column == "value").map(|item| json_text(&item.value)).unwrap_or_default();
-                redis::cmd("RPUSH").arg(table).arg(value).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("set", "insert") => {
-                let member = field_of(change, "member")?;
-                redis::cmd("SADD").arg(table).arg(member).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("set", "delete") => {
-                let member = field_of(change, "member")?;
-                redis::cmd("SREM").arg(table).arg(member).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("zset", "insert" | "update") => {
-                let member = field_of(change, "member")?;
-                let score = change.values.iter().find(|item| item.column == "score").map(|item| json_text(&item.value)).unwrap_or_else(|| "0".into());
-                redis::cmd("ZADD").arg(table).arg(score).arg(member).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("zset", "delete") => {
-                let member = field_of(change, "member")?;
-                redis::cmd("ZREM").arg(table).arg(member).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            ("none", "insert") if change.values.iter().any(|item| item.column == "value") => {
-                let value = change.values.iter().find(|item| item.column == "value").map(|item| json_text(&item.value)).unwrap_or_default();
-                redis::cmd("SET").arg(table).arg(value).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            (_, "delete") => {
-                redis::cmd("DEL").arg(table).query::<()>(self.conn.as_mut()).map_err(|err| AppError::msg(err.to_string()))?;
-            }
-            _ => return Err(AppError::msg(format!("不能对 {kind} 执行 {}", change.kind))),
+            _ => return Err(AppError::msg(format!("不能对 {kind} 新增行"))),
+        };
+        if added == 0 {
+            return Err(AppError::msg("键或成员已存在，没有覆盖已有数据"));
         }
         Ok(())
     }
+}
+
+// All reads, comparisons and writes use one key, including Redis Cluster routing.
+const CAS_SCRIPT: &str = r#"
+local key, expected, op, id, old, new = KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
+if redis.call('TYPE', key).ok ~= expected then return 0 end
+if expected == 'string' then
+    if redis.call('GET', key) ~= old then return 0 end
+    if op == 'delete' then redis.call('DEL', key)
+    else
+        local ttl = redis.call('PTTL', key)
+        redis.call('SET', key, new)
+        if ttl >= 0 then redis.call('PEXPIRE', key, ttl) end
+    end
+elseif expected == 'hash' then
+    if redis.call('HGET', key, id) ~= old then return 0 end
+    if op == 'delete' then redis.call('HDEL', key, id) else redis.call('HSET', key, id, new) end
+elseif expected == 'list' then
+    if redis.call('LINDEX', key, id) ~= old then return 0 end
+    if op == 'delete' then
+        -- A unique marker removes exactly this index, even with duplicate values.
+        if redis.call('LPOS', key, ARGV[6]) then return 0 end
+        redis.call('LSET', key, id, ARGV[6])
+        redis.call('LREM', key, 1, ARGV[6])
+    else redis.call('LSET', key, id, new) end
+elseif expected == 'set' then
+    if redis.call('SISMEMBER', key, id) ~= 1 then return 0 end
+    if op ~= 'delete' then return 0 end
+    redis.call('SREM', key, id)
+elseif expected == 'zset' then
+    local score = redis.call('ZSCORE', key, id)
+    if not score then return 0 end
+    if score ~= old and (not tonumber(score) or tonumber(score) ~= tonumber(old)) then return 0 end
+    if op == 'delete' then redis.call('ZREM', key, id) else redis.call('ZADD', key, new, id) end
+else return 0 end
+return 1
+"#;
+
+fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<String>> {
+    let original = change
+        .original
+        .as_ref()
+        .ok_or_else(|| AppError::msg("缺少 Redis 原始数据，请重新加载"))?;
+    let mut fields = std::collections::BTreeMap::new();
+    for field in original {
+        if fields.insert(field.column.as_str(), &field.value).is_some() {
+            return Err(AppError::msg("原始数据包含重复字段"));
+        }
+    }
+    let (kind, identity, value) = if fields.contains_key("key") {
+        ("string", "key", Some("value"))
+    } else if fields.contains_key("field") {
+        ("hash", "field", Some("value"))
+    } else if fields.contains_key("index") {
+        ("list", "index", Some("value"))
+    } else if fields.contains_key("member") && fields.contains_key("score") {
+        ("zset", "member", Some("score"))
+    } else if fields.contains_key("member") {
+        ("set", "member", None)
+    } else {
+        return Err(AppError::msg("Redis 原始数据格式无效"));
+    };
+    if fields.len() != if value.is_some() { 2 } else { 1 }
+        || value.is_some_and(|name| !fields.contains_key(name))
+    {
+        return Err(AppError::msg("Redis 原始数据不完整"));
+    }
+    if !matches!(change.kind.as_str(), "update" | "delete") {
+        return Err(AppError::msg("不支持的 Redis 修改类型"));
+    }
+    let id = json_text(fields[identity]);
+    if change.pk.len() != 1
+        || change.pk[0].column != identity
+        || json_text(&change.pk[0].value) != id
+        || (kind == "string" && id != table)
+    {
+        return Err(AppError::msg("Redis 行标识与原始数据不一致"));
+    }
+    if kind == "list" && !id.parse::<i64>().is_ok_and(|index| index >= 0) {
+        return Err(AppError::msg("Redis 列表位置无效"));
+    }
+    let old = value
+        .map(|name| json_text(fields[name]))
+        .unwrap_or_default();
+    let mut new = old.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    for field in &change.values {
+        if !seen.insert(field.column.as_str()) {
+            return Err(AppError::msg("更改包含重复字段"));
+        }
+        if field.column == identity {
+            if json_text(&field.value) != id {
+                return Err(AppError::msg("Redis 网格不能更改行标识，请新增后删除原行"));
+            }
+        } else if Some(field.column.as_str()) == value {
+            new = json_text(&field.value);
+        } else {
+            return Err(AppError::msg("Redis 更改包含未知字段"));
+        }
+    }
+    if kind == "zset"
+        && change.kind == "update"
+        && !new.parse::<f64>().is_ok_and(|value| !value.is_nan())
+    {
+        return Err(AppError::msg("Redis 分数不是有效数值"));
+    }
+    if kind == "set" && change.kind != "delete" {
+        return Err(AppError::msg("集合成员请使用新增或删除"));
+    }
+    Ok(vec![
+        kind.into(),
+        change.kind.clone(),
+        id,
+        old,
+        new,
+        format!("dataharbor-delete-{}", uuid::Uuid::new_v4()),
+    ])
 }
 
 fn field_of(change: &RowChange, column: &str) -> AppResult<String> {
@@ -396,7 +690,6 @@ fn field_of(change: &RowChange, column: &str) -> AppResult<String> {
         .chain(change.values.iter())
         .find(|item| item.column == column)
         .map(|item| json_text(&item.value))
-        .filter(|item| !item.is_empty())
         .ok_or_else(|| AppError::msg(format!("缺少 {column}")))
 }
 
@@ -456,6 +749,7 @@ fn value_to_outcome(value: redis::Value, max_rows: usize) -> QueryOutcome {
     rows.truncate(max_rows);
     let rows_affected = if rows.is_empty() { 1 } else { 0 };
     QueryOutcome {
+        original_rows: None,
         columns: vec![col("path", "string"), col("value", "string")],
         rows,
         rows_affected,
@@ -467,16 +761,32 @@ fn flatten(path: &str, value: &redis::Value, rows: &mut Vec<Vec<JsonValue>>) {
     match value {
         redis::Value::Nil => rows.push(vec![JsonValue::String(path.into()), JsonValue::Null]),
         redis::Value::Int(value) => rows.push(vec![JsonValue::String(path.into()), json!(value)]),
-        redis::Value::Okay => rows.push(vec![JsonValue::String(path.into()), JsonValue::String("OK".into())]),
+        redis::Value::Okay => rows.push(vec![
+            JsonValue::String(path.into()),
+            JsonValue::String("OK".into()),
+        ]),
         redis::Value::SimpleString(text) | redis::Value::VerbatimString { text, .. } => {
-            rows.push(vec![JsonValue::String(path.into()), JsonValue::String(text.clone())])
+            rows.push(vec![
+                JsonValue::String(path.into()),
+                JsonValue::String(text.clone()),
+            ])
         }
-        redis::Value::BulkString(bytes) => rows.push(vec![JsonValue::String(path.into()), JsonValue::String(String::from_utf8_lossy(bytes).into_owned())]),
-        redis::Value::Double(value) => rows.push(vec![JsonValue::String(path.into()), json!(value)]),
-        redis::Value::Boolean(flag) => rows.push(vec![JsonValue::String(path.into()), JsonValue::Bool(*flag)]),
+        redis::Value::BulkString(bytes) => rows.push(vec![
+            JsonValue::String(path.into()),
+            JsonValue::String(String::from_utf8_lossy(bytes).into_owned()),
+        ]),
+        redis::Value::Double(value) => {
+            rows.push(vec![JsonValue::String(path.into()), json!(value)])
+        }
+        redis::Value::Boolean(flag) => {
+            rows.push(vec![JsonValue::String(path.into()), JsonValue::Bool(*flag)])
+        }
         redis::Value::Array(items) | redis::Value::Set(items) => {
             if items.is_empty() {
-                rows.push(vec![JsonValue::String(path.into()), JsonValue::Array(vec![])]);
+                rows.push(vec![
+                    JsonValue::String(path.into()),
+                    JsonValue::Array(vec![]),
+                ]);
             }
             for (index, item) in items.iter().enumerate() {
                 flatten(&format!("{path}[{index}]"), item, rows);
@@ -487,7 +797,10 @@ fn flatten(path: &str, value: &redis::Value, rows: &mut Vec<Vec<JsonValue>>) {
                 flatten(&format!("{path}.{key:?}"), item, rows);
             }
         }
-        other => rows.push(vec![JsonValue::String(path.into()), JsonValue::String(format!("{other:?}"))]),
+        other => rows.push(vec![
+            JsonValue::String(path.into()),
+            JsonValue::String(format!("{other:?}")),
+        ]),
     }
 }
 
@@ -558,7 +871,9 @@ impl MappedCluster {
             .map_err(|err| AppError::msg(format!("CLUSTER SLOTS 失败: {err}")))?;
         let ranges = parse_cluster_slots(&value);
         if ranges.is_empty() {
-            return Err(AppError::msg("CLUSTER SLOTS 没有返回槽位，地址映射无法建立"));
+            return Err(AppError::msg(
+                "CLUSTER SLOTS 没有返回槽位，地址映射无法建立",
+            ));
         }
         let mut slots = Vec::new();
         for (start, end, advertised) in ranges {
@@ -582,7 +897,8 @@ impl MappedCluster {
     }
 
     fn ensure_node(&mut self, advertised: &str) -> redis::RedisResult<usize> {
-        self.ensure_node_sync(advertised).map_err(|err| redis_err(err.to_string()))
+        self.ensure_node_sync(advertised)
+            .map_err(|err| redis_err(err.to_string()))
     }
 
     fn route_index(&self, cmd: &[u8]) -> usize {
@@ -598,14 +914,27 @@ impl MappedCluster {
     }
 
     fn note_moved(&mut self, slot: u16, index: usize) {
-        if let Some(range) = self.slots.iter_mut().find(|range| slot >= range.start && slot <= range.end) {
+        if let Some(range) = self
+            .slots
+            .iter_mut()
+            .find(|range| slot >= range.start && slot <= range.end)
+        {
             range.index = index;
         } else {
-            self.slots.push(SlotRange { start: slot, end: slot, index });
+            self.slots.push(SlotRange {
+                start: slot,
+                end: slot,
+                index,
+            });
         }
     }
 
-    fn send_to(&mut self, index: usize, cmd: &[u8], asking: bool) -> redis::RedisResult<redis::Value> {
+    fn send_to(
+        &mut self,
+        index: usize,
+        cmd: &[u8],
+        asking: bool,
+    ) -> redis::RedisResult<redis::Value> {
         let index = index.min(self.nodes.len().saturating_sub(1));
         if asking {
             let _ = redis::cmd("ASKING").query::<redis::Value>(&mut self.nodes[index].conn);
@@ -639,7 +968,12 @@ impl redis::ConnectionLike for MappedCluster {
         self.round(cmd)
     }
 
-    fn req_packed_commands(&mut self, cmd: &[u8], offset: usize, count: usize) -> redis::RedisResult<Vec<redis::Value>> {
+    fn req_packed_commands(
+        &mut self,
+        cmd: &[u8],
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisResult<Vec<redis::Value>> {
         let parts = split_resp_commands(cmd);
         let commands = if parts.is_empty() { vec![cmd] } else { parts };
         let mut values = Vec::with_capacity(commands.len());
@@ -659,9 +993,9 @@ impl redis::ConnectionLike for MappedCluster {
     }
 
     fn check_connection(&mut self) -> bool {
-        self.nodes.first_mut().is_some_and(|node| {
-            redis::cmd("PING").query::<String>(&mut node.conn).is_ok()
-        })
+        self.nodes
+            .first_mut()
+            .is_some_and(|node| redis::cmd("PING").query::<String>(&mut node.conn).is_ok())
     }
 
     fn is_open(&self) -> bool {
@@ -744,16 +1078,55 @@ pub fn first_key(buf: &[u8]) -> Option<Vec<u8>> {
     }
     let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
     const KEYLESS: &[&str] = &[
-        "PING", "INFO", "AUTH", "SELECT", "CLUSTER", "CONFIG", "DBSIZE", "FLUSHALL", "FLUSHDB", "SLOWLOG",
-        "CLIENT", "COMMAND", "ECHO", "TIME", "ROLE", "REPLICAOF", "SLAVEOF", "SHUTDOWN", "SCRIPT", "MEMORY",
-        "LATENCY", "MODULE", "ACL", "HELLO", "RESET", "WAIT", "DEBUG", "MONITOR", "SYNC", "PSYNC", "ASKING",
+        "PING",
+        "INFO",
+        "AUTH",
+        "SELECT",
+        "CLUSTER",
+        "CONFIG",
+        "DBSIZE",
+        "FLUSHALL",
+        "FLUSHDB",
+        "SLOWLOG",
+        "CLIENT",
+        "COMMAND",
+        "ECHO",
+        "TIME",
+        "ROLE",
+        "REPLICAOF",
+        "SLAVEOF",
+        "SHUTDOWN",
+        "SCRIPT",
+        "MEMORY",
+        "LATENCY",
+        "MODULE",
+        "ACL",
+        "HELLO",
+        "RESET",
+        "WAIT",
+        "DEBUG",
+        "MONITOR",
+        "SYNC",
+        "PSYNC",
+        "ASKING",
     ];
     if KEYLESS.contains(&name.as_str()) {
         return None;
     }
-    if matches!(name.as_str(), "EVAL" | "EVALSHA" | "EVAL_RO" | "FCALL" | "FCALL_RO") {
-        let count = args.get(2).and_then(|bytes| std::str::from_utf8(bytes).ok()).and_then(|text| text.parse::<usize>().ok()).unwrap_or(0);
-        return if count == 0 { None } else { args.get(3).cloned() };
+    if matches!(
+        name.as_str(),
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "FCALL" | "FCALL_RO"
+    ) {
+        let count = args
+            .get(2)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| text.parse::<usize>().ok())
+            .unwrap_or(0);
+        return if count == 0 {
+            None
+        } else {
+            args.get(3).cloned()
+        };
     }
     args.get(1).cloned()
 }
@@ -853,7 +1226,9 @@ pub fn parse_cluster_slots(value: &redis::Value) -> Vec<(u16, u16, String)> {
 
 fn value_u16(value: &redis::Value) -> Option<u16> {
     match value {
-        redis::Value::Int(number) if *number >= 0 && *number <= u16::MAX as i64 => Some(*number as u16),
+        redis::Value::Int(number) if *number >= 0 && *number <= u16::MAX as i64 => {
+            Some(*number as u16)
+        }
         redis::Value::BulkString(bytes) => String::from_utf8_lossy(bytes).parse().ok(),
         _ => None,
     }
@@ -883,7 +1258,9 @@ fn redirect_from(text: &str) -> Option<(RedirectKind, u16, String)> {
     };
     let mut parts = text[token..].split_whitespace();
     let slot = parts.next()?.trim_matches(',').parse().ok()?;
-    let addr = parts.next()?.trim_matches(|ch: char| matches!(ch, ',' | '\'' | '"' | ')'));
+    let addr = parts
+        .next()?
+        .trim_matches(|ch: char| matches!(ch, ',' | '\'' | '"' | ')'));
     if addr.is_empty() {
         None
     } else {
@@ -903,7 +1280,9 @@ fn node_hostport(url: &str) -> Option<String> {
 
 fn dial_url(url: &str) -> AppResult<redis::Connection> {
     let client = redis::Client::open(url).map_err(|err| AppError::msg(err.to_string()))?;
-    let conn = client.get_connection().map_err(|err| AppError::msg(err.to_string()))?;
+    let conn = client
+        .get_connection()
+        .map_err(|err| AppError::msg(err.to_string()))?;
     conn.set_read_timeout(Some(Duration::from_secs(15))).ok();
     conn.set_write_timeout(Some(Duration::from_secs(15))).ok();
     Ok(conn)
@@ -924,12 +1303,24 @@ pub fn publish(config: &SessionConfig, channel: &str, message: &str) -> AppResul
 }
 
 pub fn read_pubsub(config: &SessionConfig, channel: &str, wait_ms: u64) -> AppResult<Vec<String>> {
-    let client = redis::Client::open(redis_url(&config.host, config.port, &config.username, &config.password, 0))
+    let client = redis::Client::open(redis_url(
+        &config.host,
+        config.port,
+        &config.username,
+        &config.password,
+        0,
+    ))
+    .map_err(|err| AppError::msg(err.to_string()))?;
+    let mut conn = client
+        .get_connection()
         .map_err(|err| AppError::msg(err.to_string()))?;
-    let mut conn = client.get_connection().map_err(|err| AppError::msg(err.to_string()))?;
     let mut pubsub = conn.as_pubsub();
-    pubsub.subscribe(channel).map_err(|err| AppError::msg(err.to_string()))?;
-    pubsub.set_read_timeout(Some(Duration::from_millis(wait_ms.clamp(200, 10_000)))).ok();
+    pubsub
+        .subscribe(channel)
+        .map_err(|err| AppError::msg(err.to_string()))?;
+    pubsub
+        .set_read_timeout(Some(Duration::from_millis(wait_ms.clamp(200, 10_000))))
+        .ok();
     let mut messages = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.clamp(200, 10_000));
     while std::time::Instant::now() < deadline && messages.len() < 50 {
@@ -950,7 +1341,10 @@ mod tests {
 
     #[test]
     fn address_map_rewrites_advertised_nodes() {
-        let merged = merge_address_map("10.0.0.9:6379=127.0.0.1:4601", "10.0.0.8:6379=127.0.0.1:4600");
+        let merged = merge_address_map(
+            "10.0.0.9:6379=127.0.0.1:4601",
+            "10.0.0.8:6379=127.0.0.1:4600",
+        );
         let map = parse_address_map(&merged);
         assert_eq!(rewrite_address("10.0.0.8:6379", &map), "127.0.0.1:4600");
         assert_eq!(rewrite_address("10.0.0.9:6379", &map), "127.0.0.1:4601");
@@ -959,7 +1353,10 @@ mod tests {
             "10.0.0.8:6379=10.9.9.9:1",
             "10.0.0.8:6379=127.0.0.1:4600",
         ));
-        assert_eq!(rewrite_address("10.0.0.8:6379", &auto_wins), "127.0.0.1:4600");
+        assert_eq!(
+            rewrite_address("10.0.0.8:6379", &auto_wins),
+            "127.0.0.1:4600"
+        );
     }
 
     #[test]
@@ -969,7 +1366,11 @@ mod tests {
         assert_eq!(key_slot(b"{user}.foo"), key_slot(b"user"));
         let packed = redis::cmd("GET").arg("foo").get_packed_command();
         assert_eq!(first_key(&packed).as_deref(), Some(b"foo".as_slice()));
-        let eval = redis::cmd("EVAL").arg("return 1").arg(1).arg("foo").get_packed_command();
+        let eval = redis::cmd("EVAL")
+            .arg("return 1")
+            .arg(1)
+            .arg("foo")
+            .get_packed_command();
         assert_eq!(first_key(&eval).as_deref(), Some(b"foo".as_slice()));
         let ping = redis::cmd("PING").get_packed_command();
         assert!(first_key(&ping).is_none());
@@ -994,5 +1395,53 @@ mod tests {
         assert!(matches!(kind, RedirectKind::Moved));
         assert_eq!(slot, 3999);
         assert_eq!(rewrite_address(&addr, &map), "127.0.0.1:4600");
+    }
+
+    #[test]
+    fn mutation_plan_requires_original_identity_and_routes_one_key() {
+        use crate::models::FieldValue;
+        let field = |name: &str, value: &str| FieldValue {
+            column: name.into(),
+            value: json!(value),
+        };
+        let change = RowChange {
+            kind: "update".into(),
+            pk: vec![field("field", "")],
+            original: Some(vec![field("field", ""), field("value", "old")]),
+            values: vec![field("value", "new")],
+        };
+        let args = cas_args("{test}:hash", &change).unwrap();
+        assert_eq!(&args[..5], ["hash", "update", "", "old", "new"]);
+        let command = redis::cmd("EVAL")
+            .arg(CAS_SCRIPT)
+            .arg(1)
+            .arg("{test}:hash")
+            .arg(args)
+            .get_packed_command();
+        assert_eq!(first_key(&command).unwrap(), b"{test}:hash");
+        assert!(cas_args(
+            "hash",
+            &RowChange {
+                original: None,
+                ..change.clone()
+            }
+        )
+        .is_err());
+        assert!(cas_args(
+            "hash",
+            &RowChange {
+                pk: vec![field("field", "other")],
+                ..change.clone()
+            }
+        )
+        .is_err());
+        assert!(cas_args(
+            "hash",
+            &RowChange {
+                values: vec![field("field", "renamed")],
+                ..change
+            }
+        )
+        .is_err());
     }
 }

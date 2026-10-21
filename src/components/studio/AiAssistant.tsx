@@ -10,6 +10,8 @@ export function AiAssistant() {
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [hasKey, setHasKey] = useState(false);
+  const [savedEndpoint, setSavedEndpoint] = useState("");
+  const [savedModel, setSavedModel] = useState("");
   const [task, setTask] = useState("explain");
   const [sql, setSql] = useState("SELECT * FROM books");
   const [engine, setEngine] = useState("sqlite");
@@ -21,11 +23,15 @@ export function AiAssistant() {
   const [roomId, setRoomId] = useState("");
   const [compareModel, setCompareModel] = useState("");
   const { busy, run } = useOperation();
+  const serviceChanged = hasKey && !!savedEndpoint && serviceOrigin(endpoint) !== serviceOrigin(savedEndpoint);
+  const settingsChanged = endpoint.trim() !== savedEndpoint || model.trim() !== savedModel || !!apiKey;
 
   useEffect(() => {
     void api.aiSettings().then((settings) => {
       setEndpoint(settings.endpoint);
+      setSavedEndpoint(settings.endpoint);
       setModel(settings.model);
+      setSavedModel(settings.model);
       setHasKey(settings.hasKey);
     }).catch(() => undefined);
   }, []);
@@ -34,12 +40,18 @@ export function AiAssistant() {
     <div className="xb-panel space-y-3 overflow-auto p-3">
       <Alert type="info" showIcon message={hasKey ? "已保存密钥。请求发往你填写的兼容接口。" : "填写自己的 OpenAI 兼容接口和密钥。没有密钥时不会编造回复。"} />
       <Alert type="warning" showIcon message="发送会把 SQL、结构说明、提示词或用于补全的单元格内容发送至已保存的接口。请先确认这些内容允许提供给该服务。" />
-      <Input disabled={!!busy} value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="https://api.openai.com/v1/chat/completions" />
+      <span className="text-xs text-[var(--xb-muted)]">远程服务请使用 HTTPS；本机 localhost、127.0.0.1 或 ::1 可使用 HTTP。</span>
+      {serviceChanged && <Alert type="warning" showIcon message="服务地址已更换，请填写新服务的 API 密钥；旧密钥不会发送给新服务。" />}
+      {settingsChanged && <Alert type="info" showIcon message="接口设置尚未保存，保存后才能发送。" />}
+      <Input aria-label="AI 服务地址" disabled={!!busy} value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="https://api.openai.com/v1/chat/completions" />
       <Space wrap>
         <Input disabled={!!busy} value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
-        <Input.Password disabled={!!busy} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="API 密钥" />
+        <Input.Password aria-label="API 密钥" disabled={!!busy} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="API 密钥" />
         <Button disabled={!!busy} loading={busy === "save"} onClick={() => void run("save", async () => {
+          if (serviceChanged && !apiKey.trim()) throw new Error("更换服务地址后，请重新填写该服务的 API 密钥");
           const settings = await api.saveAiSettings({ endpoint, model, apiKey });
+          setEndpoint(settings.endpoint); setSavedEndpoint(settings.endpoint);
+          setModel(settings.model); setSavedModel(settings.model);
           setHasKey(settings.hasKey); setApiKey(""); message.success("已保存");
         })}>保存</Button>
       </Space>
@@ -59,7 +71,7 @@ export function AiAssistant() {
       <Input value={schemaText} onChange={(event) => setSchemaText(event.target.value)} placeholder="附上的结构说明" />
       <Input value={prompt} onChange={(event) => setPrompt(event.target.value)} />
       <Space wrap>
-        <Button type="primary" disabled={!!busy} loading={busy === "send"} onClick={() => void run("send", async () => {
+        <Button type="primary" disabled={!!busy || settingsChanged} loading={busy === "send"} onClick={() => void run("send", async () => {
           const text = await api.aiAsk({ task, sql, engine, schemaText, prompt, targetEngine: target, model });
           setAnswer(text);
           const current = roomId || crypto.randomUUID();
@@ -77,7 +89,7 @@ export function AiAssistant() {
           localStorage.setItem("xb-ai-rooms", JSON.stringify(next));
         }}>分叉当前房间</Button>
         <Input style={{ width: 180 }} value={compareModel} onChange={(event) => setCompareModel(event.target.value)} placeholder="对照模型" />
-        <Button disabled={!!busy} loading={busy === "compare"} onClick={() => void run("compare", async () => {
+        <Button disabled={!!busy || settingsChanged} loading={busy === "compare"} onClick={() => void run("compare", async () => {
           const first = await api.aiAsk({ task, sql, engine, schemaText, prompt, targetEngine: target, model });
           const second = compareModel.trim() ? await api.aiAsk({ task, sql, engine, schemaText, prompt, targetEngine: target, model: compareModel.trim() }) : "";
           setAnswer(second ? `【${model || "已保存模型"}】\n${first}\n\n【${compareModel}】\n${second}` : first);
@@ -98,6 +110,10 @@ export function AiAssistant() {
       <Input.TextArea rows={10} value={answer} readOnly />
     </div>
   );
+}
+
+function serviceOrigin(endpoint: string): string {
+  try { return new URL(endpoint.trim()).origin; } catch { return endpoint.trim(); }
 }
 
 function readRooms(): { id: string; title: string; messages: string[] }[] {

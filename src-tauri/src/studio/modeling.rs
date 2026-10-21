@@ -1,6 +1,6 @@
 use super::catalog::er_diagram;
 use super::query_tools::preview_design;
-use super::storage::{escape_xml, read_vec, write_vec};
+use super::storage::{escape_xml, read_vec, update_vec};
 use super::types::{
     Dashboard, DataModel, DesignColumn, DesignRequest, ModelAttr, ModelEntity, ModelRel, ObjectRef,
 };
@@ -10,7 +10,7 @@ use crate::state::AppState;
 use uuid::Uuid;
 
 pub fn list_dashboards(state: &AppState) -> AppResult<Vec<Dashboard>> {
-    Ok(read_vec(state, "dashboards.json"))
+    read_vec(state, "dashboards.json")
 }
 
 pub fn save_dashboard(state: &AppState, mut board: Dashboard) -> AppResult<Dashboard> {
@@ -20,24 +20,25 @@ pub fn save_dashboard(state: &AppState, mut board: Dashboard) -> AppResult<Dashb
     if board.name.trim().is_empty() {
         board.name = "未命名看板".into();
     }
-    let mut items: Vec<Dashboard> = read_vec(state, "dashboards.json");
-    if let Some(slot) = items.iter_mut().find(|item| item.id == board.id) {
-        *slot = board.clone();
-    } else {
-        items.push(board.clone());
-    }
-    write_vec(state, "dashboards.json", &items)?;
-    Ok(board)
+    update_vec(state, "dashboards.json", |items: &mut Vec<Dashboard>| {
+        if let Some(slot) = items.iter_mut().find(|item| item.id == board.id) {
+            *slot = board.clone();
+        } else {
+            items.push(board.clone());
+        }
+        Ok(board)
+    })
 }
 
 pub fn delete_dashboard(state: &AppState, id: &str) -> AppResult<()> {
-    let mut items: Vec<Dashboard> = read_vec(state, "dashboards.json");
-    items.retain(|item| item.id != id);
-    write_vec(state, "dashboards.json", &items)
+    update_vec(state, "dashboards.json", |items: &mut Vec<Dashboard>| {
+        items.retain(|item| item.id != id);
+        Ok(())
+    })
 }
 
 pub fn list_models(state: &AppState) -> AppResult<Vec<DataModel>> {
-    Ok(read_vec(state, "models.json"))
+    read_vec(state, "models.json")
 }
 
 pub fn save_model(state: &AppState, mut model: DataModel) -> AppResult<DataModel> {
@@ -47,20 +48,21 @@ pub fn save_model(state: &AppState, mut model: DataModel) -> AppResult<DataModel
     if model.name.trim().is_empty() {
         return Err(AppError::msg("模型需要名称"));
     }
-    let mut items: Vec<DataModel> = read_vec(state, "models.json");
-    if let Some(slot) = items.iter_mut().find(|item| item.id == model.id) {
-        *slot = model.clone();
-    } else {
-        items.push(model.clone());
-    }
-    write_vec(state, "models.json", &items)?;
-    Ok(model)
+    update_vec(state, "models.json", |items: &mut Vec<DataModel>| {
+        if let Some(slot) = items.iter_mut().find(|item| item.id == model.id) {
+            *slot = model.clone();
+        } else {
+            items.push(model.clone());
+        }
+        Ok(model)
+    })
 }
 
 pub fn delete_model(state: &AppState, id: &str) -> AppResult<()> {
-    let mut items: Vec<DataModel> = read_vec(state, "models.json");
-    items.retain(|item| item.id != id);
-    write_vec(state, "models.json", &items)
+    update_vec(state, "models.json", |items: &mut Vec<DataModel>| {
+        items.retain(|item| item.id != id);
+        Ok(())
+    })
 }
 
 pub fn reverse_model(state: &AppState, request: &ObjectRef, name: &str) -> AppResult<DataModel> {

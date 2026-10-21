@@ -1,4 +1,4 @@
-import { App, Tabs } from "antd";
+import { App, Alert, Tabs } from "antd";
 import { errorText } from "../api";
 import { openSampleBookstore } from "../actions";
 import { useTabStore } from "../stores/useTabStore";
@@ -14,6 +14,7 @@ export function Workspace() {
   const tabs = useTabStore((state) => state.tabs);
   const activeId = useTabStore((state) => state.activeId);
   const dirty = useTabStore((state) => state.dirty);
+  const draftSaveError = useTabStore((state) => state.draftSaveError);
   const close = useTabStore((state) => state.close);
   const setActive = useTabStore((state) => state.setActive);
 
@@ -29,6 +30,7 @@ export function Workspace() {
   if (tabs.length === 0) {
     return (
       <section className="xb-workspace">
+        {draftSaveError && <Alert type="warning" showIcon message={draftSaveError} />}
         <Welcome onSample={() => void openSample()} />
       </section>
     );
@@ -36,6 +38,7 @@ export function Workspace() {
 
   return (
     <section className="xb-workspace">
+      {draftSaveError && <Alert type="warning" showIcon message={draftSaveError} />}
       <Tabs
         className="xb-tabs"
         type="editable-card"
@@ -46,9 +49,10 @@ export function Workspace() {
         onEdit={(target, action) => {
           if (action !== "remove" || typeof target !== "string") return;
           if (dirty[target]) {
+            const query = tabs.find((tab) => tab.id === target)?.kind === "query";
             modal.confirm({
-              title: "关闭未提交的标签？",
-              content: "未提交的修改会丢失。",
+              title: query ? "关闭查询草稿？" : "关闭未提交的标签？",
+              content: query ? "关闭后将移除这份 SQL 草稿及其自动恢复记录。" : "未提交的修改会丢失。",
               okText: "关闭",
               cancelText: "留下",
               onOk: () => close(target),

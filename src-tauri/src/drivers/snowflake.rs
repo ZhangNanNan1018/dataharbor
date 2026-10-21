@@ -169,6 +169,7 @@ impl DbSession for SnowflakeSession {
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
         Ok(QueryOutcome {
+            original_rows: None,
             columns: names.iter().cloned().map(ColumnMeta::named).collect(),
             rows,
             rows_affected: affected,

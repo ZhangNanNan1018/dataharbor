@@ -6,7 +6,7 @@ import { api, errorText, pickSaveCsv, type PlanNode } from "../api";
 import { engineLabel } from "../engines";
 import { displayCell, isNumericType } from "../format";
 import { applyEditorTheme, editorFont } from "../monacoTheme";
-import { refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../sqlIntelligence";
+import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../sqlIntelligence";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
@@ -15,6 +15,16 @@ import type { ExecuteSqlResponse, JsonValue, QueryTab, StatementResult } from ".
 interface ResultRow {
   key: string;
   cells: JsonValue[];
+}
+
+interface QueryContext {
+  connectionId: string;
+  database: string;
+  sql: string;
+}
+
+interface QueryResult extends ExecuteSqlResponse {
+  context: QueryContext;
 }
 
 export function QueryPanel({ tab }: { tab: QueryTab }) {
@@ -30,17 +40,75 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   const [running, setRunning] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [pageSize, setPageSize] = useState(100);
-  const [result, setResult] = useState<ExecuteSqlResponse | null>(null);
+  const [storedResult, setResult] = useState<QueryResult | null>(null);
   const [active, setActive] = useState(0);
-  const [ranSql, setRanSql] = useState("");
   const [plan, setPlan] = useState<PlanNode | null>(null);
   const [resultView, setResultView] = useState<"grid" | "messages" | "plan">("grid");
   const [history, setHistory] = useState<string[]>(() => readHistory());
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const [editorReady, setEditorReady] = useState(0);
+  const requestId = useRef(0);
+  const toolRequestId = useRef(0);
+  const runningRef = useRef<number | null>(null);
+  const exportRef = useRef(false);
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
   const pinResult = useUiStore((state) => state.pinResult);
 
+  const result = storedResult?.context.connectionId === tab.connectionId && storedResult.context.database === tab.database ? storedResult : null;
   const statement = result?.statements[active] ?? null;
   const profile = profiles.find((item) => item.id === tab.connectionId);
+
+  function invalidateResults() {
+    requestId.current += 1;
+    runningRef.current = null;
+    setRunning(false);
+    setResult(null);
+    setPlan(null);
+  }
+
+  useEffect(() => {
+    invalidateResults();
+    return () => { requestId.current += 1; };
+  }, [tab.connectionId, tab.database]);
+
+  function isCurrent(token: number, context: QueryContext) {
+    return requestId.current === token && tabRef.current.connectionId === context.connectionId && tabRef.current.database === context.database;
+  }
+
+  async function transformDraft(transform: (sql: string) => Promise<string>) {
+    const snapshot = { ...tabRef.current };
+    const token = requestId.current;
+    const toolToken = ++toolRequestId.current;
+    const current = () => token === requestId.current && toolToken === toolRequestId.current
+      && tabRef.current.connectionId === snapshot.connectionId && tabRef.current.database === snapshot.database
+      && tabRef.current.sql === snapshot.sql;
+    try {
+      const sql = await transform(snapshot.sql);
+      if (current()) patchQuery(snapshot.id, { sql });
+    } catch (error) {
+      if (current()) message.error(errorText(error));
+    }
+  }
+
+  async function explain() {
+    if (!tab.connectionId) return;
+    const context = { connectionId: tab.connectionId, database: tab.database, sql: tab.sql };
+    const token = requestId.current;
+    const toolToken = ++toolRequestId.current;
+    const current = () => isCurrent(token, context) && toolToken === toolRequestId.current && tabRef.current.sql === context.sql;
+    try {
+      await ensure(context.connectionId);
+      if (!current()) return;
+      const node = await api.explainPlan(context.connectionId, context.database, context.sql);
+      if (!current()) return;
+      setPlan(node);
+      setResultView("plan");
+      setStatus("已读取执行计划");
+    } catch (error) {
+      if (current()) message.error(errorText(error));
+    }
+  }
 
   useEffect(() => {
     const id = tab.connectionId;
@@ -79,19 +147,17 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       markConnected(id, true);
       if (current.engine !== "sqlite") {
         const list = await api.listDatabases(id).catch(() => [] as string[]);
-        if (list.length) setDatabases(list);
+        if (list.length && tabRef.current.connectionId === id) setDatabases(list);
       }
       setStatus(`已连接 ${current.name} · ${connected.version}`);
     }
   }
 
-  async function execute(sql: string, page: number, size: number, onlyStatement: number | null) {
-    if (!tab.connectionId) throw new Error("先选择连接");
-    await ensure(tab.connectionId);
+  async function execute(context: QueryContext, token: number, page: number, size: number, onlyStatement: number | null) {
+    await ensure(context.connectionId);
+    if (!isCurrent(token, context)) return null;
     return api.executeSql({
-      connectionId: tab.connectionId,
-      database: tab.database,
-      sql,
+      ...context,
       page,
       pageSize: size,
       onlyStatement,
@@ -99,6 +165,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   }
 
   async function run(mode: "all" | "selection") {
+    if (runningRef.current !== null) return;
     if (!tab.connectionId) {
       message.warning("先选择一个连接");
       return;
@@ -115,21 +182,24 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       return;
     }
     const sql = selected || tab.sql;
+    const context = { connectionId: tab.connectionId, database: tab.database, sql };
+    const token = ++requestId.current;
+    runningRef.current = token;
     setRunning(true);
     try {
-      const response = await execute(sql, 1, pageSize, null);
-      setRanSql(sql);
-      setResult(response);
+      const response = await execute(context, token, 1, pageSize, null);
+      if (!response || !isCurrent(token, context)) return;
+      setResult({ ...response, context });
       setHistory(pushHistory(sql));
-      setActive(0);
+      setActive(Math.max(0, response.statements.findIndex((item) => item.ok && item.columns.length > 0)));
       setResultView(response.statements.some((item) => item.columns.length > 0) ? "grid" : "messages");
       const first = response.statements[0];
       setStatus(first?.ok ? first.message : first?.error || "执行结束");
       if (response.stopped) message.error(first?.error || "语句执行失败，后续语句已停止");
     } catch (err) {
-      message.error(errorText(err));
+      if (isCurrent(token, context)) message.error(errorText(err));
     } finally {
-      setRunning(false);
+      if (runningRef.current === token) { runningRef.current = null; setRunning(false); }
     }
   }
 
@@ -137,19 +207,23 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function changePage(page: number, size: number) {
     const current = result?.statements[active];
-    if (!current || !ranSql) return;
+    if (!current || !result || runningRef.current !== null) return;
     if (!current.pageable) {
       message.info("这条语句不能分页");
       return;
     }
+    const context = result.context;
+    const token = ++requestId.current;
+    runningRef.current = token;
     setRunning(true);
     try {
-      const response = await execute(ranSql, page, size, current.index);
+      const response = await execute(context, token, page, size, current.index);
+      if (!response || !isCurrent(token, context)) return;
       const updated = response.statements[0];
       if (!updated) return;
       setPageSize(size);
       setResult((prev) => {
-        if (!prev) return response;
+        if (!prev) return { ...response, context };
         return {
           ...prev,
           statements: prev.statements.map((item) => (item.index === updated.index ? updated : item)),
@@ -157,25 +231,33 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       });
       setStatus(updated.ok ? updated.message : updated.error || "分页失败");
     } catch (err) {
-      message.error(errorText(err));
+      if (isCurrent(token, context)) message.error(errorText(err));
     } finally {
-      setRunning(false);
+      if (runningRef.current === token) { runningRef.current = null; setRunning(false); }
     }
   }
 
   async function exportCsv() {
     const current = result?.statements[active];
-    if (!tab.connectionId || !current?.ok || current.columns.length === 0) {
+    if (exportRef.current) return;
+    if (!result || !current?.ok || current.columns.length === 0) {
       message.warning("没有可导出的结果");
       return;
     }
-    const path = await pickSaveCsv("query.csv");
-    if (!path) return;
+    const context = result.context;
+    const token = requestId.current;
+    exportRef.current = true;
     setExporting(true);
     try {
+      const path = await pickSaveCsv("query.csv");
+      if (!path) return;
+      if (!isCurrent(token, context)) {
+        message.warning("查询上下文已改变，请重新运行后导出");
+        return;
+      }
       const exported = await api.exportSqlCsv({
-        connectionId: tab.connectionId,
-        database: tab.database,
+        connectionId: context.connectionId,
+        database: context.database,
         sql: current.sql,
         path,
       });
@@ -186,6 +268,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     } catch (err) {
       message.error(errorText(err));
     } finally {
+      exportRef.current = false;
       setExporting(false);
     }
   }
@@ -193,43 +276,47 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   useEffect(() => {
     const id = tab.connectionId;
     const monaco = monacoRef.current;
-    if (!id || !monaco) return;
+    const model = editorRef.current?.getModel();
+    if (!monaco || !model) return;
+    clearSqlSchema(monaco, model);
+    if (!id) return;
     let cancelled = false;
     void (async () => {
       try {
         await ensure(id);
         const names = await api.listTables(id, tab.database, profile?.engine === "postgres" ? "public" : "");
-        const next = [];
+        const next = names.map((name) => ({ name, columns: [] as { name: string; dataType: string; primaryKey: boolean }[], columnsLoaded: false }));
         for (const name of names.slice(0, 40)) {
+          if (cancelled) return;
           const columns = await api.listColumns(id, tab.database, profile?.engine === "postgres" ? "public" : "", name);
-          next.push({
-            name,
-            columns: columns.map((column) => ({
+          const item = next.find((item) => item.name === name)!;
+          item.columns = columns.map((column) => ({
               name: column.name,
               dataType: column.dataType,
               primaryKey: column.primaryKey,
-            })),
-          });
+            }));
+          item.columnsLoaded = true;
         }
         if (!cancelled) {
-          setSqlSchema(monaco, next);
-          const model = editorRef.current?.getModel();
-          if (model) refreshSqlMarkers(monaco, model);
+          setSqlSchema(monaco, model, next);
+          refreshSqlMarkers(monaco, model);
         }
       } catch {
-        if (!cancelled) setSqlSchema(monaco, []);
+        if (!cancelled) clearSqlSchema(monaco, model);
       }
     })();
     return () => {
       cancelled = true;
+      clearSqlSchema(monaco, model);
     };
-  }, [tab.connectionId, tab.database, profile?.engine]);
+  }, [tab.connectionId, tab.database, profile?.engine, editorReady]);
 
   const onMount: OnMount = (instance, monaco) => {
     editorRef.current = instance;
     monacoRef.current = monaco;
     applyEditorTheme(monaco, useUiStore.getState().theme);
     registerSqlIntelligence(monaco);
+    setEditorReady((value) => value + 1);
     refreshSqlMarkers(monaco, instance.getModel()!);
     instance.onDidChangeModelContent(() => {
       const model = instance.getModel();
@@ -264,6 +351,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     <div className="xb-panel">
       <div className="xb-runbar">
         <Select
+          aria-label="查询连接"
           style={{ minWidth: 180 }}
           placeholder="选择连接"
           value={tab.connectionId ?? undefined}
@@ -272,16 +360,17 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
             label: `${item.name} · ${engineLabel(item.engine)}`,
           }))}
           onChange={(id: string) => {
+            invalidateResults();
             const next = profiles.find((item) => item.id === id);
             patchQuery(tab.id, {
               connectionId: id,
               database: next?.engine === "sqlite" ? "main" : next?.database || "",
               title: next ? `查询 · ${next.name}` : tab.title,
             });
-            setResult(null);
           }}
         />
         <Select
+          aria-label="查询数据库"
           style={{ minWidth: 140 }}
           placeholder="数据库"
           value={tab.database || undefined}
@@ -290,7 +379,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
             value: name,
             label: name,
           }))}
-          onChange={(database: string) => patchQuery(tab.id, { database })}
+          onChange={(database: string) => { invalidateResults(); patchQuery(tab.id, { database }); }}
         />
         <Button type="primary" loading={running} onClick={() => void run("all")}>
           运行
@@ -303,30 +392,20 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         </Button>
         <Button
           onClick={() => {
-            void api.formatSql(tab.sql, false).then((sql) => patchQuery(tab.id, { sql }));
+            void transformDraft((sql) => api.formatSql(sql, false));
           }}
         >
           美化
         </Button>
         <Button
           onClick={() => {
-            void api.formatSql(tab.sql, true).then((sql) => patchQuery(tab.id, { sql }));
+            void transformDraft((sql) => api.formatSql(sql, true));
           }}
         >
           压缩
         </Button>
         <Button
-          onClick={() => {
-            if (!tab.connectionId) return;
-            void api
-              .explainPlan(tab.connectionId, tab.database, tab.sql)
-              .then((node) => {
-                setPlan(node);
-                setResultView("plan");
-                setStatus("已读取执行计划");
-              })
-              .catch((err) => message.error(errorText(err)));
-          }}
+          onClick={() => void explain()}
         >
           图形解释
         </Button>
@@ -346,18 +425,16 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
               .map((part) => part.split("="))
               .filter((pair) => pair[0])
               .map(([name, ...rest]) => ({ name: name.trim(), value: rest.join("=").trim() }));
-            void api
-              .bindSql(tab.sql, profile.engine, params)
-              .then((sql) => patchQuery(tab.id, { sql }))
-              .catch((err) => message.error(errorText(err)));
+            void transformDraft((sql) => api.bindSql(sql, profile.engine, params));
           }}
         >
           参数
         </Button>
-        <span className="text-xs text-[var(--xb-muted)]">Ctrl+Enter 运行全部。Redis 直接写命令，MongoDB 写 find / aggregate / JSON。</span>
+        <span className="text-xs text-[var(--xb-muted)]">Ctrl+Enter 运行全部。草稿和历史以 SQL 原文保存在本机。</span>
       </div>
       <div className="xb-editor">
         <Editor
+          path={`inmemory://queries/${encodeURIComponent(tab.id)}.sql`}
           language="sql"
           theme={theme === "dark" ? "xb-dark" : "xb-light"}
           value={tab.sql}
@@ -379,6 +456,19 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         <button type="button" className={resultView === "messages" ? "active" : ""} onClick={() => setResultView("messages")}>消息</button>
         <button type="button" className={resultView === "plan" ? "active" : ""} onClick={() => setResultView("plan")}>计划</button>
       </div>
+      {result && result.statements.length > 1 && (
+        <Select
+          aria-label="选择语句结果"
+          size="small"
+          value={active}
+          style={{ width: 200 }}
+          options={result.statements.map((item, index) => ({
+            value: index,
+            label: `语句 ${item.index + 1}${item.ok ? "" : " · 失败"}`,
+          }))}
+          onChange={(index: number) => { setActive(index); setResultView("grid"); }}
+        />
+      )}
       {resultView === "messages" && (
         <div className="xb-messages">
           {!result && <div>还没有运行。Ctrl/Cmd+Enter 运行全部。</div>}
@@ -396,18 +486,6 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         <>
           <div className="xb-result-meta">
             <Space size={8} wrap>
-              {result && result.statements.length > 1 && (
-                <Select
-                  size="small"
-                  value={active}
-                  style={{ minWidth: 160 }}
-                  options={result.statements.map((item, index) => ({
-                    value: index,
-                    label: `语句 ${item.index + 1}${item.ok ? "" : " · 失败"}`,
-                  }))}
-                  onChange={(index: number) => setActive(index)}
-                />
-              )}
               <span className="text-xs text-[var(--xb-muted)]">
                 {statement.message} · {statement.elapsedMs} ms
               </span>
@@ -462,7 +540,7 @@ function readHistory(): string[] {
 
 function pushHistory(sql: string): string[] {
   const next = [sql, ...readHistory().filter((item) => item !== sql)].slice(0, 100);
-  localStorage.setItem("xb-sql-history", JSON.stringify(next));
+  try { localStorage.setItem("xb-sql-history", JSON.stringify(next)); } catch { /* Query execution must not fail when local storage is full. */ }
   return next;
 }
 

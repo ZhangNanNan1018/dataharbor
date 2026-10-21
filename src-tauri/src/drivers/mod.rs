@@ -14,6 +14,9 @@ pub mod runtime;
 pub mod snowflake;
 pub mod sqlite;
 
+#[cfg(test)]
+mod document_tests;
+
 pub trait DbSession: Send {
     fn engine(&self) -> Engine;
     fn version(&mut self) -> AppResult<String>;
@@ -40,11 +43,21 @@ pub trait DbSession: Send {
         max_rows: Option<usize>,
     ) -> AppResult<QueryOutcome>;
 
+    fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
+        self.execute(database, sql, None).map(|outcome| outcome.rows_affected)
+    }
+
     /// Commit already validated DML on one database session. Drivers without a
     /// persistent session must override this rather than emulate BEGIN calls.
     fn execute_transaction(&mut self, database: &str, statements: &[String]) -> AppResult<()> {
+        let checked = statements.iter().cloned().map(|sql| (sql, None)).collect::<Vec<_>>();
+        self.execute_checked_transaction(database, &checked).map(|_| ())
+    }
+
+    /// Check affected rows before COMMIT so a stale edit rolls back the batch.
+    fn execute_checked_transaction(&mut self, database: &str, statements: &[(String, Option<u64>)]) -> AppResult<usize> {
         if statements.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         if self.is_document_store() || matches!(self.engine(), Engine::Oracle | Engine::Snowflake) {
             return Err(AppError::msg("当前驱动不能保证同一会话事务，已拒绝网格和 CSV 批量修改；请使用该数据库的原生客户端"));
@@ -55,8 +68,13 @@ pub trait DbSession: Send {
             "BEGIN"
         };
         self.execute(database, begin, None)?;
-        for (index, sql) in statements.iter().enumerate() {
-            if let Err(err) = self.execute(database, sql, None) {
+        for (index, (sql, expected)) in statements.iter().enumerate() {
+            let result = self.execute_affected(database, sql).and_then(|affected| {
+                if expected.is_some_and(|count| count != affected) {
+                    Err(AppError::msg(format!("数据已被修改或删除，预期影响 {} 行，实际 {} 行；请重新加载后检查更改", expected.unwrap_or(0), affected)))
+                } else { Ok(()) }
+            });
+            if let Err(err) = result {
                 let rollback = self.execute(database, "ROLLBACK", None);
                 return Err(AppError::msg(match rollback {
                     Ok(_) => format!("第 {} 条语句失败，已回滚：{err}", index + 1),
@@ -68,7 +86,7 @@ pub trait DbSession: Send {
             let _ = self.execute(database, "ROLLBACK", None);
             return Err(err);
         }
-        Ok(())
+        Ok(statements.len())
     }
 
     fn is_document_store(&self) -> bool {
@@ -90,6 +108,11 @@ pub trait DbSession: Send {
 
     fn count_relation(&mut self, _database: &str, _schema: &str, _table: &str) -> AppResult<u64> {
         Err(AppError::msg("这个引擎使用 SQL 计数"))
+    }
+
+    fn count_filtered_relation(&mut self, database: &str, schema: &str, table: &str, filters: &[FilterSpec]) -> AppResult<u64> {
+        if !filters.is_empty() { return Err(AppError::msg("当前引擎不支持网格条件筛选")); }
+        self.count_relation(database, schema, table)
     }
 
     fn apply_mutation(

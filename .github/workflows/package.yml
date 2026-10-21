@@ -31,10 +31,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdbus-1-dev pkg-config
       - run: npm ci
+      - run: npm test
       - name: Fetch locked Rust sources for license notices
         working-directory: src-tauri
         run: cargo fetch --locked
       - run: npm run licenses
+      - name: Rust regression tests before packaging
+        working-directory: src-tauri
+        run: cargo test --lib --locked
       - run: npm run tauri build
       - uses: actions/upload-artifact@v4
         with:

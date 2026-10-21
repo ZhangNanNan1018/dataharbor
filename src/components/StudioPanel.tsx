@@ -1,18 +1,32 @@
 import { Alert } from "antd";
+import { lazy, Suspense } from "react";
 import type { PlaceholderTab } from "../types";
-import { QueryBuilder, Designer } from "./studio/QueryDesign";
-import { ErView, ModelStudio } from "./studio/Modeling";
-import { StructureSync, DataSync } from "./studio/Synchronization";
-import { ImportExport, Backup } from "./studio/FileOperations";
-import { GenerateMask, Users, CatalogSearch } from "./studio/CatalogTools";
-import { BiBoard } from "./studio/Analytics";
-import { Jobs } from "./studio/Automation";
-import { AiAssistant } from "./studio/AiAssistant";
-import { Collab } from "./studio/ProjectWorkspace";
-import { RedisPubSub, MongoBuilder, DebugPanel } from "./studio/EngineTools";
+
+const QueryBuilder = lazy(() => import("./studio/QueryDesign").then((module) => ({ default: module.QueryBuilder })));
+const Designer = lazy(() => import("./studio/QueryDesign").then((module) => ({ default: module.Designer })));
+const ErView = lazy(() => import("./studio/Modeling").then((module) => ({ default: module.ErView })));
+const ModelStudio = lazy(() => import("./studio/Modeling").then((module) => ({ default: module.ModelStudio })));
+const StructureSync = lazy(() => import("./studio/Synchronization").then((module) => ({ default: module.StructureSync })));
+const DataSync = lazy(() => import("./studio/Synchronization").then((module) => ({ default: module.DataSync })));
+const ImportExport = lazy(() => import("./studio/FileOperations").then((module) => ({ default: module.ImportExport })));
+const Backup = lazy(() => import("./studio/FileOperations").then((module) => ({ default: module.Backup })));
+const GenerateMask = lazy(() => import("./studio/CatalogTools").then((module) => ({ default: module.GenerateMask })));
+const Users = lazy(() => import("./studio/CatalogTools").then((module) => ({ default: module.Users })));
+const CatalogSearch = lazy(() => import("./studio/CatalogTools").then((module) => ({ default: module.CatalogSearch })));
+const BiBoard = lazy(() => import("./studio/Analytics").then((module) => ({ default: module.BiBoard })));
+const Jobs = lazy(() => import("./studio/Automation").then((module) => ({ default: module.Jobs })));
+const AiAssistant = lazy(() => import("./studio/AiAssistant").then((module) => ({ default: module.AiAssistant })));
+const Collab = lazy(() => import("./studio/ProjectWorkspace").then((module) => ({ default: module.Collab })));
+const RedisPubSub = lazy(() => import("./studio/EngineTools").then((module) => ({ default: module.RedisPubSub })));
+const MongoBuilder = lazy(() => import("./studio/EngineTools").then((module) => ({ default: module.MongoBuilder })));
+const DebugPanel = lazy(() => import("./studio/EngineTools").then((module) => ({ default: module.DebugPanel })));
 
 export function StudioPanel({ tab }: { tab: PlaceholderTab }) {
-  switch (tab.feature) {
+  return <Suspense fallback={<div className="xb-panel" role="status">正在打开工具…</div>}>{renderTool(tab.feature)}</Suspense>;
+}
+
+function renderTool(feature: string) {
+  switch (feature) {
     case "builder":
       return <QueryBuilder />;
     case "designer":

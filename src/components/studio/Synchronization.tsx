@@ -58,7 +58,7 @@ export function StructureSync() {
       <div>目标</div>
       <ConnFields {...target} disabled={!!busy} onChange={(patch) => changeObject("target", patch)} />
       <Space>
-        <span>允许生成删除语句</span>
+        <span>允许危险结构变更（删除 / 改类型 / 替换视图），启用后仍需勾选并确认</span>
         <Switch checked={destructive} disabled={!!busy} onChange={(value) => { setDestructive(value); setStatements([]); setNotes([]); }} />
         <Button disabled={!!busy || !ready} loading={busy === "compare"} onClick={() => void run(false)}>对比</Button>
         <Button type="primary" disabled={!!busy || !ready || !statements.some((item) => item.picked)} loading={busy === "apply"} onClick={() => void run(true)}>执行勾选语句</Button>

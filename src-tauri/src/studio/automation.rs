@@ -1,6 +1,6 @@
 use super::backup::backup_sql;
 use super::file_io::export_file;
-use super::storage::{now_secs, write_json, write_vec};
+use super::storage::{now_secs, store_lock, write_json_unlocked};
 use super::types::{
     default_mail_port, BackupRequest, FileExportRequest, Job, MailSave, MailSettings,
 };
@@ -11,11 +11,7 @@ use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, TryLockError};
 use uuid::Uuid;
-
-static JOBS_STORE_LOCK: Mutex<()> = Mutex::new(());
-static JOBS_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn read_jobs(state: &AppState) -> AppResult<Vec<Job>> {
     let path = state.config_dir().join("jobs.json");
@@ -28,9 +24,7 @@ fn read_jobs(state: &AppState) -> AppResult<Vec<Job>> {
 }
 
 pub fn list_jobs(state: &AppState) -> AppResult<Vec<Job>> {
-    let _guard = JOBS_STORE_LOCK
-        .lock()
-        .map_err(|_| AppError::msg("任务存储锁异常"))?;
+    let _guard = store_lock(state, "jobs.json")?;
     read_jobs(state)
 }
 
@@ -38,12 +32,10 @@ pub(super) fn update_jobs<T>(
     state: &AppState,
     update: impl FnOnce(&mut Vec<Job>) -> AppResult<T>,
 ) -> AppResult<T> {
-    let _guard = JOBS_STORE_LOCK
-        .lock()
-        .map_err(|_| AppError::msg("任务存储锁异常"))?;
+    let _guard = store_lock(state, "jobs.json")?;
     let mut jobs = read_jobs(state)?;
     let result = update(&mut jobs)?;
-    write_vec(state, "jobs.json", &jobs)?;
+    write_json_unlocked(state, "jobs.json", &jobs)?;
     Ok(result)
 }
 
@@ -79,18 +71,50 @@ pub fn delete_job(state: &AppState, id: &str) -> AppResult<()> {
 }
 
 pub fn run_due_jobs(state: &AppState) -> AppResult<Vec<String>> {
-    run_due_jobs_with(state, |job| execute_job(state, job))
+    let results = run_due_jobs_with(state, |job| execute_job(state, job))?;
+    summarize_runs(results)
+}
+
+fn summarize_runs(results: Vec<JobRun>) -> AppResult<Vec<String>> {
+    let failed = results.iter().filter(|item| !item.ok).count();
+    let messages: Vec<String> = results
+        .into_iter()
+        .map(|item| format!("{}: {}", item.name, item.message))
+        .collect();
+    if failed > 0 {
+        return Err(AppError::msg(format!(
+            "{failed} 个计划任务失败：\n{}",
+            messages.join("\n")
+        )));
+    }
+    Ok(messages)
+}
+
+#[derive(Debug)]
+struct JobRun {
+    name: String,
+    ok: bool,
+    message: String,
 }
 
 fn run_due_jobs_with(
     state: &AppState,
-    mut execute: impl FnMut(&Job) -> String,
-) -> AppResult<Vec<String>> {
-    let _run_guard = match JOBS_RUN_LOCK.try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock) => return Ok(Vec::new()),
-        Err(TryLockError::Poisoned(_)) => return Err(AppError::msg("任务执行锁异常")),
-    };
+    mut execute: impl FnMut(&Job) -> AppResult<String>,
+) -> AppResult<Vec<JobRun>> {
+    let run_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.config_dir().join("jobs-run.lock"))
+        .map_err(|err| AppError::msg(format!("无法打开任务执行锁：{err}")))?;
+    match run_lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(Vec::new()),
+        Err(fs::TryLockError::Error(err)) => {
+            return Err(AppError::msg(format!("无法锁定任务执行：{err}")))
+        }
+    }
     let now = now_secs();
     let snapshots = list_jobs(state)?;
     let mut messages = Vec::new();
@@ -104,38 +128,92 @@ fn run_due_jobs_with(
             continue;
         }
         // Database and mail operations run without holding the storage lock.
-        let last_message = execute(&snapshot);
-        let merged = update_jobs(state, |current| {
+        let result = execute(&snapshot);
+        let ok = result.is_ok();
+        let last_message = match result {
+            Ok(text) => text,
+            Err(err) => format!("失败：{err}"),
+        };
+        update_jobs(state, |current| {
             let Some(job) = current.iter_mut().find(|job| {
                 job.id == snapshot.id && job.enabled && job.revision == snapshot.revision
             }) else {
-                return Ok(false);
+                return Ok(());
             };
             job.last_message = last_message.clone();
             job.next_run_at = now_secs().saturating_add(job.interval_secs);
             job.revision = Uuid::new_v4().to_string();
-            Ok(true)
+            Ok(())
         })?;
-        if merged {
-            messages.push(format!("{}: {last_message}", snapshot.name));
-        }
+        // Editing a job changes persistence ownership, not the outcome of an operation already run.
+        messages.push(JobRun {
+            name: snapshot.name,
+            ok,
+            message: last_message,
+        });
     }
     Ok(messages)
 }
 
-fn execute_job(state: &AppState, snapshot: &Job) -> String {
-    let mut job = snapshot.clone();
-    let result = match job.kind.as_str() {
+fn execute_job(state: &AppState, job: &Job) -> AppResult<String> {
+    let mut ids = vec![job.connection_id.clone()];
+    for id in &job.profile_ids {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    let mut messages = Vec::new();
+    let mut failed = false;
+    for (index, id) in ids.iter().enumerate() {
+        let mut operation = job.clone();
+        operation.connection_id = id.clone();
+        if index > 0 && !operation.path.is_empty() {
+            operation.path = format!("{}-{}", operation.path, id);
+        }
+        match run_job_operation(state, &operation) {
+            Ok(message) => messages.push(format!("{id}: {message}")),
+            Err(err) => {
+                failed = true;
+                messages.push(format!("{id}: {err}"));
+            }
+        }
+    }
+    let mut message = messages.join(" | ");
+    if !job.notify_email.trim().is_empty() {
+        match send_job_mail(state, &job.notify_email, &job.name, &message, &job.path) {
+            Ok(()) => message.push_str(" · 已发送邮件"),
+            Err(err) => {
+                failed = true;
+                message.push_str(&format!(" · 邮件未发出: {err}"));
+            }
+        }
+    }
+    if failed {
+        Err(AppError::msg(message))
+    } else {
+        Ok(message)
+    }
+}
+
+fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
+    // Scheduled and desktop jobs share the same authenticated connection path.
+    let connection = state.connect(&job.connection_id)?;
+    let database = if job.database.is_empty() {
+        connection.database
+    } else {
+        job.database.clone()
+    };
+    match job.kind.as_str() {
         "backup" => backup_sql(
             state,
             &BackupRequest {
                 connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
+                database,
                 schema: job.schema.clone(),
                 path: if job.path.is_empty() {
                     state
                         .config_dir()
-                        .join(format!("{}.sql", job.id))
+                        .join(format!("{}-{}.sql", job.id, job.connection_id))
                         .display()
                         .to_string()
                 } else {
@@ -160,7 +238,7 @@ fn execute_job(state: &AppState, snapshot: &Job) -> String {
             state,
             FileExportRequest {
                 connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
+                database,
                 schema: job.schema.clone(),
                 table: job.table.clone(),
                 format: "csv".into(),
@@ -168,11 +246,11 @@ fn execute_job(state: &AppState, snapshot: &Job) -> String {
             },
         )
         .map(|item| format!("导出 {} 行。{}", item.row_count, item.note)),
-        _ => execute_sql(
+        "query" => execute_sql(
             state,
             ExecuteSqlRequest {
                 connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
+                database,
                 sql: job.sql.clone(),
                 page: 1,
                 page_size: 20,
@@ -188,111 +266,7 @@ fn execute_job(state: &AppState, snapshot: &Job) -> String {
                 Ok(format!("查询完成，{} 条语句", response.statements.len()))
             }
         }),
-    };
-    job.last_message = match &result {
-        Ok(text) => text.clone(),
-        Err(err) => err.to_string(),
-    };
-    if !job.profile_ids.is_empty() {
-        let mut extra = Vec::new();
-        for id in job.profile_ids.clone() {
-            if id == job.connection_id {
-                continue;
-            }
-            let mut clone = job.clone();
-            clone.connection_id = id.clone();
-            clone.profile_ids.clear();
-            clone.notify_email.clear();
-            let piece = run_saved_job(state, &clone);
-            extra.push(format!("{id}: {piece}"));
-        }
-        if !extra.is_empty() {
-            job.last_message = format!("{} | {}", job.last_message, extra.join(" | "));
-        }
-    }
-    if !job.notify_email.trim().is_empty() {
-        match send_job_mail(
-            state,
-            &job.notify_email,
-            &job.name,
-            &job.last_message,
-            &job.path,
-        ) {
-            Ok(()) => job.last_message.push_str(" · 已发送邮件"),
-            Err(err) => job.last_message.push_str(&format!(" · 邮件未发出: {err}")),
-        }
-    }
-    job.last_message
-}
-
-fn run_saved_job(state: &AppState, job: &Job) -> String {
-    let result = match job.kind.as_str() {
-        "backup" => backup_sql(
-            state,
-            &BackupRequest {
-                connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
-                schema: job.schema.clone(),
-                path: if job.path.is_empty() {
-                    state
-                        .config_dir()
-                        .join(format!("{}-{}.sql", job.id, job.connection_id))
-                        .display()
-                        .to_string()
-                } else {
-                    format!("{}-{}", job.path, job.connection_id)
-                },
-                mode: "auto".into(),
-            },
-        )
-        .map(|item| {
-            format!(
-                "{}，{} 行。{}",
-                if item.kind == "data-only" {
-                    "已生成数据脚本"
-                } else {
-                    "备份操作完成"
-                },
-                item.row_count,
-                item.note
-            )
-        }),
-        "export" => export_file(
-            state,
-            FileExportRequest {
-                connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
-                schema: job.schema.clone(),
-                table: job.table.clone(),
-                format: "csv".into(),
-                path: format!("{}-{}.csv", job.path, job.connection_id),
-            },
-        )
-        .map(|item| format!("导出 {} 行。{}", item.row_count, item.note)),
-        _ => execute_sql(
-            state,
-            ExecuteSqlRequest {
-                connection_id: job.connection_id.clone(),
-                database: job.database.clone(),
-                sql: job.sql.clone(),
-                page: 1,
-                page_size: 20,
-                only_statement: None,
-            },
-        )
-        .and_then(|response| {
-            if let Some(failed) = response.statements.iter().find(|item| !item.ok) {
-                Err(AppError::msg(
-                    failed.error.clone().unwrap_or_else(|| "查询失败".into()),
-                ))
-            } else {
-                Ok(format!("查询完成，{} 条语句", response.statements.len()))
-            }
-        }),
-    };
-    match result {
-        Ok(text) => text,
-        Err(err) => err.to_string(),
+        _ => Err(AppError::msg("不支持的任务类型")),
     }
 }
 
@@ -384,6 +358,7 @@ pub fn mail_settings(state: &AppState) -> AppResult<MailSettings> {
 }
 
 pub fn save_mail_settings(state: &AppState, request: MailSave) -> AppResult<MailSettings> {
+    let guard = store_lock(state, "mail.json")?;
     let mut file = read_mail(state)?;
     file.host = request.host.trim().to_string();
     file.port = if request.port == 0 { 587 } else { request.port };
@@ -395,7 +370,8 @@ pub fn save_mail_settings(state: &AppState, request: MailSave) -> AppResult<Mail
     } else if !request.password.trim().is_empty() {
         file.password_enc = state.encrypt_secret(request.password.trim())?;
     }
-    write_json(state, "mail.json", &file)?;
+    write_json_unlocked(state, "mail.json", &file)?;
+    drop(guard);
     mail_settings(state)
 }
 
@@ -441,7 +417,7 @@ mod tests {
                             assert_eq!(snapshot.id, "paused");
                             started_tx.send(()).unwrap();
                             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                            "old result".into()
+                            Ok("old result".into())
                         })
                         .unwrap();
                         if entered {
@@ -475,7 +451,10 @@ mod tests {
                 .unwrap()
                 .is_empty());
                 release_tx.send(()).unwrap();
-                assert!(worker.join().unwrap().is_empty());
+                let completed = worker.join().unwrap();
+                assert_eq!(completed.len(), 1);
+                assert_eq!(completed[0].name, "paused");
+                assert!(completed[0].ok);
             });
             let jobs = list_jobs(&state).unwrap();
             assert!(!jobs.iter().find(|job| job.id == "paused").unwrap().enabled);
@@ -509,6 +488,140 @@ mod tests {
                 fs::read_to_string(dir.join("jobs.json")).unwrap(),
                 "not valid JSON"
             );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paused_during_execution_still_reports_failure_to_cli_summary() {
+        let dir =
+            std::env::temp_dir().join(format!("dataharbor-paused-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        {
+            let state = AppState::open_in(dir.clone(), true).unwrap();
+            save_job(&state, job("paused-failure")).unwrap();
+            let results = run_due_jobs_with(&state, |snapshot| {
+                let mut paused = snapshot.clone();
+                paused.enabled = false;
+                paused.last_message = "用户暂停".into();
+                save_job(&state, paused).unwrap();
+                Err(crate::error::AppError::msg("操作实际失败"))
+            })
+            .unwrap();
+            let error = super::summarize_runs(results).unwrap_err().to_string();
+            assert!(error.contains("1 个计划任务失败"));
+            assert!(error.contains("操作实际失败"));
+            let paused = list_jobs(&state).unwrap().remove(0);
+            assert!(!paused.enabled);
+            assert_eq!(paused.last_message, "用户暂停");
+            assert_eq!(paused.next_run_at, 1);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cold_start_jobs_connect_and_report_real_success_and_failure() {
+        use crate::models::{Engine, SaveConnectionRequest};
+        let dir = std::env::temp_dir().join(format!("dataharbor-cold-jobs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("fixture.sqlite");
+        let id;
+        {
+            let state = AppState::open_in(dir.clone(), true).unwrap();
+            id = state
+                .save_connection(SaveConnectionRequest {
+                    name: "fixture".into(),
+                    engine: Engine::Sqlite,
+                    file_path: db.display().to_string(),
+                    ..Default::default()
+                })
+                .unwrap()
+                .connection
+                .id;
+            let mut query = job("query");
+            query.connection_id = id.clone();
+            query.database = "main".into();
+            query.sql = "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO items VALUES(1, 'cold start');".into();
+            save_job(&state, query).unwrap();
+            let mut export = job("export");
+            export.connection_id = id.clone();
+            export.kind = "export".into();
+            export.database = "main".into();
+            export.schema = "main".into();
+            export.table = "items".into();
+            export.path = dir.join("export.csv").display().to_string();
+            save_job(&state, export).unwrap();
+        }
+        {
+            let state = AppState::open_in(dir.clone(), true).unwrap();
+            assert!(state.list_connections().iter().all(|item| !item.connected));
+            assert_eq!(super::run_due_jobs(&state).unwrap().len(), 2);
+            assert!(fs::read_to_string(dir.join("export.csv"))
+                .unwrap()
+                .contains("cold start"));
+            let check = rusqlite::Connection::open(&db).unwrap();
+            assert_eq!(
+                check
+                    .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            let mut broken = job("broken");
+            broken.connection_id = id;
+            broken.sql = "INSERT INTO missing_table VALUES(1)".into();
+            save_job(&state, broken).unwrap();
+            let error = super::run_due_jobs(&state).unwrap_err().to_string();
+            assert!(error.contains("1 个计划任务失败"));
+            let saved = list_jobs(&state)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "broken")
+                .unwrap();
+            assert!(saved.last_message.starts_with("失败："));
+            assert!(saved.next_run_at > 1);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn task_run_lock_excludes_another_process_and_releases_on_close() {
+        const ENV: &str = "DATAHARBOR_TEST_TASK_LOCK_DIR";
+        if let Some(dir) = std::env::var_os(ENV) {
+            let state = AppState::open_in(dir.into(), true).unwrap();
+            assert!(
+                run_due_jobs_with(&state, |_| panic!("another process owns the lock"))
+                    .unwrap()
+                    .is_empty()
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dataharbor-job-process-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        {
+            let state = AppState::open_in(dir.clone(), true).unwrap();
+            save_job(&state, job("due")).unwrap();
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("jobs-run.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "studio::automation::tests::task_run_lock_excludes_another_process_and_releases_on_close", "--nocapture"])
+                .env(ENV, &dir).output().unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            drop(lock);
+            let result = run_due_jobs_with(&state, |_| Ok("once".into())).unwrap();
+            assert_eq!(result.len(), 1);
+            assert!(run_due_jobs_with(&state, |_| panic!("already advanced"))
+                .unwrap()
+                .is_empty());
         }
         fs::remove_dir_all(dir).unwrap();
     }

@@ -108,6 +108,8 @@ export function parseCell(raw: string, column: ColumnMeta, asNull: boolean): Jso
   if (isNumericType(column.dataType)) {
     const trimmed = raw.trim();
     if (!trimmed) return null;
+    // Exact database numbers must not pass through JavaScript's binary floating point.
+    if (/^(decimal|numeric|number|money|dec)\b/i.test(column.dataType)) return trimmed;
     if (/^-?\d+$/.test(trimmed)) {
       const integer = Number(trimmed);
       return Number.isSafeInteger(integer) ? integer : trimmed;

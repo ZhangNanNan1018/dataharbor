@@ -4,6 +4,7 @@
 
 ```sh
 npm ci
+npm test
 npm run build
 cd src-tauri
 cargo test --lib --locked
@@ -13,7 +14,7 @@ cargo test --lib --locked
 
 ## 专用服务器往返测试
 
-根目录 `compose.test.yml` 创建独立数据库，默认仅在本机端口 13306 和 15432 监听，账号密码仅用于测试。请勿把测试端口指向业务数据库。
+根目录 `compose.test.yml` 创建独立数据库，默认仅在本机端口 13306、15432、27027 和 16379 监听，账号密码仅用于测试。请勿把测试端口指向业务数据库。
 
 PowerShell：
 
@@ -21,13 +22,16 @@ PowerShell：
 docker compose -p dataharbor-tests -f compose.test.yml up -d --wait
 $env:DATAHARBOR_TEST_MYSQL_PORT = '13306'
 $env:DATAHARBOR_TEST_POSTGRES_PORT = '15432'
+$env:DATAHARBOR_TEST_PG_CONTAINER = docker compose -p dataharbor-tests -f compose.test.yml ps -q postgres
+$env:DATAHARBOR_TEST_MONGO_PORT = '27027'
+$env:DATAHARBOR_TEST_REDIS_PORT = '16379'
 Set-Location src-tauri
-cargo test --lib --locked server_tests:: -- --ignored --test-threads=1
+cargo test --lib --locked -- --ignored --test-threads=1
 Set-Location ..
 docker compose -p dataharbor-tests -f compose.test.yml down -v
 ```
 
-这两项显式测试分别在 MySQL 8.4、PostgreSQL 16 验证真实连接、复合主键元数据、读取与修改、失败事务回滚、CSV 导出后重新导入，并读取数据库核对结果。测试表名随机，测试结束只清理自己创建的表和临时文件。
+专用测试覆盖 MySQL 8.4、PostgreSQL 16、MongoDB 7 和 Redis 7。SQL 测试验证复合主键、实际修改行数、并发冲突、整批回滚、高精度 DECIMAL、大整数、微秒时间、二进制及 CSV 两入口往返。MongoDB 验证过滤计数、稳定分页、稀疏且保留 BSON 类型的原始快照、并发冲突及部分提交错误。Redis 验证原子比较更新、类型变化、TTL 保留、列表删除和跨 500 行分页。测试表、数据库或键名随机，结束只清理自身数据。
 
 GitHub CI 在三个桌面系统执行构建与回归，在独立 Linux 服务容器执行上述服务器测试。工作流配置存在不代表已经在 GitHub 运行通过。
 
@@ -42,6 +46,26 @@ GitHub CI 在三个桌面系统执行构建与回归，在独立 Linux 服务容
 - 真实跳板机、证书链、代理、集群故障切换；
 - 多用户并发写入时的一致性快照或全任务原子回滚。
 
-后台任务的配置锁和运行锁为进程内保护。不要让多个应用实例或外部 `--run-jobs` 进程同时操作同一配置目录；跨进程任务租约尚未实现。
+后台任务使用配置文件锁和跨进程执行锁；桌面与外部 `--run-jobs` 共用同一配置目录时不会并行运行同批任务。任务冷启动会主动建连，任何实际执行失败都会令 CLI 返回非零；执行中暂停/编辑仅阻止旧结果覆盖配置，不会隐瞒已执行操作的失败。进程意外退出时锁由操作系统释放，但任务不承诺数据库写入的 exactly-once 语义。
 
 修改相关模块后运行对应回归，再执行整体构建。不得把未运行或仅静态检查的项记录成通过。
+
+## 本轮新增回归范围（2026-10-21）
+
+- 前端使用 Vitest、Testing Library 和 jsdom，真实挂载 AntD 组件；Tauri IPC、Monaco 和专用单元格编辑器使用测试替身。覆盖活动标签保存、防重复提交、部分提交后禁止重放、失败刷新、换库及迟到响应、稀疏原始快照、多结果导航、草稿损坏保留和恢复、工作台懒加载状态、AI 服务切换。
+- 凭据测试注入模拟钥匙串，不读取或修改个人系统凭据。验证暂时不可用、已存密文、冲突密钥及唯一可解候选。
+- SQLite 回归覆盖整批冲突回滚、CSV/TXT 引号和换行、NULL/空字符串/UNC 路径、超过 20MB 的内置备份恢复、坏尾部预检不写入、分批失败进度、任务冷启动和跨进程互斥。
+- SMTP 使用本机临时监听验证域名与分段协议；不会向真实邮箱发送邮件。
+- 原生工具参数、临时凭据清理、路径发现和 psql restricted 模式准备由离线夹具验证。PostgreSQL 原生 COPY 脚本另通过容器内 pg_dump/受限 psql 和实际数据回读验证；其他原生工具备份→还原、真实证书/跳板机以及 SQL Server/Oracle/达梦/Snowflake 仍需对应环境验收。
+
+前端交互测试不能替代真实 WebView、屏幕阅读器或桌面响应时间验收。CI 工作流已接入前端回归和四类数据库测试；本地通过也不能替代远程 CI 的实际结果。
+
+## 2026-10-21 本机验收结果
+
+- Windows 前端交互回归：22 项通过；生产构建通过。主包按工作台领域懒加载后约 4.50MB，仍有大包警告，未将其视为实际启动性能验收。
+- Rust 常规回归：114 项通过；7 项外部数据库测试默认 ignored。
+- 显式实库回归：6 项通过，覆盖 MySQL 8.4、PostgreSQL 16、Redis 7；包含 PostgreSQL 原生 pg_dump COPY 脚本经受限 psql 恢复后的数据核对。
+- MongoDB 的 1 项实库回归未运行：Docker Hub 及备用镜像源的镜像下载持续停滞，已停止下载；相关 helper 回归通过，但不能替代真实服务器验收。CI 已配置 MongoDB 服务，仍需在镜像可用的环境执行。
+- Windows 调试二进制构建通过；库目标改名为 dataharbor_lib，消除了与可执行文件调试符号重名的构建警告。
+- Git 差异检查、测试 Compose 配置校验通过；第三方授权重新生成，仍有 50 项需要人工核对。未执行远程 GitHub CI、正式签名发布、macOS/Linux 桌面或其他数据库实机验收。
+- 验证使用本轮独立的临时数据库和配置；测试结束已清理本轮容器，不操作业务数据库。

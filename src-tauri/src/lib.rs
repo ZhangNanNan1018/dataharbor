@@ -166,7 +166,9 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(15));
                 let state = handle.state::<AppState>();
-                let _ = studio::run_due_jobs(&state);
+                if let Err(err) = studio::run_due_jobs(&state) {
+                    eprintln!("计划任务失败：{err}");
+                }
             });
             Ok(())
         })

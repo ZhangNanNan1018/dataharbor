@@ -69,7 +69,7 @@ pub fn diff_objects(
                 &mut statements,
                 "view",
                 format!("DROP VIEW {qualified};\nCREATE VIEW {qualified} AS\n{source_sql};"),
-                false,
+                true,
             );
         }
         return (statements, notes);
@@ -115,15 +115,8 @@ pub fn diff_objects(
                             column.name, column.data_type
                         ),
                     };
-                    let warning = matches!(
-                        engine,
-                        Engine::Sqlite
-                            | Engine::Oracle
-                            | Engine::Mongodb
-                            | Engine::Redis
-                            | Engine::Snowflake
-                    );
-                    push(&mut statements, "modify", sql, warning);
+                    // Even syntactically valid ALTER TYPE can narrow existing data.
+                    push(&mut statements, "modify", sql, true);
                     notes.push(format!(
                         "列 {} 类型 {} → {}",
                         column.name, existing.data_type, column.data_type
@@ -338,6 +331,13 @@ mod tests {
         assert!(sql.contains("ALTER COLUMN"));
         assert!(sql.contains("CREATE INDEX"));
         assert!(sql.contains("FOREIGN KEY"));
+        assert!(
+            statements
+                .iter()
+                .find(|item| item.kind == "modify")
+                .unwrap()
+                .warning
+        );
     }
 
     #[test]

@@ -126,6 +126,7 @@ impl Fixture {
             changes,
         };
         let update = RowChange {
+            original: Some(page.columns.iter().zip(&page.rows[0]).map(|(column, value)| FieldValue { column: column.name.clone(), value: value.clone() }).collect()),
             kind: "update".into(),
             pk: key,
             values: vec![FieldValue {
@@ -247,4 +248,96 @@ fn postgres_real_round_trip() {
         Some(1),
         "自动分页不应额外重放函数进行COUNT"
     );
+}
+
+
+fn check_precision_and_conflicts(engine: Engine, port: &str) {
+    let fixture = Fixture::open(engine, port);
+    fixture.sql(&format!("ALTER TABLE {} ADD amount DECIMAL(38,18)", fixture.table_sql));
+    fixture.sql(&format!("ALTER TABLE {} ADD large_number DECIMAL(20,0)", fixture.table_sql));
+    if engine == Engine::Mysql {
+        fixture.sql(&format!("ALTER TABLE {} ADD stamped DATETIME(6), ADD duration TIME(6), ADD payload BLOB", fixture.table_sql));
+    }
+    let path = fixture.dir.join("precise.csv").display().to_string();
+    fs::write(&path, "label,tenant,id,amount,large_number\n00123,1,1,12345678901234567890.123456789012345678,18446744073709551615\n\"a\"\"b\n第二行\",1,2,0.000000000000000001,9007199254740993\n").unwrap();
+    import_table_csv(&fixture.state, ImportCsvRequest {
+        connection_id: fixture.id.clone(), database: fixture.database.clone(), schema: fixture.schema.clone(),
+        table: fixture.table.clone(), path: path.clone(), truncate: false,
+    }).unwrap();
+    if engine == Engine::Mysql {
+        fixture.sql(&format!("UPDATE {} SET stamped='2026-10-21 12:34:56.123456', duration='49:02:03.654321', payload=X'4142'", fixture.table_sql));
+    }
+    let before = fixture.page();
+    assert_eq!(before.rows[0][0], json!("00123"));
+    assert_eq!(before.rows[0][3], json!("12345678901234567890.123456789012345678"));
+    assert_eq!(before.rows[0][4], json!("18446744073709551615"));
+    assert!(before.columns[3].data_type.to_ascii_lowercase().contains("38,18"));
+    export_table_csv(&fixture.state, ExportTableRequest {
+        connection_id: fixture.id.clone(), database: fixture.database.clone(), schema: fixture.schema.clone(), table: fixture.table.clone(), path: path.clone(), filters: vec![], sorts: vec![],
+    }).unwrap();
+    fixture.sql(&format!("DELETE FROM {}", fixture.table_sql));
+    crate::studio::import_file(&fixture.state, crate::studio::FileImportRequest {
+        connection_id: fixture.id.clone(), database: fixture.database.clone(), schema: fixture.schema.clone(), table: fixture.table.clone(), path, format: "csv".into(),
+    }).unwrap();
+    assert_eq!(fixture.page().rows, before.rows);
+    let original = before.columns.iter().zip(&before.rows[0]).map(|(col,val)| FieldValue { column: col.name.clone(), value: val.clone() }).collect::<Vec<_>>();
+    let keys = before.columns.iter().zip(&before.rows[0]).filter(|(col,_)| col.primary_key).map(|(col,val)| FieldValue { column: col.name.clone(), value: val.clone() }).collect::<Vec<_>>();
+    let request = |value| CommitRequest {
+        connection_id: fixture.id.clone(), database: fixture.database.clone(), schema: fixture.schema.clone(), table: fixture.table.clone(),
+        changes: vec![RowChange { kind: "update".into(), original: Some(original.clone()), pk: keys.clone(), values: vec![FieldValue { column: "label".into(), value }] }],
+    };
+    // Matched-but-unchanged updates must not be mistaken for stale rows on MySQL.
+    assert_eq!(commit_changes(&fixture.state, request(json!("00123"))).unwrap().applied, 1);
+    fixture.sql(&format!("UPDATE {} SET label='other writer' WHERE tenant=1 AND id=1", fixture.table_sql));
+    assert!(commit_changes(&fixture.state, request(json!("stale overwrite"))).is_err());
+    assert_eq!(fixture.page().rows[0][0], json!("other writer"));
+    fixture.sql(&format!("DELETE FROM {} WHERE tenant=1 AND id=1", fixture.table_sql));
+    assert!(commit_changes(&fixture.state, request(json!("missing row"))).is_err());
+}
+
+#[test]
+#[ignore = "需要专用本地 MySQL 测试容器"]
+fn mysql_precise_csv_and_concurrent_edits() { check_precision_and_conflicts(Engine::Mysql, "DATAHARBOR_TEST_MYSQL_PORT"); }
+
+#[test]
+#[ignore = "需要专用本地 PostgreSQL 测试容器"]
+fn postgres_precise_csv_and_concurrent_edits() { check_precision_and_conflicts(Engine::Postgres, "DATAHARBOR_TEST_POSTGRES_PORT"); }
+
+
+#[test]
+#[ignore = "需要专用 PostgreSQL 容器及 DATAHARBOR_TEST_PG_CONTAINER"]
+fn postgres_native_copy_backup_restores_through_restricted_psql() {
+    let container = std::env::var("DATAHARBOR_TEST_PG_CONTAINER").expect("需要专用测试容器 ID");
+    let fixture = Fixture::open(Engine::Postgres, "DATAHARBOR_TEST_POSTGRES_PORT");
+    fixture.sql(&format!("INSERT INTO {} VALUES ('quotes '' and ;\n第二行',1,1)", fixture.table_sql));
+    let expected = fixture.page().rows;
+    let remote_dump = format!("/tmp/{}.sql", fixture.table);
+    let remote_ready = format!("/tmp/{}-ready.sql", fixture.table);
+    let host_dump = fixture.dir.join("native.sql");
+    let host_ready = fixture.dir.join("ready.sql");
+    // Run the production tool plans inside the disposable test container,
+    // where pg_dump/psql are installed, without depending on host PATH setup.
+    let run = |mut plan: crate::native::NativePlan| {
+        let program = plan.program.clone();
+        let mut args = vec!["exec".into()];
+        for (name, value) in &plan.env { args.extend(["-e".into(), format!("{name}={value}")]); }
+        args.extend([container.clone(), program]);
+        args.extend(plan.args);
+        plan.program = "docker".into(); plan.args = args; plan.env.clear();
+        crate::native::run_plan(&plan).unwrap();
+    };
+    let mut dump = crate::native::pg_plan("127.0.0.1", 5432, "postgres", "demo", &remote_dump, "dataharbor");
+    dump.args.extend(["--table".into(), fixture.table_sql.clone()]);
+    run(dump);
+    let copy = |source: &str, target: &str| {
+        assert!(std::process::Command::new("docker").args(["cp", source, target]).status().unwrap().success());
+    };
+    copy(&format!("{container}:{remote_dump}"), host_dump.to_str().unwrap());
+    assert!(fs::read_to_string(&host_dump).unwrap().contains("COPY "));
+    crate::native::prepare_pg_script(&host_dump, &host_ready).unwrap();
+    copy(host_ready.to_str().unwrap(), &format!("{container}:{remote_ready}"));
+    fixture.sql(&format!("DROP TABLE {}", fixture.table_sql));
+    run(crate::native::pg_restore_plan("127.0.0.1", 5432, "postgres", "demo", &remote_ready, "dataharbor", false));
+    assert_eq!(fixture.page().rows, expected);
+    let _ = std::process::Command::new("docker").args(["exec", &container, "rm", "-f", &remote_dump, &remote_ready]).status();
 }

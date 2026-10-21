@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use serde_json::{Number, Value as JsonValue};
+use serde_json::Value as JsonValue;
+
+pub(crate) mod delimited;
 
 use crate::drivers::DbSession;
 use crate::error::{AppError, AppResult};
@@ -35,8 +37,9 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
                 page_offset(page, page_size)?,
             )?;
             let total =
-                session.count_relation(&request.database, &request.schema, &request.table)?;
+                session.count_filtered_relation(&request.database, &request.schema, &request.table, &request.filters)?;
             return Ok(DataPage {
+                original_rows: outcome.original_rows,
                 columns: outcome.columns,
                 rows: outcome.rows,
                 total,
@@ -66,6 +69,7 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
             .and_then(json_count)
             .unwrap_or(0);
         Ok(DataPage {
+            original_rows: None,
             columns: plan.columns,
             rows: outcome.rows,
             total,
@@ -85,7 +89,7 @@ pub fn commit_changes(state: &AppState, request: CommitRequest) -> AppResult<Com
             for (index, change) in request.changes.iter().enumerate() {
                 session
                     .apply_mutation(&request.database, &request.schema, &request.table, change)
-                    .map_err(|err| AppError::msg(format!("第 {} 条更改失败: {err}", index + 1)))?;
+                    .map_err(|err| AppError::PartialWrite { applied: index, failed_index: index + 1, detail: err.to_string() })?;
             }
             return Ok(CommitResult {
                 applied: request.changes.len(),
@@ -105,7 +109,7 @@ pub fn commit_changes(state: &AppState, request: CommitRequest) -> AppResult<Com
             .iter()
             .enumerate()
             .map(|(index, change)| {
-                compile_change(
+                let compiled = compile_change(
                     engine,
                     &request.database,
                     &request.schema,
@@ -113,15 +117,16 @@ pub fn commit_changes(state: &AppState, request: CommitRequest) -> AppResult<Com
                     &columns,
                     change,
                 )
-                .map_err(|err| AppError::msg(format!("第 {} 条更改无效: {err}", index + 1)))
+                .map_err(|err| AppError::msg(format!("第 {} 条更改无效: {err}", index + 1)))?;
+                Ok(compiled.map(|sql| (sql, Some(1))))
             })
             .collect::<AppResult<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        session.execute_transaction(&request.database, &statements)?;
+        let applied = session.execute_checked_transaction(&request.database, &statements)?;
         Ok(CommitResult {
-            applied: request.changes.len(),
+            applied,
         })
     })
 }
@@ -130,7 +135,7 @@ pub fn export_table_csv(state: &AppState, request: ExportTableRequest) -> AppRes
     state.with_session(&request.connection_id, |session| {
         if session.is_document_store() {
             let total =
-                session.count_relation(&request.database, &request.schema, &request.table)?;
+                session.count_filtered_relation(&request.database, &request.schema, &request.table, &request.filters)?;
             let outcome = session.browse_page(
                 &request.database,
                 &request.schema,
@@ -190,7 +195,7 @@ pub fn export_sql_csv(state: &AppState, request: ExportSqlRequest) -> AppResult<
             if let Some(paged) = paginate_query_sql(session.engine(), sql, read_limit as u32, 0) {
                 match session.execute(&request.database, &paged, Some(read_limit)) {
                     Ok(outcome) => outcome,
-                    Err(_) => session.execute(&request.database, sql, Some(read_limit))?,
+                    Err(err) => return Err(err),
                 }
             } else {
                 session.execute(&request.database, sql, Some(read_limit))?
@@ -215,26 +220,8 @@ pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResul
     if meta.len() > IMPORT_BYTES {
         return Err(AppError::msg("CSV 超过 50MB"));
     }
-    let mut reader = csv::ReaderBuilder::new()
-        .flexible(true)
-        .from_path(&request.path)
-        .map_err(|err| AppError::msg(format!("无法解析 CSV: {err}")))?;
-    let headers = reader
-        .headers()
-        .map_err(|err| AppError::msg(format!("无法解析 CSV: {err}")))?
-        .iter()
-        .map(|cell| cell.trim().to_string())
-        .collect::<Vec<_>>();
-    if headers.iter().all(|header| header.is_empty()) {
-        return Err(AppError::msg("CSV 需要表头行"));
-    }
-    let records = reader
-        .records()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| AppError::msg(format!("无法解析 CSV: {err}")))?;
-    if records.len() as u64 > EXPORT_CAP {
-        return Err(AppError::msg("一次最多导入 100000 行"));
-    }
+    let file = fs::File::open(&request.path).map_err(|err| AppError::msg(format!("无法读取 CSV: {err}")))?;
+    let (headers, records) = delimited::read(file, b',', EXPORT_CAP as usize)?;
 
     state.with_session(&request.connection_id, |session| {
         let engine = session.engine();
@@ -254,8 +241,8 @@ pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResul
                     .position(|column| column.name.eq_ignore_ascii_case(header))
             })
             .collect::<Vec<_>>();
-        if mapping.iter().all(|index| index.is_none()) {
-            return Err(AppError::msg("CSV 表头与表字段不匹配"));
+        if mapping.iter().any(|index| index.is_none()) {
+            return Err(AppError::msg("CSV 表头包含不存在的字段，已取消导入"));
         }
         if session.is_document_store() {
             return Err(AppError::msg(
@@ -277,12 +264,13 @@ pub fn import_table_csv(state: &AppState, request: ImportCsvRequest) -> AppResul
                     let column = &columns[column_index];
                     Some(FieldValue {
                         column: column.name.clone(),
-                        value: csv_value(column, cell),
+                        value: cell.clone(),
                     })
                 })
                 .collect();
             let change = RowChange {
                 kind: "insert".into(),
+                original: None,
                 pk: Vec::new(),
                 values,
             };
@@ -482,7 +470,7 @@ fn compile_change(
                     value_sql(engine, &column.data_type, &field.value)?
                 ));
             }
-            let predicate = pk_predicate(engine, columns, &change.pk)?;
+            let predicate = edit_predicate(engine, columns, change)?;
             Ok(Some(format!(
                 "UPDATE {table_sql} SET {} WHERE {predicate}",
                 sets.join(", ")
@@ -490,7 +478,7 @@ fn compile_change(
         }
         "delete" => {
             ensure_pk(columns, &change.pk)?;
-            let predicate = pk_predicate(engine, columns, &change.pk)?;
+            let predicate = edit_predicate(engine, columns, change)?;
             Ok(Some(format!("DELETE FROM {table_sql} WHERE {predicate}")))
         }
         _ => Err(AppError::msg("未知的更改类型")),
@@ -530,6 +518,36 @@ fn pk_predicate(engine: Engine, columns: &[ColumnMeta], pk: &[FieldValue]) -> Ap
     Ok(parts.join(" AND "))
 }
 
+fn edit_predicate(engine: Engine, columns: &[ColumnMeta], change: &RowChange) -> AppResult<String> {
+    let original = change.original.as_ref().ok_or_else(|| AppError::msg("缺少读取时的原始行，无法检查并发冲突；请刷新后重试"))?;
+    let names = original.iter().map(|field| field.column.as_str()).collect::<BTreeSet<_>>();
+    let expected = columns.iter().map(|column| column.name.as_str()).collect::<BTreeSet<_>>();
+    if names != expected || original.len() != columns.len() {
+        return Err(AppError::msg("原始行字段与当前结构不一致，请刷新后重试"));
+    }
+    let mut parts = vec![pk_predicate(engine, columns, &change.pk)?];
+    for field in original {
+        let column = find_column(columns, &field.column)?;
+        let ident = crate::sqlutil::quote_ident(engine, &field.column)?;
+        if field.value.is_null() {
+            parts.push(format!("{ident} IS NULL"));
+        } else {
+            let literal = value_sql(engine, &column.data_type, &field.value)?;
+            // JSON/legacy text columns have no equality operator on some
+            // engines. Compare their canonical textual representation.
+            let kind = column.data_type.to_ascii_lowercase();
+            let predicate = match engine {
+                Engine::Postgres if matches!(kind.as_str(), "json" | "xml") => format!("CAST({ident} AS TEXT) = {literal}"),
+                Engine::Mssql if matches!(kind.as_str(), "text" | "ntext" | "xml") => format!("CAST({ident} AS NVARCHAR(MAX)) = {literal}"),
+                Engine::Mysql | Engine::Mariadb if !crate::sqlutil::is_numeric_type(&kind) && !crate::sqlutil::is_binary_type(&kind) => format!("BINARY {ident} = BINARY {literal}"),
+                _ => format!("{ident} = {literal}"),
+            };
+            parts.push(predicate);
+        }
+    }
+    Ok(parts.join(" AND "))
+}
+
 fn find_column<'a>(columns: &'a [ColumnMeta], name: &str) -> AppResult<&'a ColumnMeta> {
     columns
         .iter()
@@ -547,61 +565,11 @@ fn literal_for_column(engine: Engine, column: &ColumnMeta, raw: &str) -> AppResu
             return sql_literal(engine, &JsonValue::Bool(false));
         }
     }
-    if is_numeric_type(&column.data_type) {
-        if let Ok(value) = raw.parse::<i64>() {
-            return sql_literal(engine, &JsonValue::Number(value.into()));
-        }
-        if let Ok(value) = raw.parse::<f64>() {
-            if value.is_finite() {
-                if let Some(number) = Number::from_f64(value) {
-                    return sql_literal(engine, &JsonValue::Number(number));
-                }
-            }
-        }
-    }
-    sql_literal(engine, &JsonValue::String(raw.to_string()))
-}
-
-fn csv_value(column: &ColumnMeta, cell: &str) -> JsonValue {
-    if cell.is_empty() {
-        return JsonValue::Null;
-    }
-    if is_bool_type(&column.data_type) {
-        let lowered = cell.to_ascii_lowercase();
-        if matches!(lowered.as_str(), "1" | "t" | "true" | "yes") {
-            return JsonValue::Bool(true);
-        }
-        if matches!(lowered.as_str(), "0" | "f" | "false" | "no") {
-            return JsonValue::Bool(false);
-        }
-    }
-    if is_numeric_type(&column.data_type) {
-        if let Ok(value) = cell.parse::<i64>() {
-            return JsonValue::Number(value.into());
-        }
-        if let Ok(value) = cell.parse::<f64>() {
-            if let Some(number) = Number::from_f64(value) {
-                return JsonValue::Number(number);
-            }
-        }
-    }
-    JsonValue::String(cell.to_string())
+    value_sql(engine, &column.data_type, &JsonValue::String(raw.to_string()))
 }
 
 fn is_blank(value: &JsonValue) -> bool {
     value.is_null() || value.as_str().is_some_and(|text| text.is_empty())
-}
-
-fn is_numeric_type(data_type: &str) -> bool {
-    let data_type = data_type.to_ascii_lowercase();
-    if data_type.starts_with("interval") {
-        return false;
-    }
-    [
-        "int", "serial", "decimal", "numeric", "float", "double", "real", "money", "number", "dec",
-    ]
-    .iter()
-    .any(|token| data_type.starts_with(token))
 }
 
 fn is_bool_type(data_type: &str) -> bool {
@@ -621,33 +589,10 @@ fn write_csv(path: &str, columns: &[ColumnMeta], rows: &[Vec<JsonValue>]) -> App
         }
     }
     let mut buffer = vec![0xEF, 0xBB, 0xBF];
-    {
-        let mut writer = csv::WriterBuilder::new().from_writer(&mut buffer);
-        writer
-            .write_record(columns.iter().map(|column| column.name.as_str()))
-            .map_err(|err| AppError::msg(err.to_string()))?;
-        for row in rows {
-            let cells = row.iter().map(csv_cell).collect::<Vec<_>>();
-            writer
-                .write_record(&cells)
-                .map_err(|err| AppError::msg(err.to_string()))?;
-        }
-        writer
-            .flush()
-            .map_err(|err| AppError::msg(err.to_string()))?;
-    }
+    let names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    delimited::write(&mut buffer, &names, rows, b',')?;
     fs::write(path, buffer).map_err(|err| AppError::msg(format!("写入 CSV 失败: {err}")))?;
     Ok(())
-}
-
-fn csv_cell(value: &JsonValue) -> String {
-    match value {
-        JsonValue::Null => String::new(),
-        JsonValue::String(text) => text.clone(),
-        JsonValue::Bool(flag) => flag.to_string(),
-        JsonValue::Number(number) => number.to_string(),
-        other => other.to_string(),
-    }
 }
 
 #[cfg(test)]
