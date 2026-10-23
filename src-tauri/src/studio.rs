@@ -16,7 +16,7 @@ mod sync;
 mod table_data;
 #[cfg(test)]
 mod tests;
-mod types;
+pub(crate) mod types;
 
 pub use ai::{ai_ask, ai_settings, save_ai_settings};
 pub use automation::{

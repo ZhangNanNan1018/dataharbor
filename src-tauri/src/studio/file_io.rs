@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+#[cfg(test)]
 pub fn export_file(state: &AppState, request: FileExportRequest) -> AppResult<FileExportResult> {
     export_file_with_operation(state, request, &OperationContext::detached())
 }

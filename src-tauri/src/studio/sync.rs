@@ -97,7 +97,7 @@ pub fn diff_structure(state: &AppState, request: &PairRequest) -> AppResult<Diff
     if request.apply && !sql.trim().is_empty() {
         let response = execute_sql(
             state,
-            ExecuteSqlRequest {
+            ExecuteSqlRequest { session_id: None,
                 connection_id: request.target_id.clone(),
                 database: request.target_database.clone(),
                 sql: sql.clone(),

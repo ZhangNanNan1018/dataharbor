@@ -1,3 +1,4 @@
+import { ExecutionHistory } from "./ExecutionHistory";
 import { App, Alert, Button, Input, InputNumber, Select, Space, Table, Tag } from "antd";
 import { useEffect, useState } from "react";
 import { api, errorText, pickSavePath, type Job } from "../../api";
@@ -5,7 +6,7 @@ import { defaultDb, useOperation, useProfiles } from "./shared";
 
 function newJob(): Job {
   return {
-    id: "", name: "新任务", kind: "query", connectionId: "", database: "", schema: "", table: "books",
+    id: "", revision: "", name: "新任务", kind: "query", connectionId: "", database: "", schema: "", table: "books",
     sql: "SELECT COUNT(*) FROM books", path: "", intervalSecs: 3600, nextRunAt: 0,
     enabled: false, lastMessage: "", notifyEmail: "", profileIds: [],
   };
@@ -144,6 +145,7 @@ export function Jobs() {
           })}>删除</Button>
         </Space> },
       ]} />
+      <ExecutionHistory jobs={jobs} />
       <Space wrap>
         <Input value={smtpHost} onChange={(event) => setSmtpHost(event.target.value)} placeholder="SMTP 主机" />
         <InputNumber value={smtpPort} onChange={(value) => setSmtpPort(value ?? 587)} />

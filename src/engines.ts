@@ -1,4 +1,5 @@
-import type { Engine } from "./types";
+import type { Engine, EngineCapabilities } from "./types";
+import { ENGINE_CAPABILITIES } from "./generated/contracts";
 
 export interface EngineOption {
   value: Engine;
@@ -7,18 +8,10 @@ export interface EngineOption {
   placeholder?: boolean;
 }
 
-export const ENGINES: EngineOption[] = [
-  { value: "mysql", label: "MySQL", port: 3306 },
-  { value: "mariadb", label: "MariaDB", port: 3306 },
-  { value: "postgres", label: "PostgreSQL", port: 5432 },
-  { value: "sqlite", label: "SQLite", port: 0 },
-  { value: "mongodb", label: "MongoDB", port: 27017 },
-  { value: "redis", label: "Redis", port: 6379 },
-  { value: "mssql", label: "SQL Server", port: 1433 },
-  { value: "oracle", label: "Oracle", port: 1521 },
-  { value: "snowflake", label: "Snowflake", port: 443 },
-  { value: "dameng", label: "达梦", port: 5236 },
-];
+export const ENGINES: EngineOption[] = ENGINE_CAPABILITIES.map((item) => ({ value: item.engine, label: item.label, port: item.defaultPort }));
+export function engineCapabilities(engine: Engine | undefined): EngineCapabilities | undefined {
+  return ENGINE_CAPABILITIES.find((item) => item.engine === engine);
+}
 
 export const COLORS = [
   "#6366f1",
@@ -41,7 +34,7 @@ export function isServerEngine(engine: Engine): boolean {
 
 /** Engines whose object tree has a schema level between database and table. */
 export function usesSchema(engine: Engine | undefined): boolean {
-  return engine === "postgres" || engine === "mssql" || engine === "oracle";
+  return engineCapabilities(engine)?.schemaTree ?? false;
 }
 
 export function quoteIdent(engine: Engine | undefined, name: string): string {

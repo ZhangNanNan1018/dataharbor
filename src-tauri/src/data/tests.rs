@@ -23,7 +23,7 @@ fn sqlite_pages_keep_user_sort_and_use_primary_key_tie_breaker() {
         let run = |sql: &str, page, size| {
             execute_sql(
                 &state,
-                ExecuteSqlRequest {
+                ExecuteSqlRequest { session_id: None,
                     connection_id: id.clone(),
                     database: "main".into(),
                     sql: sql.into(),
@@ -132,7 +132,7 @@ fn exporting_a_written_result_cannot_replay_the_write() {
         ] {
             assert!(export_sql_csv(
                 &state,
-                ExportSqlRequest {
+                ExportSqlRequest { session_id: None,
                     connection_id: id.clone(),
                     database: "main".into(),
                     sql: sql.into(),
@@ -150,7 +150,7 @@ fn exporting_a_written_result_cannot_replay_the_write() {
         assert_eq!(after.rows, vec![vec![json!(1)]]);
         let exported = export_sql_csv(
             &state,
-            ExportSqlRequest {
+            ExportSqlRequest { session_id: None,
                 connection_id: id.clone(),
                 database: "main".into(),
                 sql: "SELECT n FROM counter LIMIT 1".into(),
@@ -480,7 +480,7 @@ fn query_failure_and_uncommitted_writes_have_truthful_operation_state() {
     fixture.sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)");
     fixture.sql("INSERT INTO items VALUES(1,'before')");
     let run = |sql: &str, operation: &OperationContext| {
-        crate::query::execute_sql_with_operation(&fixture.state, ExecuteSqlRequest {
+        crate::query::execute_sql_with_operation(&fixture.state, ExecuteSqlRequest { session_id: None,
             connection_id: fixture.id.clone(), database: "main".into(), sql: sql.into(), page: 1, page_size: 10, only_statement: None,
         }, operation)
     };

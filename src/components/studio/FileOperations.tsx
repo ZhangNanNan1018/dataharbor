@@ -74,7 +74,7 @@ export function Backup() {
       const path = await pickSavePath("backup.sql");
       if (!path) return;
       setFeedback(null);
-      setFeedback(exportFeedback(await task.execute("数据库备份", (operationId) => api.backupSql({ connectionId: id, database, schema, path }, operationId))));
+      setFeedback(exportFeedback(await task.execute("数据库备份", (operationId) => api.backupSql({ connectionId: id, database, schema, path, mode: "auto" }, operationId))));
     });
   }
 

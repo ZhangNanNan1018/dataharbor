@@ -222,6 +222,7 @@ export interface ObjectSelection {
 
 export function pairRequest(source: ObjectSelection, target: ObjectSelection): PairRequest {
   return {
+    apply: false, deleteMissing: false, allowDestructive: false, selectedIds: [], preview: false,
     sourceId: source.id, sourceDatabase: source.database, sourceSchema: source.schema, sourceTable: source.table,
     targetId: target.id, targetDatabase: target.database, targetSchema: target.schema, targetTable: target.table,
   };

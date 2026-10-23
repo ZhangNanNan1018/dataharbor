@@ -218,7 +218,7 @@ fn postgres_real_round_trip() {
     );
     let response = crate::query::execute_sql(
         &fixture.state,
-        ExecuteSqlRequest {
+        ExecuteSqlRequest { session_id: None,
             connection_id: fixture.id.clone(),
             database: fixture.database.clone(),
             sql: query,

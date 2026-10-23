@@ -5,6 +5,7 @@ use serde_json::Value as JsonValue;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SqlText {
     pub sql: String,
     #[serde(default)]
@@ -13,6 +14,7 @@ pub struct SqlText {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ParamBind {
     pub name: String,
     pub value: JsonValue,
@@ -20,6 +22,7 @@ pub struct ParamBind {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct BindRequest {
     pub sql: String,
     pub engine: Engine,
@@ -29,6 +32,7 @@ pub struct BindRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Snippet {
     pub id: String,
     pub name: String,
@@ -41,6 +45,7 @@ pub struct Snippet {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct GridResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<JsonValue>>,
@@ -50,6 +55,7 @@ pub struct GridResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ErTable {
     pub name: String,
     pub columns: Vec<ColumnMeta>,
@@ -57,6 +63,7 @@ pub struct ErTable {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ErEdge {
     pub from_table: String,
     pub from_column: String,
@@ -66,6 +73,7 @@ pub struct ErEdge {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ErGraph {
     pub tables: Vec<ErTable>,
     pub edges: Vec<ErEdge>,
@@ -74,6 +82,7 @@ pub struct ErGraph {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ObjectRef {
     pub connection_id: String,
     #[serde(default)]
@@ -86,6 +95,7 @@ pub struct ObjectRef {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FileExportRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -99,6 +109,7 @@ pub struct FileExportRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FileExportResult {
     pub path: String,
     pub row_count: u64,
@@ -109,6 +120,7 @@ pub struct FileExportResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FileImportRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -122,6 +134,7 @@ pub struct FileImportRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct PairRequest {
     pub source_id: String,
     #[serde(default)]
@@ -150,6 +163,7 @@ pub struct PairRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DiffResult {
     pub sql: String,
     pub notes: Vec<String>,
@@ -159,6 +173,7 @@ pub struct DiffResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SyncResult {
     pub inserted: usize,
     pub updated: usize,
@@ -169,6 +184,7 @@ pub struct SyncResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct BackupRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -183,6 +199,7 @@ pub struct BackupRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct RestoreRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -192,6 +209,7 @@ pub struct RestoreRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct GenerateRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -204,6 +222,7 @@ pub struct GenerateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct MaskRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -216,6 +235,7 @@ pub struct MaskRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Job {
     pub id: String,
     #[serde(default)]
@@ -253,6 +273,7 @@ fn default_interval() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Dashboard {
     pub id: String,
     pub name: String,
@@ -262,6 +283,7 @@ pub struct Dashboard {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ModelAttr {
     pub name: String,
     #[serde(default)]
@@ -278,6 +300,7 @@ fn yes() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ModelEntity {
     pub name: String,
     #[serde(default)]
@@ -286,6 +309,7 @@ pub struct ModelEntity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ModelRel {
     pub from_entity: String,
     pub to_entity: String,
@@ -299,6 +323,7 @@ pub struct ModelRel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DataModel {
     pub id: String,
     pub name: String,
@@ -313,6 +338,7 @@ pub struct DataModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Favorite {
     pub id: String,
     pub connection_id: String,
@@ -327,12 +353,14 @@ pub struct Favorite {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AiSettingsRequest {
     #[serde(default)]
     pub endpoint: String,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub api_key: Option<String>,
     #[serde(default)]
     pub clear_key: bool,
@@ -340,6 +368,7 @@ pub struct AiSettingsRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AiSettingsPublic {
     pub endpoint: String,
     pub model: String,
@@ -348,6 +377,7 @@ pub struct AiSettingsPublic {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AiAskRequest {
     pub task: String,
     #[serde(default)]
@@ -366,6 +396,7 @@ pub struct AiAskRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DesignColumn {
     pub name: String,
     #[serde(default)]
@@ -378,6 +409,7 @@ pub struct DesignColumn {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DesignRequest {
     pub engine: Engine,
     #[serde(default)]
@@ -394,6 +426,7 @@ pub struct DesignRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct MailSettings {
     #[serde(default)]
     pub host: String,
@@ -415,6 +448,7 @@ pub(super) fn default_mail_port() -> u16 {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct MailSave {
     #[serde(default)]
     pub host: String,
@@ -434,6 +468,7 @@ pub struct MailSave {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DebugReport {
     pub available: bool,
     pub message: String,
@@ -442,6 +477,7 @@ pub struct DebugReport {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ForeignKeyRef {
     pub column: String,
     pub ref_schema: String,

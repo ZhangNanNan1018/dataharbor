@@ -31,3 +31,8 @@ cargo test --lib --locked
 ## 发布
 
 CI 检查与安装包工作流见 `.github/workflows/`。手动触发的安装包工作流仅上传预览产物，不发布 GitHub Release。上传前应人工确认授权、平台启动、数据库验证矩阵及已知限制，正式分发另行配置代码签名和 macOS 公证。
+
+
+修改 Rust 传输类型、命令或引擎能力后，运行 `npm run contracts:generate` 并提交 `src/generated/contracts.ts`。`npm run check` 执行前端回归、生产构建和契约检查；完整数据库回归仍按测试说明运行。CI 保持手动触发，普通 Rust 测试包含契约一致性检查。
+
+Windows 真实桌面检查脚本为 `tests/desktop/smoke.cjs`，需要使用测试说明中的独立配置及 WebView 目录。测试脚本会修改示例 SQLite，不能连接用户保存的业务连接。

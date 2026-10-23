@@ -66,6 +66,9 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
         let offset = page_offset(page, page_size)?;
         let sql = paginate_sql(engine, &plan.select_body, page_size, offset);
         let outcome = session.execute(&request.database, &sql, Some(page_size as usize))?;
+        if outcome.truncated {
+            return Err(AppError::msg("当前页数据体积超过读取预算，请减少每页行数或改用按需查询；未返回不完整的可编辑页面"));
+        }
         let count = session.execute(&request.database, &plan.count_sql, Some(1))?;
         let total = count
             .rows
@@ -80,7 +83,7 @@ pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<Data
             total,
             page,
             page_size,
-            read_only: plan.read_only,
+            read_only: plan.read_only || !engine.capabilities().atomic_writes,
         })
     })
 }
@@ -283,11 +286,13 @@ pub(crate) fn export_sql_csv_with_operation(
     if !crate::sqlutil::is_read_query(sql) {
         return Err(AppError::msg("SQL 导出仅接受 SELECT 或只读 CTE 查询；写语句和含写操作的 CTE 已拒绝，避免导出时再次修改数据库"));
     }
-    state.with_session_operation(
+    state.with_query_session(
         &request.connection_id,
         &request.database,
+        request.session_id.as_deref(),
         operation,
         |session| {
+            let _interrupt = operation.bind_interrupt(session.cancel_handle(&request.database)?)?;
             let read_limit = EXPORT_CAP as usize + 1;
             let mut outcome = if let Some(paged) =
                 paginate_query_sql(session.engine(), sql, read_limit as u32, 0)

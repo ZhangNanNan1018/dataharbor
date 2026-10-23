@@ -3,8 +3,9 @@ use crate::models::{Engine, StoredProfile};
 use crate::state::AppState;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn profile_of(state: &AppState, id: &str) -> AppResult<StoredProfile> {
@@ -45,31 +46,12 @@ pub(super) fn read_vec<T: serde::de::DeserializeOwned>(
     state: &AppState,
     name: &str,
 ) -> AppResult<Vec<T>> {
-    let path = state.config_dir().join(name);
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(AppError::msg(format!(
-                "无法读取 {name}，原配置已保留：{err}"
-            )))
-        }
-    };
-    serde_json::from_str(&text)
-        .map_err(|err| AppError::msg(format!("{name} 无法解析，已停止更新以保留原文件：{err}")))
+    let _guard = store_lock(state, name)?;
+    crate::persistence::read_collection(state.config_dir(), name)
 }
 
-pub(super) fn store_lock(state: &AppState, name: &str) -> AppResult<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(state.config_dir().join(format!("{name}.lock")))
-        .map_err(|err| AppError::msg(format!("无法锁定 {name}：{err}")))?;
-    file.lock()
-        .map_err(|err| AppError::msg(format!("无法锁定 {name}：{err}")))?;
-    Ok(file)
+pub(super) fn store_lock(state: &AppState, _name: &str) -> AppResult<File> {
+    crate::persistence::lock(state.config_dir())
 }
 
 pub(super) fn update_vec<T, R>(
@@ -81,15 +63,15 @@ where
     T: Serialize + serde::de::DeserializeOwned,
 {
     let _lock = store_lock(state, name)?;
-    let mut items = read_vec(state, name)?;
+    let mut items = crate::persistence::read_collection(state.config_dir(), name)?;
     let result = update(&mut items)?;
-    write_json_unlocked(state, name, &items)?;
+    write_json_unlocked(state, name, &crate::persistence::collection(&items)?)?;
     Ok(result)
 }
 
 #[cfg(test)]
 pub(super) fn write_vec<T: Serialize>(state: &AppState, name: &str, items: &[T]) -> AppResult<()> {
-    write_json(state, name, items)
+    write_json(state, name, &crate::persistence::collection(items)?)
 }
 
 #[cfg(test)]
@@ -107,25 +89,7 @@ pub(super) fn write_json_unlocked<T: Serialize + ?Sized>(
     name: &str,
     value: &T,
 ) -> AppResult<()> {
-    let path = state.config_dir().join(name);
-    let text = serde_json::to_string_pretty(value).map_err(|err| AppError::msg(err.to_string()))?;
-    let tmp = state
-        .config_dir()
-        .join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        if path.exists() {
-            fs::copy(&path, state.config_dir().join(format!("{name}.bak")))?;
-        }
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result.map_err(|err: std::io::Error| AppError::msg(format!("保存 {name} 失败：{err}")))
+    crate::persistence::write_json(&state.config_dir().join(name), value)
 }
 
 pub(super) fn now_secs() -> u64 {
@@ -190,8 +154,10 @@ mod tests {
             let mut values: Vec<u32> = read_vec(&state, "items.json").unwrap();
             values.sort();
             assert_eq!(values, (0..12).collect::<Vec<_>>());
-            let backup: Vec<u32> =
-                serde_json::from_slice(&fs::read(dir.join("items.json.bak")).unwrap()).unwrap();
+            let backup: Vec<u32> = crate::persistence::decode_collection(
+                &fs::read(dir.join("items.json.bak")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(backup.len(), 11);
         }
         fs::remove_dir_all(dir).unwrap();

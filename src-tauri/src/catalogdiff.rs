@@ -31,6 +31,7 @@ pub struct ObjectSnap {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SyncStatement {
     pub id: String,
     pub kind: String,

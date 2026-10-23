@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use ::postgres::Client;
+use tokio_postgres::Client;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -21,6 +21,7 @@ pub struct DebugSlot {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DebugCell {
     pub name: String,
     pub value: String,
@@ -29,9 +30,11 @@ pub struct DebugCell {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DebugSnapshot {
     pub status: String,
     pub function: String,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub line: Option<i64>,
     pub message: String,
     pub variables: Vec<DebugCell>,

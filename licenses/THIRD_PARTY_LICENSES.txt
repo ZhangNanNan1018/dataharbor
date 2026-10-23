@@ -404,7 +404,6 @@ cargo:portable-atomic@1.15.0 | declared license: Apache-2.0 OR MIT | repository:
 cargo:postgres-native-tls@0.5.3 | declared license: MIT OR Apache-2.0 | repository: https://github.com/rust-postgres/rust-postgres
 cargo:postgres-protocol@0.6.12 | declared license: MIT OR Apache-2.0 | repository: https://github.com/rust-postgres/rust-postgres
 cargo:postgres-types@0.2.14 | declared license: MIT OR Apache-2.0 | repository: https://github.com/rust-postgres/rust-postgres
-cargo:postgres@0.19.14 | declared license: MIT OR Apache-2.0 | repository: https://github.com/rust-postgres/rust-postgres
 cargo:potential_utf@0.1.6 | declared license: Unicode-3.0 | repository: https://github.com/unicode-org/icu4x
 cargo:powerfmt@0.2.1 | declared license: MIT OR Apache-2.0 | repository: https://github.com/jhpratt/powerfmt
 cargo:ppv-lite86@0.2.21 | declared license: MIT OR Apache-2.0 | repository: https://github.com/cryptocorrosion/cryptocorrosion
@@ -594,6 +593,8 @@ cargo:tray-icon@0.25.1 | declared license: MIT OR Apache-2.0 | repository: https
 cargo:trust-dns-proto@0.21.2 | declared license: MIT/Apache-2.0 | repository: https://github.com/bluejekyll/trust-dns
 cargo:trust-dns-resolver@0.21.2 | declared license: MIT/Apache-2.0 | repository: https://github.com/bluejekyll/trust-dns
 cargo:try-lock@0.2.5 | declared license: MIT | repository: https://github.com/seanmonstar/try-lock
+cargo:ts-rs-macros@12.0.1 | declared license: MIT | repository: https://github.com/Aleph-Alpha/ts-rs
+cargo:ts-rs@12.0.1 | declared license: MIT | repository: https://github.com/Aleph-Alpha/ts-rs
 cargo:ttf-parser@0.19.2 | declared license: MIT OR Apache-2.0 | repository: https://github.com/RazrFalcon/ttf-parser
 cargo:twox-hash@2.1.5 | declared license: MIT | repository: https://github.com/shepmaster/twox-hash
 cargo:typed-builder@0.10.0 | declared license: MIT/Apache-2.0 | repository: https://github.com/idanarye/rust-typed-builder
@@ -1019,6 +1020,14 @@ cargo:selectors@0.38.0
 cargo:tauri-plugin@2.7.2
   declared license: Apache-2.0 OR MIT
   repository: https://github.com/tauri-apps/tauri
+  - 未找到授权原文；metadata 中的 license 不能替代完整授权文本
+cargo:ts-rs-macros@12.0.1
+  declared license: MIT
+  repository: https://github.com/Aleph-Alpha/ts-rs
+  - 未找到授权原文；metadata 中的 license 不能替代完整授权文本
+cargo:ts-rs@12.0.1
+  declared license: MIT
+  repository: https://github.com/Aleph-Alpha/ts-rs
   - 未找到授权原文；metadata 中的 license 不能替代完整授权文本
 cargo:wasite@1.0.2
   declared license: Apache-2.0 OR BSL-1.0 OR MIT
@@ -9145,7 +9154,6 @@ Sources:
   cargo:postgres-native-tls@0.5.3/LICENSE-MIT
   cargo:postgres-protocol@0.6.12/LICENSE-MIT
   cargo:postgres-types@0.2.14/LICENSE-MIT
-  cargo:postgres@0.19.14/LICENSE-MIT
   cargo:tokio-postgres@0.7.18/LICENSE-MIT
 
 The MIT License (MIT)
@@ -18411,7 +18419,6 @@ Sources:
   cargo:postgres-native-tls@0.5.3/LICENSE-APACHE
   cargo:postgres-protocol@0.6.12/LICENSE-APACHE
   cargo:postgres-types@0.2.14/LICENSE-APACHE
-  cargo:postgres@0.19.14/LICENSE-APACHE
   cargo:regex-automata@0.4.18/LICENSE-APACHE
   cargo:regex-syntax@0.8.11/LICENSE-APACHE
   cargo:regex@1.13.1/LICENSE-APACHE

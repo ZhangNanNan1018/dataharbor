@@ -1,6 +1,6 @@
 use tauri::Manager;
 
-use crate::data::{commit_changes as commit_rows, fetch_rows as load_rows};
+use crate::data::fetch_rows as load_rows;
 use crate::error::AppResult;
 use crate::models::{
     AppInfo, ColumnMeta, CommitRequest, CommitResult, ConnectResult, ConnectionPublic, DataPage,
@@ -31,6 +31,10 @@ async fn run_operation<T: Send + 'static>(
         Some(id) => app.state::<AppState>().operations.claim(&id)?,
         None => OperationContext::detached(),
     };
+    if let Err(error) = operation.record(&app.state::<AppState>().history, None) {
+        operation.finish::<()>(&Err(crate::error::AppError::msg(error.to_string())));
+        return Err(error);
+    }
     let worker = operation.clone();
     let result = run_blocking(move || {
         worker.checkpoint()?;
@@ -211,6 +215,16 @@ pub async fn list_columns(
 }
 
 #[tauri::command]
+pub async fn list_run_history(app: tauri::AppHandle) -> AppResult<Vec<crate::run_history::RunRecord>> {
+    run_blocking(move || app.state::<AppState>().history.list()).await
+}
+
+#[tauri::command]
+pub async fn close_query_session(app: tauri::AppHandle, session_id: String) -> AppResult<()> {
+    run_blocking(move || { app.state::<AppState>().close_query_session(&session_id); Ok(()) }).await
+}
+
+#[tauri::command]
 pub async fn execute_sql(
     app: tauri::AppHandle,
     request: ExecuteSqlRequest,
@@ -248,9 +262,8 @@ pub async fn commit_changes(
     app: tauri::AppHandle,
     request: CommitRequest,
 ) -> AppResult<CommitResult> {
-    run_blocking(move || {
-        let state = app.state::<AppState>();
-        commit_rows(&state, request)
+    run_operation(app, None, move |state, operation| {
+        crate::data::commit_changes_with_operation(state, request, operation)
     })
     .await
 }

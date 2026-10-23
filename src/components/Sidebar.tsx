@@ -118,7 +118,7 @@ export function Sidebar({ width }: { width: number }) {
       }));
     }
     if (meta.kind === "database" && meta.connectionId && meta.engine && meta.database) {
-      if (meta.engine === "postgres" || meta.engine === "mssql" || meta.engine === "oracle") {
+      if (usesSchema(meta.engine)) {
         const schemas = await api.listSchemas(meta.connectionId, meta.database);
         return schemas.map((schema) => ({
           key: nodeKey("schema", meta.connectionId!, meta.database!, schema),

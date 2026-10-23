@@ -40,8 +40,8 @@ export function GenerateMask() {
         <Button disabled={!ref.id || !ref.table} onClick={() => void mask().catch((err) => message.error(errorText(err)))}>脱敏</Button>
       </Space>
       <Space>
-        <Button onClick={() => void api.dataDictionary({ connectionId: ref.id, database: ref.database, schema: ref.schema }).then(setDoc).catch((err) => message.error(errorText(err)))}>数据字典</Button>
-        <Button onClick={() => void api.analyzeSchema({ connectionId: ref.id, database: ref.database, schema: ref.schema }).then(setAnalysis).catch((err) => message.error(errorText(err)))}>结构分析</Button>
+        <Button onClick={() => void api.dataDictionary({ connectionId: ref.id, database: ref.database, schema: ref.schema, table: "" }).then(setDoc).catch((err) => message.error(errorText(err)))}>数据字典</Button>
+        <Button onClick={() => void api.analyzeSchema({ connectionId: ref.id, database: ref.database, schema: ref.schema, table: "" }).then(setAnalysis).catch((err) => message.error(errorText(err)))}>结构分析</Button>
       </Space>
       {doc && <Input.TextArea rows={12} value={doc} readOnly />}
       <Grid result={analysis} />
@@ -87,8 +87,8 @@ export function CatalogSearch() {
         if (patch.schema !== undefined) setSchema(patch.schema);
       }} />
       <Space>
-        <Input value={query} placeholder="表名或列名" onChange={(event) => setQuery(event.target.value)} onPressEnter={() => id && void api.searchCatalog({ connectionId: id, database, schema }, query).then(setGrid).catch((err) => message.error(errorText(err)))} />
-        <Button type="primary" onClick={() => id && void api.searchCatalog({ connectionId: id, database, schema }, query).then(setGrid).catch((err) => message.error(errorText(err)))}>搜索</Button>
+        <Input value={query} placeholder="表名或列名" onChange={(event) => setQuery(event.target.value)} onPressEnter={() => id && void api.searchCatalog({ connectionId: id, database, schema, table: "" }, query).then(setGrid).catch((err) => message.error(errorText(err)))} />
+        <Button type="primary" onClick={() => id && void api.searchCatalog({ connectionId: id, database, schema, table: "" }, query).then(setGrid).catch((err) => message.error(errorText(err)))}>搜索</Button>
       </Space>
       <Grid result={grid} onOpen={(row) => {
         const table = String(row[1] ?? "");

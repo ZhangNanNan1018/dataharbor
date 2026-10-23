@@ -16,48 +16,31 @@ use crate::models::{
 use crate::store;
 use crate::tunnel::TunnelGuard;
 
-pub struct SessionSlot {
-    pub inner: Mutex<Box<dyn DbSession>>,
-    pub tunnel: Vec<TunnelGuard>,
-    pub live: SessionConfig,
-}
-
-/// A task owns its database transaction and pins any SSH/HTTP tunnel until it ends.
-pub(crate) struct IsolatedSession {
-    inner: Box<dyn DbSession>,
-    _owner: Arc<SessionSlot>,
-}
-impl std::ops::Deref for IsolatedSession {
-    type Target = dyn DbSession;
-    fn deref(&self) -> &Self::Target {
-        &*self.inner
-    }
-}
-impl std::ops::DerefMut for IsolatedSession {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.inner
-    }
-}
-
-impl SessionSlot {
-    pub fn tunnel_count(&self) -> usize {
-        self.tunnel.len()
-    }
-}
+mod sessions;
+pub(crate) use sessions::IsolatedSession;
+use sessions::{ConnectionLocks, QuerySessions, SessionSlot};
 
 pub struct AppState {
     pub(crate) operations: crate::operations::OperationManager,
+    pub(crate) history: crate::run_history::RunHistory,
     config_dir: PathBuf,
     cipher: CredentialCipher,
     key_source: KeySource,
     profiles: Mutex<Vec<StoredProfile>>,
-    session_lifecycle: Mutex<()>,
+    session_lifecycle: ConnectionLocks,
+    query_sessions: QuerySessions,
     sessions: Mutex<HashMap<String, Arc<SessionSlot>>>,
     debuggers: Mutex<HashMap<String, crate::pldbg::DebugSlot>>,
 }
 
 impl AppState {
     pub fn initialize() -> AppResult<Self> {
+        // Desktop smoke tests use a disposable profile and file key. This override
+        // is absent from release builds and never changes the user's OS keyring.
+        #[cfg(debug_assertions)]
+        if let Some(directory) = std::env::var_os("DATAHARBOR_TEST_CONFIG_DIR") {
+            return Self::open_in(PathBuf::from(directory), true);
+        }
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         crate::migrate::prepare_local_data(&base)?;
         Self::open_in(base.join(crate::migrate::CONFIG_DIR_NAME), false)
@@ -66,15 +49,19 @@ impl AppState {
     pub fn open_in(dir: PathBuf, force_file: bool) -> AppResult<Self> {
         fs::create_dir_all(&dir)
             .map_err(|err| AppError::msg(format!("无法创建配置目录: {err}")))?;
+        let store_guard = crate::persistence::lock(&dir)?;
         let (cipher, key_source) = crypto::load_or_create_cipher(&dir, force_file)?;
         let profiles = store::load_profiles(&dir)?;
+        drop(store_guard);
         Ok(Self {
             operations: crate::operations::OperationManager::default(),
+            history: crate::run_history::RunHistory::open(dir.join("runs"))?,
             config_dir: dir,
             cipher,
             key_source,
             profiles: Mutex::new(profiles),
-            session_lifecycle: Mutex::new(()),
+            session_lifecycle: ConnectionLocks::default(),
+            query_sessions: QuerySessions::default(),
             sessions: Mutex::new(HashMap::new()),
             debuggers: Mutex::new(HashMap::new()),
         })
@@ -146,7 +133,8 @@ impl AppState {
         };
         let now = now_string();
 
-        let _lifecycle = lock(&self.session_lifecycle);
+        let lifecycle = self.session_lifecycle.for_id(request.id.as_deref().unwrap_or(""));
+        let _lifecycle = lock(&lifecycle);
         let _file_lock = self.profile_store_lock()?;
         let mut cached_profiles = lock(&self.profiles);
         let mut profiles = store::load_profiles(&self.config_dir)?;
@@ -306,7 +294,8 @@ impl AppState {
     }
 
     pub fn delete_connection(&self, id: &str) -> AppResult<()> {
-        let _lifecycle = lock(&self.session_lifecycle);
+        let lifecycle = self.session_lifecycle.for_id(id);
+        let _lifecycle = lock(&lifecycle);
         let _file_lock = self.profile_store_lock()?;
         let mut cached_profiles = lock(&self.profiles);
         let mut profiles = store::load_profiles(&self.config_dir)?;
@@ -342,7 +331,8 @@ impl AppState {
     }
 
     pub fn connect(&self, id: &str) -> AppResult<ConnectResult> {
-        let _lifecycle = lock(&self.session_lifecycle);
+        let lifecycle = self.session_lifecycle.for_id(id);
+        let _lifecycle = lock(&lifecycle);
         let profile = self.profile_by_id(id)?;
         if lock(&self.sessions).contains_key(id) {
             match self.with_session(id, |session| session.version()) {
@@ -382,7 +372,8 @@ impl AppState {
     }
 
     pub fn disconnect(&self, id: &str) {
-        let _lifecycle = lock(&self.session_lifecycle);
+        let lifecycle = self.session_lifecycle.for_id(id);
+        let _lifecycle = lock(&lifecycle);
         self.drop_session(id);
     }
 
@@ -429,16 +420,7 @@ impl AppState {
     }
 
     fn profile_store_lock(&self) -> AppResult<fs::File> {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.config_dir.join("connections.json.lock"))
-            .map_err(|err| AppError::msg(format!("无法锁定连接配置：{err}")))?;
-        file.lock()
-            .map_err(|err| AppError::msg(format!("无法锁定连接配置：{err}")))?;
-        Ok(file)
+        crate::persistence::lock(&self.config_dir)
     }
 
     pub(crate) fn config_dir(&self) -> &std::path::Path {
@@ -457,10 +439,7 @@ impl AppState {
         lock(&self.profiles).clone()
     }
 
-    pub(crate) fn import_profiles(&self, extra: Vec<StoredProfile>) -> AppResult<(usize, usize)> {
-        let _lifecycle = lock(&self.session_lifecycle);
-        let _file_lock = self.profile_store_lock()?;
-        let mut cached_profiles = lock(&self.profiles);
+    pub(crate) fn prepare_profile_import(&self, extra: Vec<StoredProfile>) -> AppResult<(Vec<StoredProfile>, usize, usize)> {
         let mut profiles = store::load_profiles(&self.config_dir)?;
         let mut added = 0;
         let mut needs_credentials = 0;
@@ -479,10 +458,12 @@ impl AppState {
             profiles.push(item);
             added += 1;
         }
-        store::save_profiles(&self.config_dir, &profiles)?;
-        *cached_profiles = profiles;
-        drop(cached_profiles);
-        Ok((added, needs_credentials))
+        Ok((profiles, added, needs_credentials))
+    }
+
+    pub(crate) fn refresh_profiles(&self) -> AppResult<()> {
+        *lock(&self.profiles) = store::load_profiles(&self.config_dir)?;
+        Ok(())
     }
 
     pub(crate) fn session_config_for(&self, id: &str) -> AppResult<SessionConfig> {
@@ -548,24 +529,6 @@ impl AppState {
         };
         operation.checkpoint()?;
         f(&mut **session)
-    }
-
-    pub(crate) fn open_isolated_session(&self, id: &str) -> AppResult<IsolatedSession> {
-        let existing = { lock(&self.sessions).get(id).cloned() };
-        let slot = if let Some(slot) = existing {
-            slot
-        } else {
-            self.connect(id)?;
-            lock(&self.sessions)
-                .get(id)
-                .cloned()
-                .ok_or_else(|| AppError::msg("连接已关闭"))?
-        };
-        let inner = drivers::open_session(&slot.live)?;
-        Ok(IsolatedSession {
-            inner,
-            _owner: slot,
-        })
     }
 
     fn profile_by_id(&self, id: &str) -> AppResult<StoredProfile> {
@@ -688,6 +651,7 @@ impl AppState {
 
     fn drop_session(&self, id: &str) {
         crate::pldbg::discard(self, id);
+        self.query_sessions.remove_connection(id);
         lock(&self.sessions).remove(id);
     }
 }
@@ -1149,7 +1113,7 @@ mod tests {
         reopened.connect(&id).unwrap();
         let created = execute_sql(
             &reopened,
-            crate::models::ExecuteSqlRequest {
+            crate::models::ExecuteSqlRequest { session_id: None,
                 connection_id: id.clone(),
                 database: "main".into(),
                 sql: "CREATE TABLE goods (id INTEGER PRIMARY KEY, name TEXT, price REAL);\
@@ -1229,7 +1193,7 @@ mod tests {
 
         let queried = execute_sql(
             &reopened,
-            crate::models::ExecuteSqlRequest {
+            crate::models::ExecuteSqlRequest { session_id: None,
                 connection_id: id.clone(),
                 database: "main".into(),
                 sql: "SELECT name, price FROM goods WHERE name = '红茶'".into(),
@@ -1312,7 +1276,7 @@ mod tests {
         state.connect(&id).unwrap();
         execute_sql(
             &state,
-            crate::models::ExecuteSqlRequest {
+            crate::models::ExecuteSqlRequest { session_id: None,
                 connection_id: id.clone(),
                 database: "main".into(),
                 sql: "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);\

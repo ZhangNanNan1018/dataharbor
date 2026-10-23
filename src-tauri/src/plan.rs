@@ -3,10 +3,13 @@ use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct PlanNode {
     pub label: String,
     pub detail: String,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub cost: Option<f64>,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub rows: Option<f64>,
     pub children: Vec<PlanNode>,
 }

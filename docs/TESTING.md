@@ -128,3 +128,36 @@ python -m pip install paramiko==5.0.0
 cd src-tauri
 cargo test --lib --locked tunnel:: -- --include-ignored --test-threads=1
 ```
+
+## 架构边界修复验收（2026-10-23）
+
+本轮在 Windows 上验证，业务配置及业务数据库未用于测试。
+
+- `cargo test --lib --locked -- --include-ignored --test-threads=1`：207 项全部通过，无跳过。外部服务使用单独 Compose 项目中的 MySQL 8.4、PostgreSQL 16、MongoDB 7、Redis 7；SSH 使用本机临时协议夹具。
+- `npm test`：8 个文件、67 项通过；TypeScript 检查及生产构建通过。
+- `cargo build --bin dataharbor --locked`：Windows 调试二进制构建通过。
+- 新增覆盖：双控制台事务隔离、临时表与查询导出的会话归属、关闭会话拒绝排队 SQL、独立任务与编辑器快照、PostgreSQL 大结果流及超宽分页拒绝、项目全量预检/提交恢复、旧配置升级/未来版本拒绝、执行租约与异常任务暂停、配置写回失败不重放、前后端契约一致性、面板异常隔离。
+- 真实 Tauri/WebView2 桌面：使用 Monaco 键盘输入执行 SQLite 脚本；A 未提交修改对 B 不可见，B COMMIT 被拒绝，A 提交后 B 读到新值；执行记录经真实 IPC 保存并在界面展示。500 行页面实际保留 12 个渲染行，滚动至第 500 行成功。脚本为 `tests/desktop/smoke.cjs`。
+- PostgreSQL 独立测试进程额外启用 `DATAHARBOR_MEMORY_PROBE=1`：流式消费 512 MiB 行文本，只保留 17 行；同时验证 64 MiB 宽行结果受字节预算限制、截断后连接可继续执行、状态函数未被重放或提前停止。Windows 以 `PeakWorkingSet64` 采样，测试进程峰值约 **47.45 MiB**，运行约 **4.12 秒**。这不代表完整桌面程序的内存或所有数据库的性能；协议解码的一条超宽行仍可能短暂超过保留预算。
+- 第三方授权重新生成：858 项依赖、441 份去重授权文本，52 项仍需人工核对；生成成功不代表授权审计完成。
+
+Windows 桌面复测需先构建调试二进制并启动 `npm run dev`，然后为测试进程设置独立目录。`DATAHARBOR_TEST_CONFIG_DIR` 仅调试构建识别，使用本地测试密钥，不读取或更新用户系统凭据：
+
+```powershell
+$smokeRoot = Join-Path $env:TEMP ('dataharbor-desktop-smoke-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+$smokeScript = (Resolve-Path tests/desktop/smoke.cjs).Path
+$env:DATAHARBOR_TEST_CONFIG_DIR = Join-Path $smokeRoot 'config'
+$env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $smokeRoot 'webview'
+$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9224'
+$desktopProcess = Start-Process -FilePath (Resolve-Path src-tauri/target/debug/dataharbor.exe).Path -WindowStyle Hidden -PassThru
+Set-Location $smokeRoot
+playwright-cli -s=dataharbor-test attach --cdp=http://127.0.0.1:9224
+playwright-cli -s=dataharbor-test run-code "--filename=$smokeScript"
+playwright-cli -s=dataharbor-test detach
+Stop-Process -Id $desktopProcess.Id
+```
+
+确认 1420 和 9224 端口没有被其他应用使用。脚本只接受独立测试目录中的 SQLite 连接，会重置测试标记表并生成截图；关闭窗口进入托盘不等于测试进程退出。
+
+CI 继续仅手动触发。本轮未执行远程工作流、正式签名安装包、macOS/Linux 桌面或 SQL Server/Oracle/达梦/Snowflake 的实机验收。生产构建仍有 Monaco 等大块提示，实际冷启动与完整应用多标签内存尚未建立统一基准。

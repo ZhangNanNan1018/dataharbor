@@ -21,7 +21,7 @@ export function ErView() {
     if (!id) return;
     try {
       await api.connect(id);
-      const next = await api.erDiagram({ connectionId: id, database, schema });
+      const next = await api.erDiagram({ connectionId: id, database, schema, table: "" });
       setGraph(next);
       const saved = readLayout(layoutKey);
       const placed: Record<string, { x: number; y: number }> = {};
@@ -186,7 +186,7 @@ export function ModelStudio() {
         if (patch.schema !== undefined) setSchema(patch.schema);
       }} />
       <Space wrap>
-        <Button onClick={() => void api.reverseModel({ connectionId: id || "", database, schema }, "反向模型").then(async (model) => { setCurrent({ ...model, level }); setModels(await api.listModels()); }).catch((err) => message.error(errorText(err)))}>反向工程</Button>
+        <Button onClick={() => void api.reverseModel({ connectionId: id || "", database, schema, table: "" }, "反向模型").then(async (model) => { setCurrent({ ...model, level }); setModels(await api.listModels()); }).catch((err) => message.error(errorText(err)))}>反向工程</Button>
         <Button onClick={() => void (async () => {
           const model = current ?? { id: "", name: "新模型", level, note: "", entities: [{ name: "Entity", attributes: [{ name: "id", dataType: "INTEGER", pk: true, nullable: false }] }], relations: [] };
           const saved = await api.saveModel({ ...model, level });

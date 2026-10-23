@@ -1,12 +1,13 @@
-use super::backup::backup_sql;
-use super::file_io::export_file;
+use super::backup::backup_sql_with_operation;
+use super::file_io::export_file_with_operation;
 use super::storage::{now_secs, store_lock, write_json_unlocked};
 use super::types::{
     default_mail_port, BackupRequest, FileExportRequest, Job, MailSave, MailSettings,
 };
 use crate::error::{AppError, AppResult};
 use crate::models::ExecuteSqlRequest;
-use crate::query::execute_sql;
+use crate::query::execute_sql_with_operation;
+use crate::operations::OperationContext;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -14,13 +15,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 fn read_jobs(state: &AppState) -> AppResult<Vec<Job>> {
-    let path = state.config_dir().join("jobs.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = fs::read_to_string(path).map_err(|err| AppError::msg(err.to_string()))?;
-    serde_json::from_str(&text)
-        .map_err(|err| AppError::msg(format!("任务文件无法读取，已停止更新以保留原文件：{err}")))
+    crate::persistence::read_collection(state.config_dir(), "jobs.json")
 }
 
 pub fn list_jobs(state: &AppState) -> AppResult<Vec<Job>> {
@@ -35,7 +30,7 @@ pub(super) fn update_jobs<T>(
     let _guard = store_lock(state, "jobs.json")?;
     let mut jobs = read_jobs(state)?;
     let result = update(&mut jobs)?;
-    write_json_unlocked(state, "jobs.json", &jobs)?;
+    write_json_unlocked(state, "jobs.json", &crate::persistence::collection(&jobs)?)?;
     Ok(result)
 }
 
@@ -71,7 +66,7 @@ pub fn delete_job(state: &AppState, id: &str) -> AppResult<()> {
 }
 
 pub fn run_due_jobs(state: &AppState) -> AppResult<Vec<String>> {
-    let results = run_due_jobs_with(state, |job| execute_job(state, job))?;
+    let results = run_due_jobs_with(state, |job, operation| execute_job(state, job, operation))?;
     summarize_runs(results)
 }
 
@@ -99,7 +94,7 @@ struct JobRun {
 
 fn run_due_jobs_with(
     state: &AppState,
-    mut execute: impl FnMut(&Job) -> AppResult<String>,
+    mut execute: impl FnMut(&Job, &OperationContext) -> AppResult<String>,
 ) -> AppResult<Vec<JobRun>> {
     let run_lock = fs::OpenOptions::new()
         .read(true)
@@ -115,6 +110,19 @@ fn run_due_jobs_with(
             return Err(AppError::msg(format!("无法锁定任务执行：{err}")))
         }
     }
+    let uncertain = state.history.uncertain_jobs()?;
+    if !uncertain.is_empty() {
+        update_jobs(state, |jobs| {
+            for record in &uncertain {
+                if let Some(job) = jobs.iter_mut().find(|job| Some(&job.id) == record.job_id.as_ref() && Some(&job.revision) == record.revision.as_ref()) {
+                    job.enabled = false;
+                    job.revision = Uuid::new_v4().to_string();
+                    job.last_message = "上次执行异常退出，结果待核对；已暂停自动重试，请核对数据库和输出文件后再启用。".into();
+                }
+            }
+            Ok(())
+        })?;
+    }
     let now = now_secs();
     let snapshots = list_jobs(state)?;
     let mut messages = Vec::new();
@@ -128,13 +136,19 @@ fn run_due_jobs_with(
             continue;
         }
         // Database and mail operations run without holding the storage lock.
-        let result = execute(&snapshot);
+        let created = state.operations.create(format!("计划任务 · {}", snapshot.name));
+        let operation = state.operations.claim(&created.id)?;
+        if let Err(error) = operation.record(&state.history, Some((&snapshot.id, &snapshot.revision))) {
+            operation.finish::<()>(&Err(crate::error::AppError::msg(error.to_string())));
+            return Err(error);
+        }
+        let result = execute(&snapshot, &operation);
         let ok = result.is_ok();
-        let last_message = match result {
-            Ok(text) => text,
+        let last_message = match &result {
+            Ok(text) => text.clone(),
             Err(err) => format!("失败：{err}"),
         };
-        update_jobs(state, |current| {
+        let persisted = update_jobs(state, |current| {
             let Some(job) = current.iter_mut().find(|job| {
                 job.id == snapshot.id && job.enabled && job.revision == snapshot.revision
             }) else {
@@ -144,7 +158,13 @@ fn run_due_jobs_with(
             job.next_run_at = now_secs().saturating_add(job.interval_secs);
             job.revision = Uuid::new_v4().to_string();
             Ok(())
-        })?;
+        });
+        if let Err(error) = persisted {
+            operation.abandon_record();
+            operation.finish::<()>(&Err(AppError::msg(error.to_string())));
+            return Err(error);
+        }
+        operation.finish(&result);
         // Editing a job changes persistence ownership, not the outcome of an operation already run.
         messages.push(JobRun {
             name: snapshot.name,
@@ -155,7 +175,7 @@ fn run_due_jobs_with(
     Ok(messages)
 }
 
-fn execute_job(state: &AppState, job: &Job) -> AppResult<String> {
+fn execute_job(state: &AppState, job: &Job, context: &OperationContext) -> AppResult<String> {
     let mut ids = vec![job.connection_id.clone()];
     for id in &job.profile_ids {
         if !ids.contains(id) {
@@ -170,7 +190,7 @@ fn execute_job(state: &AppState, job: &Job) -> AppResult<String> {
         if index > 0 && !operation.path.is_empty() {
             operation.path = format!("{}-{}", operation.path, id);
         }
-        match run_job_operation(state, &operation) {
+        match run_job_operation(state, &operation, context) {
             Ok(message) => messages.push(format!("{id}: {message}")),
             Err(err) => {
                 failed = true;
@@ -195,7 +215,7 @@ fn execute_job(state: &AppState, job: &Job) -> AppResult<String> {
     }
 }
 
-fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
+fn run_job_operation(state: &AppState, job: &Job, operation: &OperationContext) -> AppResult<String> {
     // Scheduled and desktop jobs share the same authenticated connection path.
     let connection = state.connect(&job.connection_id)?;
     let database = if job.database.is_empty() {
@@ -204,7 +224,7 @@ fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
         job.database.clone()
     };
     match job.kind.as_str() {
-        "backup" => backup_sql(
+        "backup" => backup_sql_with_operation(
             state,
             &BackupRequest {
                 connection_id: job.connection_id.clone(),
@@ -221,6 +241,7 @@ fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
                 },
                 mode: "auto".into(),
             },
+            operation,
         )
         .map(|item| {
             format!(
@@ -234,7 +255,7 @@ fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
                 item.note
             )
         }),
-        "export" => export_file(
+        "export" => export_file_with_operation(
             state,
             FileExportRequest {
                 connection_id: job.connection_id.clone(),
@@ -244,11 +265,12 @@ fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
                 format: "csv".into(),
                 path: job.path.clone(),
             },
+            operation,
         )
         .map(|item| format!("导出 {} 行。{}", item.row_count, item.note)),
-        "query" => execute_sql(
+        "query" => execute_sql_with_operation(
             state,
-            ExecuteSqlRequest {
+            ExecuteSqlRequest { session_id: None,
                 connection_id: job.connection_id.clone(),
                 database,
                 sql: job.sql.clone(),
@@ -256,6 +278,7 @@ fn run_job_operation(state: &AppState, job: &Job) -> AppResult<String> {
                 page_size: 20,
                 only_statement: None,
             },
+            operation,
         )
         .and_then(|response| {
             if let Some(failed) = response.statements.iter().find(|item| !item.ok) {
@@ -412,7 +435,7 @@ mod tests {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     loop {
                         let mut entered = false;
-                        let result = run_due_jobs_with(state_ref, |snapshot| {
+                        let result = run_due_jobs_with(state_ref, |snapshot, _| {
                             entered = true;
                             assert_eq!(snapshot.id, "paused");
                             started_tx.send(()).unwrap();
@@ -445,7 +468,7 @@ mod tests {
                 let project = dir.join("project.json");
                 fs::write(&project, serde_json::to_vec(&json!({ "version": 1, "profiles": [], "snippets": [], "dashboards": [], "models": [], "favorites": [], "jobs": [job("imported")] })).unwrap()).unwrap();
                 import_project(&state, project.to_str().unwrap()).unwrap();
-                assert!(run_due_jobs_with(&state, |_| panic!(
+                assert!(run_due_jobs_with(&state, |_, _| panic!(
                     "parallel execution must be skipped"
                 ))
                 .unwrap()
@@ -500,7 +523,7 @@ mod tests {
         {
             let state = AppState::open_in(dir.clone(), true).unwrap();
             save_job(&state, job("paused-failure")).unwrap();
-            let results = run_due_jobs_with(&state, |snapshot| {
+            let results = run_due_jobs_with(&state, |snapshot, _| {
                 let mut paused = snapshot.clone();
                 paused.enabled = false;
                 paused.last_message = "用户暂停".into();
@@ -589,7 +612,7 @@ mod tests {
         if let Some(dir) = std::env::var_os(ENV) {
             let state = AppState::open_in(dir.into(), true).unwrap();
             assert!(
-                run_due_jobs_with(&state, |_| panic!("another process owns the lock"))
+                run_due_jobs_with(&state, |_, _| panic!("another process owns the lock"))
                     .unwrap()
                     .is_empty()
             );
@@ -617,12 +640,56 @@ mod tests {
                 String::from_utf8_lossy(&child.stdout)
             );
             drop(lock);
-            let result = run_due_jobs_with(&state, |_| Ok("once".into())).unwrap();
+            let result = run_due_jobs_with(&state, |_, _| Ok("once".into())).unwrap();
             assert_eq!(result.len(), 1);
-            assert!(run_due_jobs_with(&state, |_| panic!("already advanced"))
+            assert!(run_due_jobs_with(&state, |_, _| panic!("already advanced"))
                 .unwrap()
                 .is_empty());
         }
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn crashed_schedule_is_paused_until_user_reenables_a_new_revision() {
+        let dir = std::env::temp_dir().join(format!("dataharbor-job-recovery-{}",Uuid::new_v4()));
+        let state = AppState::open_in(dir.clone(),true).unwrap();
+        let saved = save_job(&state,job("recover")).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let lease = state.history.start(&id,Some((&saved.id,&saved.revision))).unwrap();
+        lease.progress("写入事务",500,1).unwrap();
+        drop(lease);
+        assert!(run_due_jobs_with(&state, |_, _| panic!("must not replay uncertain writes")).unwrap().is_empty());
+        let mut paused = list_jobs(&state).unwrap().remove(0);
+        assert!(!paused.enabled);
+        assert!(paused.last_message.contains("结果待核对"));
+        let record = state.history.list().unwrap().remove(0);
+        assert_eq!((record.status.as_str(),record.committed),("unknown",500));
+        paused.enabled = true;
+        paused.next_run_at = 1;
+        save_job(&state,paused).unwrap();
+        assert_eq!(run_due_jobs_with(&state, |_, _| Ok("explicit new run".into())).unwrap().len(),1);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn schedule_write_failure_keeps_the_completed_database_work_uncertain() {
+        let dir = std::env::temp_dir().join(format!("dataharbor-job-store-failure-{}",Uuid::new_v4()));
+        let state = AppState::open_in(dir.clone(),true).unwrap();
+        save_job(&state,job("failure")).unwrap();
+        let before = fs::read(dir.join("jobs.json")).unwrap();
+        let mut calls = 0;
+        assert!(run_due_jobs_with(&state, |_, operation| {
+            calls += 1;
+            operation.committed(3);
+            fs::write(dir.join("jobs.json"), "broken store").unwrap();
+            Ok("database already changed".into())
+        }).is_err());
+        assert_eq!(calls,1);
+        fs::write(dir.join("jobs.json"), before).unwrap();
+        assert!(run_due_jobs_with(&state, |_, _| panic!("must not replay")).unwrap().is_empty());
+        assert!(!list_jobs(&state).unwrap()[0].enabled);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
 }

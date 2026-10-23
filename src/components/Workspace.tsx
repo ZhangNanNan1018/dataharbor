@@ -1,5 +1,6 @@
+import { PanelBoundary } from "./PanelBoundary";
 import { App, Alert, Tabs } from "antd";
-import { lazy, Suspense } from "react";
+import { lazy, memo, Suspense } from "react";
 import { errorText } from "../api";
 import { openSampleBookstore } from "../actions";
 import { useTabStore } from "../stores/useTabStore";
@@ -64,11 +65,11 @@ export function Workspace() {
             });
             return;
           }
-          if (dirty[target]) {
+          if (dirty[target] || tabs.find((tab) => tab.id === target)?.kind === "query") {
             const query = tabs.find((tab) => tab.id === target)?.kind === "query";
             modal.confirm({
               title: query ? "关闭查询草稿？" : "关闭未提交的标签？",
-              content: query ? "关闭后将移除这份 SQL 草稿及其自动恢复记录。" : "未提交的修改会丢失。",
+              content: query ? "关闭后将移除这份 SQL 草稿及其自动恢复记录，并断开此标签的数据库会话；未提交事务将由数据库回滚。" : "未提交的修改会丢失。",
               okText: "关闭",
               cancelText: "留下",
               onOk: () => close(target),
@@ -80,14 +81,14 @@ export function Workspace() {
         items={tabs.map((tab) => ({
           key: tab.id,
           label: dirty[tab.id] ? `${tab.title} *` : tab.title,
-          children: <OperationOwnerContext.Provider value={tab.id}>{renderTab(tab)}</OperationOwnerContext.Provider>,
+          children: <OperationOwnerContext.Provider value={tab.id}><PanelBoundary ownerId={tab.id}><TabContent tab={tab} /></PanelBoundary></OperationOwnerContext.Provider>,
         }))}
       />
     </section>
   );
 }
 
-function renderTab(tab: WorkspaceTab) {
+const TabContent = memo(function TabContent({ tab }: { tab: WorkspaceTab }) {
   switch (tab.kind) {
     case "query":
       return <Suspense fallback={<div className="p-3 text-xs">正在加载查询编辑器…</div>}><QueryPanel tab={tab} /></Suspense>;
@@ -98,4 +99,4 @@ function renderTab(tab: WorkspaceTab) {
     case "placeholder":
       return <StudioPanel tab={tab} />;
   }
-}
+});

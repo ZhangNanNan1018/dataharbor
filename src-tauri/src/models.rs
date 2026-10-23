@@ -3,6 +3,7 @@ use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub enum Engine {
     Mysql,
     Mariadb,
@@ -17,19 +18,7 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn is_sql(self) -> bool {
-        matches!(
-            self,
-            Engine::Mysql
-                | Engine::Mariadb
-                | Engine::Postgres
-                | Engine::Sqlite
-                | Engine::Mssql
-                | Engine::Oracle
-                | Engine::Snowflake
-                | Engine::Dameng
-        )
-    }
+    pub fn is_sql(self) -> bool { self.capabilities().sql }
 
     pub fn default_port(self) -> u16 {
         match self {
@@ -63,6 +52,7 @@ impl Engine {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ColumnMeta {
     pub name: String,
     pub data_type: String,
@@ -70,6 +60,7 @@ pub struct ColumnMeta {
     pub primary_key: bool,
     pub auto_increment: bool,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub default_value: Option<String>,
 }
 
@@ -209,6 +200,7 @@ pub struct SessionConfig {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ConnectionPublic {
     pub id: String,
     pub name: String,
@@ -243,8 +235,10 @@ pub struct ConnectionPublic {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SaveConnectionRequest {
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub id: Option<String>,
     #[serde(default)]
     pub name: String,
@@ -260,6 +254,7 @@ pub struct SaveConnectionRequest {
     #[serde(default)]
     pub username: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub password: Option<String>,
     #[serde(default)]
     pub clear_password: bool,
@@ -280,6 +275,7 @@ pub struct SaveConnectionRequest {
     #[serde(default)]
     pub ssh_username: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub ssh_password: Option<String>,
     #[serde(default)]
     pub clear_ssh_password: bool,
@@ -341,6 +337,7 @@ impl Default for SaveConnectionRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SaveConnectionResult {
     pub connection: ConnectionPublic,
     pub needs_reconnect: bool,
@@ -348,14 +345,17 @@ pub struct SaveConnectionResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct TestResult {
     pub ok: bool,
     pub message: String,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ConnectResult {
     pub id: String,
     pub engine: Engine,
@@ -365,7 +365,11 @@ pub struct ConnectResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExecuteSqlRequest {
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
+    pub session_id: Option<String>,
     pub connection_id: String,
     #[serde(default)]
     pub database: String,
@@ -375,6 +379,7 @@ pub struct ExecuteSqlRequest {
     #[serde(default = "default_page_size")]
     pub page_size: u32,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub only_statement: Option<usize>,
 }
 
@@ -388,14 +393,17 @@ pub fn default_page_size() -> u32 {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct StatementResult {
     pub index: usize,
     pub sql: String,
     pub ok: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub error: Option<String>,
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<JsonValue>>,
     pub rows_affected: u64,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub total_rows: Option<u64>,
     pub page: u32,
     pub page_size: u32,
@@ -408,6 +416,7 @@ pub struct StatementResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExecuteSqlResponse {
     pub statements: Vec<StatementResult>,
     pub stopped: bool,
@@ -415,15 +424,18 @@ pub struct ExecuteSqlResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FilterSpec {
     pub column: String,
     pub op: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct SortSpec {
     pub column: String,
     #[serde(default)]
@@ -432,6 +444,7 @@ pub struct SortSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FetchRowsRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -451,7 +464,9 @@ pub struct FetchRowsRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct DataPage {
+    #[cfg_attr(test, ts(optional = nullable))]
     pub original_rows: Option<Vec<Vec<FieldValue>>>,
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<JsonValue>>,
@@ -463,6 +478,7 @@ pub struct DataPage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct FieldValue {
     pub column: String,
     pub value: JsonValue,
@@ -470,10 +486,12 @@ pub struct FieldValue {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct RowChange {
     pub kind: String,
     /// Values observed by the editor. Used as an optimistic concurrency guard.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub original: Option<Vec<FieldValue>>,
     #[serde(default)]
     pub pk: Vec<FieldValue>,
@@ -483,6 +501,7 @@ pub struct RowChange {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct CommitRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -495,12 +514,14 @@ pub struct CommitRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct CommitResult {
     pub applied: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExportTableRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -517,7 +538,11 @@ pub struct ExportTableRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExportSqlRequest {
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
+    pub session_id: Option<String>,
     pub connection_id: String,
     #[serde(default)]
     pub database: String,
@@ -527,6 +552,7 @@ pub struct ExportSqlRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ImportCsvRequest {
     pub connection_id: String,
     #[serde(default)]
@@ -541,6 +567,7 @@ pub struct ImportCsvRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExportResult {
     pub path: String,
     pub row_count: u64,
@@ -549,12 +576,14 @@ pub struct ExportResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ImportResult {
     pub inserted: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct AppInfo {
     pub name: String,
     pub version: String,

@@ -15,6 +15,7 @@ use std::path::Path;
 
 const MAX_STATEMENT_BYTES: usize = 20 * 1024 * 1024;
 
+#[cfg(test)]
 pub fn backup_sql(state: &AppState, request: &BackupRequest) -> AppResult<FileExportResult> {
     backup_sql_with_operation(state, request, &OperationContext::detached())
 }
@@ -195,7 +196,7 @@ pub fn restore_sql_with_operation(
             let sql = crate::native::mssql_restore_sql(&request.database, &request.path);
             let response = execute_sql_with_operation(
                 state,
-                ExecuteSqlRequest {
+                ExecuteSqlRequest { session_id: None,
                     connection_id: request.connection_id.clone(),
                     database: request.database.clone(),
                     sql,
@@ -588,7 +589,7 @@ fn try_native_backup(
         let sql = crate::native::mssql_backup_sql(&request.database, &request.path);
         let response = execute_sql_with_operation(
             state,
-            ExecuteSqlRequest {
+            ExecuteSqlRequest { session_id: None,
                 connection_id: request.connection_id.clone(),
                 database: request.database.clone(),
                 sql,

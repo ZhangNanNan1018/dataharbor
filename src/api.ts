@@ -1,3 +1,5 @@
+import type { CommandName, CommitRequest, ExportTableRequest, ExportSqlRequest, ImportCsvRequest, ExecuteSqlRequest, RunRecord, AiAskRequest, AiSettingsPublic as AiSettings, AiSettingsRequest, BackupRequest, Dashboard, DataModel, DebugCell, DebugReport, DebugSnapshot, DiffResult, ErGraph, Favorite, FileExportResult, ForeignKeyRef, GridResult, Job, MailSettings, ObjectRef, OperationSnapshot, PairRequest, PlanNode, RestoreRequest, Snippet, SyncResult, SyncStatement } from "./generated/contracts";
+export type { RunRecord, AiAskRequest, AiSettings, AiSettingsRequest, BackupRequest, Dashboard, DataModel, DebugCell, DebugReport, DebugSnapshot, DiffResult, ErGraph, Favorite, FileExportResult, ForeignKeyRef, GridResult, Job, MailSettings, ObjectRef, OperationSnapshot, PairRequest, PlanNode, RestoreRequest, Snippet, SyncResult, SyncStatement };
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
@@ -10,13 +12,9 @@ import type {
   ExecuteSqlResponse,
   ExportResult,
   FetchRowsRequest,
-  JsonValue,
-  FilterSpec,
   ImportResult,
-  RowChange,
   SaveConnectionRequest,
   SaveConnectionResult,
-  SortSpec,
   TestResult,
 } from "./types";
 
@@ -34,25 +32,11 @@ export function errorText(err: unknown): string {
   return "未知错误";
 }
 
-async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+async function call<T>(command: CommandName, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) {
     throw new Error("当前在浏览器预览中。请在桌面窗口里使用：npm run tauri dev");
   }
   return invoke<T>(command, args);
-}
-
-export interface OperationSnapshot {
-  id: string;
-  label: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
-  phase: string;
-  completed: number;
-  total: number | null;
-  committed: number;
-  batches: number;
-  cancelRequested: boolean;
-  message: string;
-  interruptible: boolean;
 }
 
 export function isOperationCancelled(error: unknown): boolean {
@@ -83,48 +67,15 @@ export const api = {
     call<string[]>("list_views", { connectionId, database, schema }),
   listColumns: (connectionId: string, database: string, schema: string, objectName: string) =>
     call<ColumnMeta[]>("list_columns", { connectionId, database, schema, objectName }),
-  executeSql: (request: {
-    connectionId: string;
-    database: string;
-    sql: string;
-    page: number;
-    pageSize: number;
-    onlyStatement?: number | null;
-  }, operationId?: string) => call<ExecuteSqlResponse>("execute_sql", { request, operationId }),
-  executeReadQuery: (request: {
-    connectionId: string;
-    database: string;
-    sql: string;
-    page: number;
-    pageSize: number;
-  }, operationId?: string) => call<ExecuteSqlResponse>("execute_read_query", { request, operationId }),
+  closeQuerySession: (sessionId: string) => call<void>("close_query_session", { sessionId }),
+  executeSql: (request: ExecuteSqlRequest, operationId?: string) => call<ExecuteSqlResponse>("execute_sql", { request, operationId }),
+  executeReadQuery: (request: ExecuteSqlRequest, operationId?: string) => call<ExecuteSqlResponse>("execute_read_query", { request, operationId }),
   fetchRows: (request: FetchRowsRequest) => call<DataPage>("fetch_rows", { request }),
-  commitChanges: (request: {
-    connectionId: string;
-    database: string;
-    schema: string;
-    table: string;
-    changes: RowChange[];
-  }) => call<CommitResult>("commit_changes", { request }),
-  exportTableCsv: (request: {
-    connectionId: string;
-    database: string;
-    schema: string;
-    table: string;
-    filters: FilterSpec[];
-    sorts: SortSpec[];
-    path: string;
-  }, operationId?: string) => call<ExportResult>("export_table_csv", { request, operationId }),
-  exportSqlCsv: (request: { connectionId: string; database: string; sql: string; path: string }, operationId?: string) =>
+  commitChanges: (request: CommitRequest) => call<CommitResult>("commit_changes", { request }),
+  exportTableCsv: (request: ExportTableRequest, operationId?: string) => call<ExportResult>("export_table_csv", { request, operationId }),
+  exportSqlCsv: (request: ExportSqlRequest, operationId?: string) =>
     call<ExportResult>("export_sql_csv", { request, operationId }),
-  importTableCsv: (request: {
-    connectionId: string;
-    database: string;
-    schema: string;
-    table: string;
-    path: string;
-    truncate: boolean;
-  }, operationId?: string) => call<ImportResult>("import_table_csv", { request, operationId }),
+  importTableCsv: (request: ImportCsvRequest, operationId?: string) => call<ImportResult>("import_table_csv", { request, operationId }),
   formatSql: (sql: string, minify: boolean) => call<string>("format_sql", { request: { sql, minify } }),
   bindSql: (sql: string, engine: string, params: { name: string; value: unknown }[]) =>
     call<string>("bind_sql", { request: { sql, engine, params } }),
@@ -154,6 +105,7 @@ export const api = {
   aiSettings: () => call<AiSettings>("ai_settings"),
   saveAiSettings: (request: AiSettingsRequest) => call<AiSettings>("save_ai_settings", { request }),
   aiAsk: (request: AiAskRequest) => call<string>("ai_ask", { request }),
+  listRunHistory: () => call<RunRecord[]>("list_run_history"),
   listJobs: () => call<Job[]>("list_jobs"),
   saveJob: (job: Job) => call<Job>("save_job", { job }),
   deleteJob: (id: string) => call<void>("delete_job", { id }),
@@ -202,80 +154,6 @@ export const api = {
   saveMailSettings: (request: Record<string, unknown>) => call<MailSettings>("save_mail_settings", { request }),
 };
 
-export interface PlanNode {
-  label: string;
-  detail: string;
-  cost?: number | null;
-  rows?: number | null;
-  children: PlanNode[];
-}
-
-export interface DebugReport {
-  available: boolean;
-  message: string;
-  steps: string[];
-}
-
-export interface DebugCell {
-  name: string;
-  value: string;
-  detail: string;
-}
-
-export interface DebugSnapshot {
-  status: string;
-  function: string;
-  line?: number | null;
-  message: string;
-  variables: DebugCell[];
-  stack: DebugCell[];
-  targetNote: string;
-}
-
-export interface MailSettings {
-  host: string;
-  port: number;
-  username: string;
-  from: string;
-  starttls: boolean;
-  hasPassword: boolean;
-}
-
-export interface SyncStatement {
-  id: string;
-  kind: string;
-  sql: string;
-  warning: boolean;
-}
-
-export interface ForeignKeyRef {
-  column: string;
-  refSchema: string;
-  refTable: string;
-  refColumn: string;
-}
-
-export interface GridResult {
-  columns: string[];
-  rows: JsonValue[][];
-  note: string;
-}
-
-export interface Snippet {
-  id: string;
-  name: string;
-  engine: string;
-  body: string;
-  updatedAt: string;
-}
-
-export interface ObjectRef {
-  connectionId: string;
-  database: string;
-  schema: string;
-  table?: string;
-}
-
 export interface TableRef extends ObjectRef {
   table: string;
 }
@@ -286,135 +164,6 @@ export interface FileTransferRequest extends TableRef {
 }
 
 /** The kind describes what was actually produced, including a partial data script. */
-export interface FileExportResult extends ExportResult {
-  kind: "table-export" | "native-backup" | "sqlite-script" | "data-only";
-  note: string;
-}
-
-export interface PairRequest {
-  sourceId: string;
-  sourceDatabase: string;
-  sourceSchema: string;
-  sourceTable: string;
-  targetId: string;
-  targetDatabase: string;
-  targetSchema: string;
-  targetTable: string;
-  apply?: boolean;
-  deleteMissing?: boolean;
-  allowDestructive?: boolean;
-  selectedIds?: string[];
-  /** Read and compare only. The target is not modified. */
-  preview?: boolean;
-}
-
-export interface BackupRequest {
-  connectionId: string;
-  database: string;
-  schema: string;
-  path: string;
-  mode?: "auto" | "native" | "builtin";
-}
-
-export interface RestoreRequest {
-  connectionId: string;
-  database: string;
-  path: string;
-}
-
-export interface ErGraph {
-  tables: { name: string; columns: ColumnMeta[] }[];
-  edges: { fromTable: string; fromColumn: string; toTable: string; toColumn: string }[];
-  note: string;
-}
-
-export interface DiffResult {
-  sql: string;
-  notes: string[];
-  applied: boolean;
-  statements?: SyncStatement[];
-}
-
-export interface SyncResult {
-  inserted: number;
-  updated: number;
-  deleted: number;
-  truncated: boolean;
-  note: string;
-}
-
-export interface AiSettings {
-  endpoint: string;
-  model: string;
-  hasKey: boolean;
-}
-
-export interface AiSettingsRequest {
-  endpoint: string;
-  model: string;
-  apiKey: string;
-}
-
-export interface AiAskRequest {
-  task: string;
-  sql: string;
-  engine: string;
-  schemaText: string;
-  prompt: string;
-  targetEngine?: string;
-  model?: string;
-}
-
-export interface Job {
-  id: string;
-  name: string;
-  kind: string;
-  connectionId: string;
-  database: string;
-  schema: string;
-  table: string;
-  sql: string;
-  path: string;
-  intervalSecs: number;
-  nextRunAt: number;
-  enabled: boolean;
-  lastMessage: string;
-  notifyEmail?: string;
-  profileIds?: string[];
-}
-
-export interface Dashboard {
-  id: string;
-  name: string;
-  pages: JsonValue[];
-}
-
-export interface DataModel {
-  id: string;
-  name: string;
-  level: string;
-  note: string;
-  entities: {
-    name: string;
-    attributes: { name: string; dataType: string; pk: boolean; nullable: boolean }[];
-  }[];
-  relations: {
-    fromEntity: string;
-    toEntity: string;
-    fromAttr: string;
-    toAttr: string;
-    label: string;
-  }[];
-}
-
-export interface Favorite {
-  id: string;
-  connectionId: string;
-  database: string;
-  schema: string;
-  objectName: string;
-  kind: string;
-}
 
 export async function pickSqliteFile(): Promise<string | null> {
   const selected = await open({

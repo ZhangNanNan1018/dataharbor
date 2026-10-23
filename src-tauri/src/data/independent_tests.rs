@@ -122,7 +122,7 @@ fn bi_uses_committed_snapshot_and_leaves_editor_writes_and_transaction_untouched
     fixture.editor("UPDATE marker SET value = 55").unwrap();
     let query = |sql: &str| crate::studio::execute_read_query_with_operation(
         &fixture.state,
-        ExecuteSqlRequest { connection_id: fixture.id.clone(), database: "main".into(), sql: sql.into(), page: 1, page_size: 10, only_statement: None },
+        ExecuteSqlRequest { session_id: None, connection_id: fixture.id.clone(), database: "main".into(), sql: sql.into(), page: 1, page_size: 10, only_statement: None },
         &OperationContext::detached(),
     );
     let response = query("WITH x AS (SELECT value FROM marker) SELECT value FROM x").unwrap();
@@ -225,7 +225,7 @@ fn server_writes_are_isolated(engine: Engine) {
     assert_eq!(fixture.external(&marker_query), vec![vec![json!(1), json!(0)]]);
     assert_eq!(ServerFixture::numbers(fixture.editor(&marker_query).unwrap().rows), vec![vec![json!(1), json!(55)], vec![json!(2), json!(66)]]);
     assert_eq!(fixture.external(&items_query), vec![vec![json!(1)], vec![json!(2)]]);
-    let read = crate::studio::execute_read_query_with_operation(&fixture.state, ExecuteSqlRequest {
+    let read = crate::studio::execute_read_query_with_operation(&fixture.state, ExecuteSqlRequest { session_id: None,
         connection_id: fixture.id.clone(), database: "demo".into(), sql: marker_query.clone(), page: 1, page_size: 10, only_statement: None,
     }, &OperationContext::detached()).unwrap();
     assert_eq!(ServerFixture::numbers(read.statements[0].rows.clone()), vec![vec![json!(1), json!(0)]]);

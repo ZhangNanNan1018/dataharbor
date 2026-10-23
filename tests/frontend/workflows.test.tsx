@@ -17,7 +17,7 @@ vi.mock("../../src/api", async (importOriginal) => {
   return { ...actual, api: { ...actual.api,
     fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn(),
     listDatabases: vi.fn(), listSchemas: vi.fn(), listTables: vi.fn(), listViews: vi.fn(), connect: vi.fn(),
-    executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
+    closeQuerySession: vi.fn().mockResolvedValue(undefined), executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
     aiSettings: vi.fn(), saveAiSettings: vi.fn(),
     createOperation: vi.fn(), operationStatus: vi.fn(), cancelOperation: vi.fn(), releaseOperation: vi.fn(),
     syncRows: vi.fn(), transferRows: vi.fn(),
@@ -95,6 +95,7 @@ beforeEach(() => {
   vi.mocked(api.listTables).mockResolvedValue(["books"]);
   vi.mocked(api.listViews).mockResolvedValue([]);
   vi.mocked(api.connect).mockResolvedValue({ version: "test" });
+  vi.mocked(api.closeQuerySession).mockResolvedValue(undefined);
   vi.mocked(api.executeSql).mockResolvedValue({ statements: [statement()], stopped: false });
   vi.mocked(pickSaveCsv).mockResolvedValue("fixture.csv");
   vi.mocked(api.exportSqlCsv).mockResolvedValue({ path: "fixture.csv", rowCount: 1, truncated: false });
@@ -191,10 +192,29 @@ describe("网格写入边界", () => {
 });
 
 describe("查询结果上下文", () => {
+  it("查询和导出共享会话，换库和卸载释放旧会话", async () => {
+    const id = openQuery();
+    const mounted = mount(<QueryHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
+    await screen.findByText("A result");
+    const first = vi.mocked(api.executeSql).mock.calls[0][0].sessionId;
+    expect(first).toEqual(expect.any(String));
+    fireEvent.click(screen.getByRole("button", { name: "导出 CSV" }));
+    await waitFor(() => expect(api.exportSqlCsv).toHaveBeenCalledWith(expect.objectContaining({ sessionId: first }), expect.any(String)));
+    act(() => useTabStore.getState().patchQuery(id, { database: "B" }));
+    await waitFor(() => expect(api.closeQuerySession).toHaveBeenCalledWith(first));
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
+    await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(2));
+    const second = vi.mocked(api.executeSql).mock.calls[1][0].sessionId;
+    expect(second).not.toBe(first);
+    mounted.unmount();
+    await waitFor(() => expect(api.closeQuerySession).toHaveBeenCalledWith(second));
+  });
+
   it("换库后清除旧结果，不能把旧 SQL 的导出发往新库", async () => {
     const id = openQuery();
     mount(<QueryHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
     await screen.findByText("A result");
     act(() => useTabStore.getState().patchQuery(id, { database: "B" }));
     expect(screen.queryByText("A result")).not.toBeInTheDocument();
@@ -207,7 +227,7 @@ describe("查询结果上下文", () => {
     vi.mocked(api.executeSql).mockReturnValueOnce(pending.promise);
     const id = openQuery();
     mount(<QueryHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
     await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(1));
     act(() => useTabStore.getState().patchQuery(id, { database: "B" }));
     await act(async () => pending.resolve({ statements: [statement()], stopped: false }));
@@ -219,7 +239,7 @@ describe("查询结果上下文", () => {
     vi.mocked(pickSaveCsv).mockReturnValueOnce(picker.promise);
     const id = openQuery();
     mount(<QueryHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
     await screen.findByText("A result");
     fireEvent.click(screen.getByRole("button", { name: "导出 CSV" }));
     act(() => useTabStore.getState().patchQuery(id, { database: "B" }));
@@ -234,7 +254,7 @@ describe("查询结果上下文", () => {
     ] });
     openQuery();
     mount(<QueryHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
     await screen.findByText("A result");
     await choose("选择语句结果", "语句 1");
     expect(screen.getByText("修改完成")).toBeInTheDocument();
@@ -338,7 +358,7 @@ it("关闭运行中的查询标签会确认取消，并等后台返回后再移�
   vi.mocked(api.executeSql).mockReturnValueOnce(pending.promise);
   openQuery();
   mount(<Workspace />);
-  fireEvent.click(screen.getByRole("button", { name: "运 行" }));
+  fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
   await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByLabelText("remove"));
   const dialog = await screen.findByRole("dialog");

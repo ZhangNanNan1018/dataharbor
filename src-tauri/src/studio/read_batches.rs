@@ -28,10 +28,7 @@ impl ReadSession {
         operation.checkpoint()?;
         let mut session = state.open_isolated_session(id)?;
         let interrupt = operation.bind_interrupt(session.cancel_handle(database)?)?;
-        let snapshot = matches!(
-            session.engine(),
-            Engine::Sqlite | Engine::Postgres | Engine::Mysql | Engine::Mariadb
-        );
+        let snapshot = session.engine().capabilities().read_snapshot;
         if snapshot {
             let result = session.begin_read_snapshot(database);
             operation.checkpoint()?;

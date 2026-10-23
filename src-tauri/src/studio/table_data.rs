@@ -77,7 +77,7 @@ pub fn mask_columns(state: &AppState, request: &MaskRequest) -> AppResult<String
     let sql = format!("UPDATE {name} SET {sets}");
     let response = execute_sql(
         state,
-        ExecuteSqlRequest {
+        ExecuteSqlRequest { session_id: None,
             connection_id: request.connection_id.clone(),
             database: request.database.clone(),
             sql,

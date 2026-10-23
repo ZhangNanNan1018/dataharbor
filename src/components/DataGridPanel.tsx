@@ -1,3 +1,5 @@
+import { buildChanges, type GridRow } from "../gridEdits";
+import { engineCapabilities } from "../engines";
 import {
   App,
   Alert,
@@ -18,19 +20,12 @@ import { useLongOperation } from "../operations";
 import { TaskProgress } from "./TaskProgress";
 import type { ForeignKeyRef } from "../api";
 import { CellValue } from "./CellEditors";
-import { isBlank, isNumericType, sameValue } from "../format";
+import { isNumericType, sameValue } from "../format";
 import { useTabStore } from "../stores/useTabStore";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useUiStore } from "../stores/useUiStore";
-import type { ColumnMeta, DataTab, FieldValue, FilterSpec, JsonValue, RowChange, SortSpec } from "../types";
+import type { ColumnMeta, DataTab, FilterSpec, JsonValue, SortSpec } from "../types";
 
-interface GridRow {
-  rid: string;
-  cells: JsonValue[];
-  original: JsonValue[] | null;
-  originalFields: FieldValue[] | null;
-  status: "clean" | "dirty" | "inserted" | "deleted";
-}
 
 const FILTER_OPS = [
   { value: "contains", label: "包含" },
@@ -50,7 +45,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   const exportInFlight = useRef(false);
   const setStatus = useUiStore((state) => state.setStatus);
   const setDirty = useTabStore((state) => state.setDirty);
-  const supportsFilters = useConnectionStore((state) => state.profiles.find((profile) => profile.id === tab.connectionId)?.engine !== "redis");
+  const supportsFilters = useConnectionStore((state) => engineCapabilities(state.profiles.find((profile) => profile.id === tab.connectionId)?.engine)?.filters ?? false);
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [rows, setRows] = useState<GridRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -488,7 +483,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
                   onOk: () => {
                     const schemaText = columns.map((column) => `${column.name} ${column.dataType}`).join(", ");
                     const current = Object.fromEntries(columns.map((column, index) => [column.name, row.cells[index]]));
-                    return api.aiAsk({ task: "fill", sql: JSON.stringify(current), schemaText, prompt: "只补空值", engine: "sqlite" }).then((text) => {
+                    return api.aiAsk({ task: "fill", targetEngine: "", model: "", sql: JSON.stringify(current), schemaText, prompt: "只补空值", engine: "sqlite" }).then((text) => {
                       const match = text.match(/\{[\s\S]*\}/);
                       if (!match) throw new Error("模型没有返回 JSON 对象");
                       const object = JSON.parse(match[0]) as Record<string, JsonValue>;
@@ -669,45 +664,6 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
       </Modal>
     </div>
   );
-}
-
-function buildChanges(columns: ColumnMeta[], rows: GridRow[]): RowChange[] {
-  const changes: RowChange[] = [];
-  for (const row of rows) {
-    if (row.status === "inserted") {
-      const values: FieldValue[] = [];
-      let meaningful = false;
-      columns.forEach((column, index) => {
-        const value = row.cells[index] ?? null;
-        if (column.autoIncrement && isBlank(value)) return;
-        if (!isBlank(value)) meaningful = true;
-        values.push({ column: column.name, value });
-      });
-      if (!meaningful) continue;
-      changes.push({ kind: "insert", pk: [], values });
-    } else if (row.status === "deleted" && row.original) {
-      changes.push({ kind: "delete", pk: primaryKey(columns, row.original), values: [], original: row.originalFields ?? originalValues(columns, row.original) });
-    } else if (row.status === "dirty" && row.original) {
-      const values: FieldValue[] = [];
-      columns.forEach((column, index) => {
-        const value = row.cells[index] ?? null;
-        if (!sameValue(value, row.original?.[index])) values.push({ column: column.name, value });
-      });
-      if (values.length) changes.push({ kind: "update", pk: primaryKey(columns, row.original), values, original: row.originalFields ?? originalValues(columns, row.original) });
-    }
-  }
-  return changes;
-}
-
-function originalValues(columns: ColumnMeta[], original: JsonValue[]): FieldValue[] {
-  return columns.map((column, index) => ({ column: column.name, value: original[index] ?? null }));
-}
-
-function primaryKey(columns: ColumnMeta[], original: JsonValue[]): FieldValue[] {
-  return columns
-    .map((column, index) => ({ column, index }))
-    .filter((item) => item.column.primaryKey)
-    .map((item) => ({ column: item.column.name, value: original[item.index] ?? null }));
 }
 
 function opLabel(op: string): string {

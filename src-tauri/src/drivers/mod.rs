@@ -133,7 +133,7 @@ pub trait DbSession: Send {
         if statements.is_empty() {
             return Ok(0);
         }
-        if self.is_document_store() || matches!(self.engine(), Engine::Oracle | Engine::Snowflake) {
+        if !self.engine().capabilities().atomic_writes {
             return Err(AppError::msg("当前驱动不能保证同一会话事务，已拒绝网格和 CSV 批量修改；请使用该数据库的原生客户端"));
         }
         let begin = if self.engine() == Engine::Mssql {

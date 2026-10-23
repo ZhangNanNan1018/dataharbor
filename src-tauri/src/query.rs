@@ -28,83 +28,99 @@ pub fn execute_sql_with_operation(
         }
     }
 
-    let mut results = Vec::new();
-    let mut stopped = false;
-    for (index, sql) in statements.iter().enumerate() {
-        if request.only_statement.is_some_and(|only| only != index) {
-            continue;
-        }
-        operation.checkpoint()?;
-        let total = if request.only_statement.is_some() {
-            1
-        } else {
-            statements.len()
-        };
-        operation.report(
-            "执行 SQL",
-            results.len() as u64,
-            Some(total as u64),
-            "取消会停止当前支持中断的语句及后续语句，已完成的写入不会自动撤销",
-        );
-        let started = Instant::now();
-        match run_one(
-            state,
-            &request.connection_id,
-            &request.database,
-            sql,
-            page,
-            page_size,
-            operation,
-        ) {
-            Ok(mut result) => {
-                result.index = index;
-                result.sql = sql.clone();
-                result.elapsed_ms = started.elapsed().as_millis() as u64;
-                results.push(result);
+    state.with_query_session(
+        &request.connection_id,
+        &request.database,
+        request.session_id.as_deref(),
+        operation,
+        |session| {
+            if !session.engine().capabilities().persistent_console
+                && statements.iter().any(|sql| {
+                    matches!(
+                        crate::sqlutil::strip_leading_comments(sql)
+                            .trim()
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_ascii_uppercase()
+                            .as_str(),
+                        "BEGIN" | "BEGIN TRANSACTION" | "START TRANSACTION" | "COMMIT" | "ROLLBACK"
+                    )
+                })
+            {
+                return Err(AppError::msg(
+                    "当前驱动不支持跨语句的会话事务，请使用该引擎支持的原生事务操作",
+                ));
+            }
+            let mut results = Vec::new();
+            let mut stopped = false;
+            for (index, sql) in statements.iter().enumerate() {
+                if request.only_statement.is_some_and(|only| only != index) {
+                    continue;
+                }
+                operation.checkpoint()?;
+                let total = if request.only_statement.is_some() {
+                    1
+                } else {
+                    statements.len()
+                };
                 operation.report(
                     "执行 SQL",
                     results.len() as u64,
                     Some(total as u64),
-                    "当前语句已完成；原始 SQL 可能处于显式事务，影响行数不等于已提交数量",
+                    "取消会停止当前支持中断的语句及后续语句，已完成的写入不会自动撤销",
                 );
-                operation.checkpoint()?;
-            }
-            Err(err) => {
-                if matches!(err, AppError::Cancelled { .. }) {
-                    return Err(err);
+                let started = Instant::now();
+                match run_one(session, &request.database, sql, page, page_size, operation) {
+                    Ok(mut result) => {
+                        result.index = index;
+                        result.sql = sql.clone();
+                        result.elapsed_ms = started.elapsed().as_millis() as u64;
+                        results.push(result);
+                        operation.report(
+                            "执行 SQL",
+                            results.len() as u64,
+                            Some(total as u64),
+                            "当前语句已完成；原始 SQL 可能处于显式事务，影响行数不等于已提交数量",
+                        );
+                        operation.checkpoint()?;
+                    }
+                    Err(err) => {
+                        if matches!(err, AppError::Cancelled { .. }) {
+                            return Err(err);
+                        }
+                        operation.report_failure(err.to_string());
+                        results.push(StatementResult {
+                            index,
+                            sql: sql.clone(),
+                            ok: false,
+                            error: Some(err.to_string()),
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rows_affected: 0,
+                            total_rows: None,
+                            page,
+                            page_size,
+                            pageable: is_pageable(sql),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            message: err.to_string(),
+                            truncated: false,
+                            has_more: false,
+                        });
+                        stopped = true;
+                        break;
+                    }
                 }
-                operation.report_failure(err.to_string());
-                results.push(StatementResult {
-                    index,
-                    sql: sql.clone(),
-                    ok: false,
-                    error: Some(err.to_string()),
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    rows_affected: 0,
-                    total_rows: None,
-                    page,
-                    page_size,
-                    pageable: is_pageable(sql),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    message: err.to_string(),
-                    truncated: false,
-                    has_more: false,
-                });
-                stopped = true;
-                break;
             }
-        }
-    }
-    Ok(ExecuteSqlResponse {
-        statements: results,
-        stopped,
-    })
+            Ok(ExecuteSqlResponse {
+                statements: results,
+                stopped,
+            })
+        },
+    )
 }
 
 fn run_one(
-    state: &AppState,
-    connection_id: &str,
+    session: &mut dyn crate::drivers::DbSession,
     database: &str,
     sql: &str,
     page: u32,
@@ -114,19 +130,19 @@ fn run_one(
     let offset = (page - 1)
         .checked_mul(page_size)
         .ok_or_else(|| AppError::msg("分页位置超出范围"))?;
-    let paged = state.with_session_operation(connection_id, database, operation, |session| {
-        Ok(paginate_query_sql(
-            session.engine(),
-            sql,
-            page_size + 1,
-            offset,
-        ))
-    })?;
+    let paged = paginate_query_sql(session.engine(), sql, page_size + 1, offset);
     if let Some(paged) = paged {
-        match state.with_session_operation(connection_id, database, operation, |session| {
-            session.execute(database, &paged, Some(page_size as usize + 1))
-        }) {
+        match execute_one(
+            session,
+            database,
+            &paged,
+            Some(page_size as usize + 1),
+            operation,
+        ) {
             Ok(mut outcome) => {
+                if outcome.truncated && outcome.rows.len() <= page_size as usize {
+                    return Err(AppError::msg("当前页结果超过读取预算，请减少每页行数或所选字段；分页已停止以避免跳过未显示的记录"));
+                }
                 let has_more = outcome.truncated || outcome.rows.len() > page_size as usize;
                 outcome.rows.truncate(page_size as usize);
                 // Never execute arbitrary user SQL a second time to count it:
@@ -146,10 +162,40 @@ fn run_one(
     if page > 1 {
         return Err(AppError::msg("这条语句按原文执行，不支持自动分页"));
     }
-    let outcome = state.with_session_operation(connection_id, database, operation, |session| {
-        session.execute(database, sql, Some(5_000))
-    })?;
+    let outcome = execute_one(session, database, sql, Some(5_000), operation)?;
     Ok(from_outcome(outcome, page, page_size, false, None))
+}
+
+fn execute_one(
+    session: &mut dyn crate::drivers::DbSession,
+    database: &str,
+    sql: &str,
+    limit: Option<usize>,
+    operation: &OperationContext,
+) -> AppResult<QueryOutcome> {
+    // Never interrupt a transaction completion: its result determines commit ownership.
+    let completion = matches!(
+        crate::sqlutil::strip_leading_comments(sql)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .to_ascii_uppercase()
+            .as_str(),
+        "COMMIT" | "ROLLBACK" | "END"
+    );
+    let interrupt = operation.bind_interrupt(if completion {
+        None
+    } else {
+        session.cancel_handle(database)?
+    })?;
+    operation.checkpoint()?;
+    let result = session.execute(database, sql, limit);
+    drop(interrupt);
+    if result.is_err() && operation.cancel_requested() {
+        return Err(operation.cancel_error());
+    }
+    result
 }
 
 fn from_outcome(
@@ -184,3 +230,6 @@ fn from_outcome(
         has_more: false,
     }
 }
+
+#[cfg(test)]
+mod tests;

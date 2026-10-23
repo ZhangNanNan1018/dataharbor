@@ -98,7 +98,7 @@ pub fn execute_read_query_with_operation(
     if paged.is_none() && page > 1 {
         return Err(AppError::msg("这条只读语句不支持自动分页"));
     }
-    let enforced = matches!(session.engine(), Engine::Sqlite | Engine::Postgres | Engine::Mysql | Engine::Mariadb);
+    let enforced = session.engine().capabilities().read_snapshot;
     operation.report("执行只读查询", 0, None, if enforced { "独立只读事务；取消不会影响查询编辑器" } else { "已校验 SELECT/只读 CTE 语法；该引擎仍需避免调用有副作用的函数" });
     let interrupt = operation.bind_interrupt(session.cancel_handle(&request.database)?)?;
     if enforced {
@@ -112,6 +112,9 @@ pub fn execute_read_query_with_operation(
     operation.checkpoint()?;
     let mut outcome = result?;
     ended?;
+    if paged.is_some() && outcome.truncated && outcome.rows.len() <= page_size as usize {
+        return Err(AppError::msg("当前页结果超过读取预算，请减少查询字段或行数；分页已停止以避免遗漏记录"));
+    }
     let has_more = outcome.truncated || outcome.rows.len() > page_size as usize;
     outcome.rows.truncate(page_size as usize);
     let total_rows = if paged.is_some() && !has_more { Some(u64::from(offset) + outcome.rows.len() as u64) } else { None };
@@ -296,7 +299,7 @@ pub(super) fn run_grid(
 ) -> AppResult<GridResult> {
     let response = execute_sql(
         state,
-        ExecuteSqlRequest {
+        ExecuteSqlRequest { session_id: None,
             connection_id: connection_id.to_string(),
             database: database.to_string(),
             sql: sql.to_string(),

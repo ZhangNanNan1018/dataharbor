@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::runtime::block_on;
+use futures::TryStreamExt;
 use native_tls::TlsConnector;
 use postgres::config::SslMode;
 use postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use postgres_native_tls::MakeTlsConnector;
 use serde_json::Value as JsonValue;
+use tokio_postgres as postgres;
 
 use super::DbSession;
 use crate::error::{AppError, AppResult};
@@ -24,13 +27,13 @@ pub struct PostgresSession {
     default_db: String,
 }
 
-/// rust-postgres 0.19 sits on tokio-postgres 0.7. That stack parses
+/// tokio-postgres 0.7 parses
 /// AuthenticationGss (auth code 7) and AuthenticationGssContinue, then
 /// `connect_raw` returns "unsupported authentication method" without calling
 /// gss_init_sec_context. tiberius `integrated-auth-gssapi` is a TDS login, not
 /// a PostgreSQL startup packet, so it is not a substitute. libpq is not linked.
 pub fn gssapi_refusal() -> &'static str {
-    "当前 PostgreSQL 驱动不支持 GSSAPI / Kerberos。rust-postgres 0.19 / tokio-postgres 0.7 会解析 AuthenticationGss（认证码 7）和 AuthenticationGssContinue，但 connect_raw 把它们当成不支持的认证方法直接返回，没有 GSS token 交换，也不会调用 gss_init_sec_context。tiberius 的 integrated-auth-gssapi 只用于 SQL Server TDS 登录，不能用于 PostgreSQL 启动包。本程序不链接 libpq。请改用密码、md5 或 SCRAM-SHA-256。"
+    "当前 PostgreSQL 驱动不支持 GSSAPI / Kerberos。tokio-postgres 0.7 会解析 AuthenticationGss（认证码 7）和 AuthenticationGssContinue，但 connect_raw 把它们当成不支持的认证方法直接返回，没有 GSS token 交换，也不会调用 gss_init_sec_context。tiberius 的 integrated-auth-gssapi 只用于 SQL Server TDS 登录，不能用于 PostgreSQL 启动包。本程序不链接 libpq。请改用密码、md5 或 SCRAM-SHA-256。"
 }
 
 pub fn connect(config: &SessionConfig) -> AppResult<PostgresSession> {
@@ -111,24 +114,41 @@ pub fn open_client(
         .dbname(database)
         .connect_timeout(Duration::from_secs(8))
         .application_name("dataharbor");
-    let client = if use_ssl {
-        let mut builder = TlsConnector::builder();
-        if ssl_insecure {
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-        }
-        let connector = builder
-            .build()
-            .map_err(|err| AppError::msg(format!("TLS 初始化失败: {err}")))?;
-        config
-            .connect(MakeTlsConnector::new(connector))
-            .map_err(|err| AppError::msg(err.to_string()))?
-    } else {
-        config
-            .connect(NoTls)
-            .map_err(|err| AppError::msg(err.to_string()))?
-    };
-    Ok(client)
+    let client = block_on(async {
+        let client = if use_ssl {
+            let mut builder = TlsConnector::builder();
+            if ssl_insecure {
+                builder.danger_accept_invalid_certs(true);
+                builder.danger_accept_invalid_hostnames(true);
+            }
+            let connector = builder
+                .build()
+                .map_err(|err| AppError::msg(format!("TLS 初始化失败: {err}")))?;
+            config
+                .connect(MakeTlsConnector::new(connector))
+                .await
+                .map(|(client, connection)| {
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    client
+                })
+                .map_err(|err| AppError::msg(err.to_string()))?
+        } else {
+            config
+                .connect(NoTls)
+                .await
+                .map(|(client, connection)| {
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    client
+                })
+                .map_err(|err| AppError::msg(err.to_string()))?
+        };
+        Ok(client)
+    });
+    client
 }
 
 fn connection_options(
@@ -230,14 +250,12 @@ impl DbSession for PostgresSession {
                 .build()
                 .map_err(|err| AppError::msg(format!("取消连接 TLS 初始化失败：{err}")))?;
             std::sync::Arc::new(move || {
-                token
-                    .cancel_query(MakeTlsConnector::new(connector.clone()))
+                block_on(token.cancel_query(MakeTlsConnector::new(connector.clone())))
                     .map_err(|err| AppError::msg(format!("PostgreSQL 取消请求未送达：{err}")))
             })
         } else {
             std::sync::Arc::new(move || {
-                token
-                    .cancel_query(NoTls)
+                block_on(token.cancel_query(NoTls))
                     .map_err(|err| AppError::msg(format!("PostgreSQL 取消请求未送达：{err}")))
             })
         };
@@ -246,16 +264,14 @@ impl DbSession for PostgresSession {
 
     fn begin_read_snapshot(&mut self, database: &str) -> AppResult<()> {
         self.with_client(database, |client| {
-            client
-                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            block_on(client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
                 .map_err(|err| AppError::msg(format!("无法建立 PostgreSQL 只读快照：{err}")))
         })
     }
 
     fn end_read_snapshot(&mut self, database: &str) -> AppResult<()> {
         self.with_client(database, |client| {
-            client
-                .batch_execute("ROLLBACK")
+            block_on(client.batch_execute("ROLLBACK"))
                 .map_err(|err| AppError::msg(format!("无法结束 PostgreSQL 快照：{err}")))
         })
     }
@@ -420,64 +436,91 @@ fn schema_or_public(schema: &str) -> String {
     }
 }
 
+// Bound retained cells independently of row count. The protocol stream is drained
+// without collecting discarded rows, preserving transaction and statement semantics.
+// A single wire row can still exceed this budget while the driver decodes it.
+const MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
+
 pub(crate) fn run_simple(
     client: &mut Client,
     sql: &str,
     max_rows: Option<usize>,
 ) -> AppResult<QueryOutcome> {
-    let messages = client
-        .simple_query(sql)
-        .map_err(|err| AppError::msg(err.to_string()))?;
-    let mut columns: Vec<ColumnMeta> = Vec::new();
-    let mut rows = Vec::new();
-    let mut affected = 0u64;
-    let mut truncated = false;
-    let mut saw_rows = false;
-    for message in messages {
-        match message {
-            SimpleQueryMessage::RowDescription(description) => {
-                if columns.is_empty() {
-                    columns = description
-                        .iter()
-                        .map(|column| ColumnMeta::named(column.name()))
-                        .collect();
+    block_on(async {
+        let messages = client
+            .simple_query_raw(sql)
+            .await
+            .map_err(|err| AppError::msg(err.to_string()))?;
+        futures::pin_mut!(messages);
+        let mut retained_bytes = 0usize;
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        let mut rows = Vec::new();
+        let mut affected = 0u64;
+        let mut truncated = false;
+        let mut saw_rows = false;
+        while let Some(message) = messages
+            .try_next()
+            .await
+            .map_err(|err| AppError::msg(err.to_string()))?
+        {
+            match message {
+                SimpleQueryMessage::RowDescription(description) => {
+                    if columns.is_empty() {
+                        columns = description
+                            .iter()
+                            .map(|column| ColumnMeta::named(column.name()))
+                            .collect();
+                    }
                 }
+                SimpleQueryMessage::Row(row) => {
+                    saw_rows = true;
+                    if columns.is_empty() {
+                        columns = row
+                            .columns()
+                            .iter()
+                            .map(|column| ColumnMeta::named(column.name()))
+                            .collect();
+                    }
+                    let row_bytes = (0..row.len())
+                        .try_fold(
+                            row.len().saturating_mul(std::mem::size_of::<JsonValue>()),
+                            |bytes, index| {
+                                row.try_get(index)
+                                    .map(|cell| bytes.saturating_add(cell.map_or(0, str::len)))
+                            },
+                        )
+                        .map_err(|err| AppError::msg(err.to_string()))?;
+                    if truncated
+                        || max_rows.is_some_and(|limit| rows.len() >= limit)
+                        || retained_bytes.saturating_add(row_bytes) > MAX_RESULT_BYTES
+                    {
+                        truncated = true;
+                        continue;
+                    }
+                    retained_bytes += row_bytes;
+                    let mut cells = Vec::with_capacity(row.len());
+                    for index in 0..row.len() {
+                        cells.push(match row.try_get(index) {
+                            Ok(Some(text)) => JsonValue::String(text.to_string()),
+                            Ok(None) => JsonValue::Null,
+                            Err(err) => return Err(AppError::msg(err.to_string())),
+                        });
+                    }
+                    rows.push(cells);
+                }
+                SimpleQueryMessage::CommandComplete(count) => {
+                    affected = count;
+                }
+                _ => {}
             }
-            SimpleQueryMessage::Row(row) => {
-                saw_rows = true;
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|column| ColumnMeta::named(column.name()))
-                        .collect();
-                }
-                if max_rows.is_some_and(|limit| rows.len() >= limit) {
-                    truncated = true;
-                    continue;
-                }
-                let mut cells = Vec::with_capacity(row.len());
-                for index in 0..row.len() {
-                    cells.push(match row.try_get(index) {
-                        Ok(Some(text)) => JsonValue::String(text.to_string()),
-                        Ok(None) => JsonValue::Null,
-                        Err(err) => return Err(AppError::msg(err.to_string())),
-                    });
-                }
-                rows.push(cells);
-            }
-            SimpleQueryMessage::CommandComplete(count) => {
-                affected = count;
-            }
-            _ => {}
         }
-    }
-    Ok(QueryOutcome {
-        original_rows: None,
-        columns,
-        rows,
-        rows_affected: if saw_rows { 0 } else { affected },
-        truncated,
+        Ok(QueryOutcome {
+            original_rows: None,
+            columns,
+            rows,
+            rows_affected: if saw_rows { 0 } else { affected },
+            truncated,
+        })
     })
 }
 

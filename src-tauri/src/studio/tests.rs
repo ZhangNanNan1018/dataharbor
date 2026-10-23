@@ -52,7 +52,7 @@ impl Fixture {
     fn execute(&self, id: &str, sql: &str) {
         let result = execute_sql(
             &self.state,
-            ExecuteSqlRequest {
+            ExecuteSqlRequest { session_id: None,
                 connection_id: id.into(),
                 database: "main".into(),
                 sql: sql.into(),

@@ -1,28 +1,23 @@
+import { QueryResultTable } from "./QueryResultTable";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import "../monacoSetup";
-import { App, Alert, Button, Dropdown, Input, Modal, Pagination, Select, Space, Table, Tag } from "antd";
-import type { ColumnsType } from "antd/es/table";
-import { useEffect, useRef, useState } from "react";
+import { App, Alert, Button, Dropdown, Input, Modal, Pagination, Select, Space, Tag } from "antd";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorText, isOperationCancelled, pickSaveCsv, type PlanNode } from "../api";
 import { useLongOperation } from "../operations";
 import { TaskProgress } from "./TaskProgress";
 import { engineLabel } from "../engines";
-import { displayCell, isNumericType } from "../format";
 import { applyEditorTheme, editorFont } from "../monacoTheme";
 import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../sqlIntelligence";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
-import type { ExecuteSqlResponse, JsonValue, QueryTab, StatementResult } from "../types";
+import type { ExecuteSqlResponse, QueryTab, StatementResult } from "../types";
 import { watchSqlCatalog } from "../sqlCatalog";
 import { ensureConnection } from "../connectionReady";
 
-interface ResultRow {
-  key: string;
-  cells: JsonValue[];
-}
-
 interface QueryContext {
+  sessionId: string;
   connectionId: string;
   database: string;
   sql: string;
@@ -35,6 +30,8 @@ interface QueryResult extends ExecuteSqlResponse {
 export function QueryPanel({ tab }: { tab: QueryTab }) {
   const { message } = App.useApp();
   const task = useLongOperation(tab.id);
+  const sessionId = useMemo(() => crypto.randomUUID(), [tab.id, tab.connectionId, tab.database]);
+  useEffect(() => () => { void api.closeQuerySession(sessionId).catch(() => {}); }, [sessionId]);
   const theme = useUiStore((state) => state.theme);
   const setStatus = useUiStore((state) => state.setStatus);
   const profiles = useConnectionStore((state) => state.profiles);
@@ -100,7 +97,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function explain() {
     if (!tab.connectionId) return;
-    const context = { connectionId: tab.connectionId, database: tab.database, sql: tab.sql };
+    const context = { sessionId, connectionId: tab.connectionId, database: tab.database, sql: tab.sql };
     const token = requestId.current;
     const toolToken = ++toolRequestId.current;
     const current = () => isCurrent(token, context) && toolToken === toolRequestId.current && tabRef.current.sql === context.sql;
@@ -188,7 +185,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       return;
     }
     const sql = selected || tab.sql;
-    const context = { connectionId: tab.connectionId, database: tab.database, sql };
+    const context = { sessionId, connectionId: tab.connectionId, database: tab.database, sql };
     const token = ++requestId.current;
     runningRef.current = token;
     setRunning(true);
@@ -268,6 +265,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         return;
       }
       const exported = await task.execute("导出查询结果", (operationId) => api.exportSqlCsv({
+        sessionId: context.sessionId,
         connectionId: context.connectionId,
         database: context.database,
         sql: current.sql,
@@ -337,20 +335,6 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     applyEditorTheme(monaco, theme);
   }, [theme]);
 
-  const columns: ColumnsType<ResultRow> = (statement?.columns ?? []).map((column, index) => ({
-    title: column.name,
-    key: `${column.name}-${index}`,
-    align: isNumericType(column.dataType) ? "right" : "left",
-    render: (_value, row) => {
-      const cell = row.cells[index];
-      return <span className={cell === null ? "xb-null" : isNumericType(column.dataType) ? "xb-num" : undefined}>{displayCell(cell, column.dataType)}</span>;
-    },
-  }));
-  const dataSource: ResultRow[] = (statement?.rows ?? []).map((cells, index) => ({
-    key: `${statement?.page ?? 1}-${index}`,
-    cells,
-  }));
-
   return (
     <div className="xb-panel">
       <div className="xb-runbar">
@@ -385,13 +369,13 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
           }))}
           onChange={(database: string) => { invalidateResults(); patchQuery(tab.id, { database }); }}
         />
-        <Button type="primary" disabled={task.active || exporting} loading={running} onClick={() => void run("all")}>
+        <Button aria-label="运行 SQL" type="primary" disabled={task.active || exporting} loading={running} onClick={() => void run("all")}>
           运行
         </Button>
-        <Button disabled={task.active || exporting} loading={running} onClick={() => void run("selection")}>
+        <Button aria-label="运行选中 SQL" disabled={task.active || exporting} loading={running} onClick={() => void run("selection")}>
           运行选中
         </Button>
-        <Button disabled={task.active || running} loading={exporting} onClick={() => void exportCsv()}>
+        <Button aria-label="导出 CSV" disabled={task.active || running} loading={exporting} onClick={() => void exportCsv()}>
           导出 CSV
         </Button>
         <Button
@@ -534,14 +518,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
             />
           </div>
           <div className="xb-grid-wrap">
-            <Table<ResultRow>
-              size="small"
-              pagination={false}
-              columns={columns}
-              dataSource={dataSource}
-              sticky
-              scroll={{ x: "max-content" }}
-            />
+            <QueryResultTable statement={statement} />
           </div>
         </>
       )}

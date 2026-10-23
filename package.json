@@ -11,7 +11,10 @@
     "test": "vitest run",
     "preview": "vite preview",
     "licenses": "node scripts/generate-notices.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "contracts:generate": "node scripts/contracts.mjs --generate",
+    "contracts:check": "node scripts/contracts.mjs",
+    "check": "npm test && npm run build && npm run contracts:check"
   },
   "engines": {
     "node": ">=20"

@@ -18,12 +18,7 @@ mod stage;
 use stage::{canonical_value, Relation, Side, Stage};
 
 pub(super) fn supports_pair(state: &AppState, request: &PairRequest) -> AppResult<bool> {
-    let supported = |engine| {
-        matches!(
-            engine,
-            Engine::Sqlite | Engine::Mysql | Engine::Mariadb | Engine::Postgres
-        )
-    };
+    let supported = |engine: Engine| engine.capabilities().read_snapshot;
     Ok(supported(engine_of(state, &request.source_id)?)
         && supported(engine_of(state, &request.target_id)?))
 }

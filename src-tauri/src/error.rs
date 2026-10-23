@@ -2,6 +2,28 @@ use serde::Serialize;
 
 pub type AppResult<T> = Result<T, AppError>;
 
+#[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorKind {
+    Message,
+    Cancelled,
+    OperationMissing,
+    PartialWrite,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorPayload {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub committed: Option<u64>,
+    pub batches: Option<u64>,
+    pub applied: Option<usize>,
+    pub failed_index: Option<usize>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
@@ -22,6 +44,15 @@ impl AppError {
     pub fn msg(text: impl Into<String>) -> Self {
         AppError::Message(text.into())
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Message(_) => "message",
+            Self::Cancelled { .. } => "cancelled",
+            Self::OperationMissing => "operationMissing",
+            Self::PartialWrite { .. } => "partialWrite",
+        }
+    }
 }
 
 impl Serialize for AppError {
@@ -29,37 +60,32 @@ impl Serialize for AppError {
     where
         S: serde::Serializer,
     {
+        let mut payload = ErrorPayload {
+            kind: ErrorKind::Message,
+            message: self.to_string(),
+            committed: None,
+            batches: None,
+            applied: None,
+            failed_index: None,
+        };
         match self {
-            Self::Message(_) => serializer.serialize_str(&self.to_string()),
-            Self::OperationMissing => {
-                use serde::ser::SerializeStruct;
-                let mut value = serializer.serialize_struct("OperationMissing", 2)?;
-                value.serialize_field("kind", "operationMissing")?;
-                value.serialize_field("message", &self.to_string())?;
-                value.end()
-            }
+            Self::Message(_) => {}
+            Self::OperationMissing => payload.kind = ErrorKind::OperationMissing,
             Self::Cancelled { committed, batches } => {
-                use serde::ser::SerializeStruct;
-                let mut value = serializer.serialize_struct("Cancelled", 4)?;
-                value.serialize_field("kind", "cancelled")?;
-                value.serialize_field("message", &self.to_string())?;
-                value.serialize_field("committed", committed)?;
-                value.serialize_field("batches", batches)?;
-                value.end()
+                payload.kind = ErrorKind::Cancelled;
+                payload.committed = Some(*committed);
+                payload.batches = Some(*batches);
             }
             Self::PartialWrite {
                 applied,
                 failed_index,
                 ..
             } => {
-                use serde::ser::SerializeStruct;
-                let mut value = serializer.serialize_struct("PartialWrite", 4)?;
-                value.serialize_field("kind", "partialWrite")?;
-                value.serialize_field("message", &self.to_string())?;
-                value.serialize_field("applied", applied)?;
-                value.serialize_field("failedIndex", failed_index)?;
-                value.end()
+                payload.kind = ErrorKind::PartialWrite;
+                payload.applied = Some(*applied);
+                payload.failed_index = Some(*failed_index);
             }
         }
+        payload.serialize(serializer)
     }
 }

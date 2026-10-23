@@ -62,12 +62,14 @@ impl Drop for AtomicOutput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
 pub struct OperationSnapshot {
     pub id: String,
     pub label: String,
     pub status: String,
     pub phase: String,
     pub completed: u64,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub total: Option<u64>,
     pub committed: u64,
     pub batches: u64,
@@ -81,6 +83,7 @@ struct InterruptSlot {
     handle: Option<CancelHandle>,
 }
 struct Inner {
+    journal: Mutex<Option<crate::run_history::RunLease>>,
     reported_failure: Mutex<Option<String>>,
     progress: Mutex<OperationSnapshot>,
     cancelled: AtomicBool,
@@ -97,6 +100,7 @@ impl OperationContext {
     fn new(id: String, label: String, status: &str) -> Self {
         Self {
             inner: Arc::new(Inner {
+                journal: Mutex::new(None),
                 reported_failure: Mutex::new(None),
                 progress: Mutex::new(OperationSnapshot {
                     id,
@@ -119,6 +123,16 @@ impl OperationContext {
                 finished: Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn abandon_record(&self) {
+        self.inner.journal.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
+    pub(crate) fn record(&self, history: &crate::run_history::RunHistory, job: Option<(&str, &str)>) -> AppResult<()> {
+        let lease = history.start(&self.snapshot().id, job)?;
+        *self.inner.journal.lock().unwrap_or_else(|p| p.into_inner()) = Some(lease);
+        Ok(())
     }
 
     pub fn detached() -> Self {
@@ -170,6 +184,11 @@ impl OperationContext {
             .unwrap_or_else(|p| p.into_inner());
         state.committed = state.committed.saturating_add(rows);
         state.batches = state.batches.saturating_add(1);
+        if let Some(lease) = self.inner.journal.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            if lease.progress(&state.phase, state.committed, state.batches).is_err() {
+                state.message.push_str("；提交进度记录失败，异常退出后需核对目标数据");
+            }
+        }
     }
     pub fn report_failure(&self, message: String) {
         *self
@@ -289,6 +308,7 @@ impl OperationContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         state.interruptible = false;
+        let last_phase = state.phase.clone();
         match result {
             Ok(_) => {
                 if let Some(error) = self
@@ -324,6 +344,11 @@ impl OperationContext {
                 if state.status == "cancelled" && !detail.is_empty() {
                     state.message.push_str(&format!("。{detail}"));
                 }
+            }
+        }
+        if let Some(lease) = self.inner.journal.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if lease.finish(&state.status, state.committed, state.batches, &last_phase, result.as_ref().err().map(AppError::kind).or_else(|| (state.status == "failed").then_some("statementError"))).is_err() {
+                state.message.push_str("；执行记录未能保存，重启后请核对数据库或输出文件");
             }
         }
         *self

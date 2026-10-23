@@ -49,7 +49,7 @@ export function AiAssistant() {
         <Input.Password aria-label="API 密钥" disabled={!!busy} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="API 密钥" />
         <Button disabled={!!busy} loading={busy === "save"} onClick={() => void run("save", async () => {
           if (serviceChanged && !apiKey.trim()) throw new Error("更换服务地址后，请重新填写该服务的 API 密钥");
-          const settings = await api.saveAiSettings({ endpoint, model, apiKey });
+          const settings = await api.saveAiSettings({ endpoint, model, apiKey, clearKey: false });
           setEndpoint(settings.endpoint); setSavedEndpoint(settings.endpoint);
           setModel(settings.model); setSavedModel(settings.model);
           setHasKey(settings.hasKey); setApiKey(""); message.success("已保存");

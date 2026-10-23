@@ -314,7 +314,7 @@ fn cancel_stops_later_statements_without_replaying_writes(engine: Engine) {
     let worker = std::thread::spawn(move || {
         crate::query::execute_sql_with_operation(
             &worker_state,
-            ExecuteSqlRequest {
+            ExecuteSqlRequest { session_id: None,
                 connection_id: worker_id,
                 database: "demo".into(),
                 sql: query,
@@ -345,4 +345,31 @@ fn cancel_stops_later_statements_without_replaying_writes(engine: Engine) {
         Err(crate::error::AppError::Cancelled { .. })
     ));
     assert_eq!(crate::sqlutil::json_count(&rows.rows[0][0]), Some(0));
+}
+
+#[test]
+#[ignore = "requires isolated PostgreSQL from compose.test.yml"]
+fn postgres_large_explicit_limit_is_streamed_and_budget_truncation_keeps_session_usable() {
+    let port = std::env::var("DATAHARBOR_TEST_POSTGRES_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(15432);
+    let mut session = open_session(&config(Engine::Postgres, "", port)).unwrap();
+    let result = session.execute("demo", "SELECT g::text FROM generate_series(1,200003) g LIMIT 200003", Some(17)).unwrap();
+    assert_eq!(result.rows.len(),17);
+    assert!(result.truncated);
+    assert_eq!(result.rows[16][0], json!("17"));
+    if std::env::var_os("DATAHARBOR_MEMORY_PROBE").is_some() {
+        let bulk = session.execute("demo", "SELECT repeat('x',4096) FROM generate_series(1,131072) LIMIT 131072", Some(17)).unwrap();
+        assert_eq!(bulk.rows.len(),17);
+        assert!(bulk.truncated);
+        println!("Streamed 512 MiB of row text while retaining 17 rows");
+    }
+    // 64 MiB arrives over the protocol but only the configured prefix is retained.
+    let wide = session.execute("demo", "SELECT repeat('x',1048576) FROM generate_series(1,64) LIMIT 64", Some(1000)).unwrap();
+    assert!(wide.truncated);
+    assert!(wide.rows.len() <= 32);
+    assert_eq!(session.execute("demo", "SELECT 42", Some(1)).unwrap().rows[0][0],json!("42"));
+    // Preserve stateful statement semantics, including execution beyond the display limit.
+    session.execute("demo", "CREATE TEMP SEQUENCE stream_counter", None).unwrap();
+    let counted = session.execute("demo", "SELECT nextval('stream_counter') FROM generate_series(1,300) LIMIT 300", Some(2)).unwrap();
+    assert_eq!(counted.rows.len(),2);
+    assert_eq!(session.execute("demo", "SELECT last_value FROM stream_counter", Some(1)).unwrap().rows[0][0],json!("300"));
 }

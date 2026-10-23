@@ -23,7 +23,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["default-rust", "rustls-tls-ring"] }
-postgres = "0.19"
+tokio-postgres = "0.7"
 postgres-native-tls = "0.5"
 native-tls = "0.2"
 aes-gcm = "0.10"
@@ -60,3 +60,6 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+ts-rs = { version = "12", features = ["serde-json-impl"] }
