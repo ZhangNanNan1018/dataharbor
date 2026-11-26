@@ -366,27 +366,27 @@ impl DbSession for RedisSession {
         let columns = columns_for(&kind);
         let mut rows = match kind.as_str() {
             "string" => {
-                let value: Option<String> = redis::cmd("GET")
+                let value: Option<Vec<u8>> = redis::cmd("GET")
                     .arg(table)
                     .query(self.conn.as_mut())
                     .map_err(|err| AppError::msg(err.to_string()))?;
                 vec![vec![
                     JsonValue::String(table.into()),
-                    JsonValue::String(value.unwrap_or_default()),
+                    value.as_deref().map(redis_cell).unwrap_or(JsonValue::Null),
                 ]]
             }
             "hash" => {
-                let mut map: Vec<(String, String)> = redis::cmd("HGETALL")
+                let mut map: Vec<(Vec<u8>, Vec<u8>)> = redis::cmd("HGETALL")
                     .arg(table)
                     .query(self.conn.as_mut())
                     .map_err(|err| AppError::msg(err.to_string()))?;
                 map.sort_by(|left, right| left.0.cmp(&right.0));
                 map.into_iter()
-                    .map(|(field, value)| vec![JsonValue::String(field), JsonValue::String(value)])
+                    .map(|(field, value)| vec![redis_cell(&field), redis_cell(&value)])
                     .collect()
             }
             "list" => {
-                let values: Vec<String> = redis::cmd("LRANGE")
+                let values: Vec<Vec<u8>> = redis::cmd("LRANGE")
                     .arg(table)
                     .arg(offset)
                     .arg(u64::from(offset) + u64::from(limit) - 1)
@@ -396,26 +396,23 @@ impl DbSession for RedisSession {
                     .into_iter()
                     .enumerate()
                     .map(|(index, value)| {
-                        vec![
-                            json!(u64::from(offset) + index as u64),
-                            JsonValue::String(value),
-                        ]
+                        vec![json!(u64::from(offset) + index as u64), redis_cell(&value)]
                     })
                     .collect()
             }
             "set" => {
-                let mut values: Vec<String> = redis::cmd("SMEMBERS")
+                let mut values: Vec<Vec<u8>> = redis::cmd("SMEMBERS")
                     .arg(table)
                     .query(self.conn.as_mut())
                     .map_err(|err| AppError::msg(err.to_string()))?;
                 values.sort();
                 values
                     .into_iter()
-                    .map(|value| vec![JsonValue::String(value)])
+                    .map(|value| vec![redis_cell(&value)])
                     .collect()
             }
             "zset" => {
-                let values: Vec<(String, String)> = redis::cmd("ZRANGE")
+                let values: Vec<(Vec<u8>, String)> = redis::cmd("ZRANGE")
                     .arg(table)
                     .arg(offset)
                     .arg(u64::from(offset) + u64::from(limit) - 1)
@@ -424,9 +421,7 @@ impl DbSession for RedisSession {
                     .map_err(|err| AppError::msg(err.to_string()))?;
                 values
                     .into_iter()
-                    .map(|(member, score)| {
-                        vec![JsonValue::String(member), JsonValue::String(score)]
-                    })
+                    .map(|(member, score)| vec![redis_cell(&member), JsonValue::String(score)])
                     .collect()
             }
             _ => {
@@ -441,13 +436,30 @@ impl DbSession for RedisSession {
             offset as usize
         };
         let end = (start + limit as usize).min(rows.len());
-        let page = if start < rows.len() {
+        let page: Vec<Vec<JsonValue>> = if start < rows.len() {
             rows.drain(start..end).collect()
         } else {
             Vec::new()
         };
+        // Preserve a byte-exact witness for genuine U+FFFD text. Older lossy
+        // snapshots cannot distinguish this character from invalid UTF-8.
+        let has_ambiguous_text = page.iter().flatten().any(|value| {
+            value.as_str().is_some_and(|text| text.contains(char::REPLACEMENT_CHARACTER))
+        });
+        let original_rows = has_ambiguous_text.then(|| {
+            page.iter().map(|row| {
+                columns.iter().zip(row).map(|(column, value)| {
+                    let original = match value.as_str() {
+                        Some(text) if column.data_type == "redis-string" && text.contains(char::REPLACEMENT_CHARACTER) =>
+                            json!({"$redisBytes": crate::sqlutil::json_blob(text.as_bytes())}),
+                        _ => value.clone(),
+                    };
+                    crate::models::FieldValue { column: column.name.clone(), value: original }
+                }).collect()
+            }).collect()
+        });
         Ok(QueryOutcome {
-            original_rows: None,
+            original_rows,
             columns,
             rows: page,
             rows_affected: 0,
@@ -514,7 +526,8 @@ impl DbSession for RedisSession {
             .values
             .iter()
             .find(|item| item.column == "value")
-            .map(|item| json_text(&item.value))
+            .map(|item| redis_bytes(&item.value))
+            .transpose()?
             .unwrap_or_default();
         let added: i64 = match kind.as_str() {
             "string" | "none" => {
@@ -602,7 +615,7 @@ else return 0 end
 return 1
 "#;
 
-fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<String>> {
+fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<Vec<u8>>> {
     let original = change
         .original
         .as_ref()
@@ -634,19 +647,34 @@ fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<String>> {
     if !matches!(change.kind.as_str(), "update" | "delete") {
         return Err(AppError::msg("不支持的 Redis 修改类型"));
     }
-    let id = json_text(fields[identity]);
+    // Old snapshots could have stringified damaged UTF-8. Fresh ambiguous values
+    // carry an explicit byte tag, so a stale replacement character is detectable.
+    if fields.iter().any(|(column, v)| {
+        *column != "key"
+            && v.as_str()
+                .is_some_and(|s| s.contains(char::REPLACEMENT_CHARACTER))
+    }) {
+        return Err(AppError::msg("旧 Redis 原始值含替换字符，请重新加载后编辑"));
+    }
+    let id = redis_bytes(fields[identity])?;
     if change.pk.len() != 1
         || change.pk[0].column != identity
-        || json_text(&change.pk[0].value) != id
-        || (kind == "string" && id != table)
+        || redis_bytes(&change.pk[0].value)? != id
+        || (kind == "string" && id != table.as_bytes())
     {
         return Err(AppError::msg("Redis 行标识与原始数据不一致"));
     }
-    if kind == "list" && !id.parse::<i64>().is_ok_and(|index| index >= 0) {
+    if kind == "list"
+        && !std::str::from_utf8(&id)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_some_and(|index| index >= 0)
+    {
         return Err(AppError::msg("Redis 列表位置无效"));
     }
     let old = value
-        .map(|name| json_text(fields[name]))
+        .map(|name| redis_bytes(fields[name]))
+        .transpose()?
         .unwrap_or_default();
     let mut new = old.clone();
     let mut seen = std::collections::BTreeSet::new();
@@ -655,18 +683,21 @@ fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<String>> {
             return Err(AppError::msg("更改包含重复字段"));
         }
         if field.column == identity {
-            if json_text(&field.value) != id {
+            if redis_bytes(&field.value)? != id {
                 return Err(AppError::msg("Redis 网格不能更改行标识，请新增后删除原行"));
             }
         } else if Some(field.column.as_str()) == value {
-            new = json_text(&field.value);
+            new = redis_bytes(&field.value)?;
         } else {
             return Err(AppError::msg("Redis 更改包含未知字段"));
         }
     }
     if kind == "zset"
         && change.kind == "update"
-        && !new.parse::<f64>().is_ok_and(|value| !value.is_nan())
+        && !std::str::from_utf8(&new)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .is_some_and(|value| !value.is_nan())
     {
         return Err(AppError::msg("Redis 分数不是有效数值"));
     }
@@ -675,22 +706,22 @@ fn cas_args(table: &str, change: &RowChange) -> AppResult<Vec<String>> {
     }
     Ok(vec![
         kind.into(),
-        change.kind.clone(),
+        change.kind.as_bytes().to_vec(),
         id,
         old,
         new,
-        format!("dataharbor-delete-{}", uuid::Uuid::new_v4()),
+        format!("dataharbor-delete-{}", uuid::Uuid::new_v4()).into_bytes(),
     ])
 }
 
-fn field_of(change: &RowChange, column: &str) -> AppResult<String> {
+fn field_of(change: &RowChange, column: &str) -> AppResult<Vec<u8>> {
     change
         .pk
         .iter()
         .chain(change.values.iter())
         .find(|item| item.column == column)
-        .map(|item| json_text(&item.value))
         .ok_or_else(|| AppError::msg(format!("缺少 {column}")))
+        .and_then(|item| redis_bytes(&item.value))
 }
 
 fn key_type(conn: &mut dyn redis::ConnectionLike, key: &str) -> AppResult<String> {
@@ -702,12 +733,12 @@ fn key_type(conn: &mut dyn redis::ConnectionLike, key: &str) -> AppResult<String
 
 fn columns_for(kind: &str) -> Vec<ColumnMeta> {
     match kind {
-        "string" => vec![pk("key", "string"), col("value", "string")],
-        "hash" => vec![pk("field", "string"), col("value", "string")],
-        "list" => vec![pk("index", "int"), col("value", "string")],
-        "set" => vec![pk("member", "string")],
-        "zset" => vec![pk("member", "string"), col("score", "float")],
-        _ => vec![pk("key", "string"), col("value", "string")],
+        "string" => vec![pk("key", "string"), col("value", "redis-string")],
+        "hash" => vec![pk("field", "redis-string"), col("value", "redis-string")],
+        "list" => vec![pk("index", "int"), col("value", "redis-string")],
+        "set" => vec![pk("member", "redis-string")],
+        "zset" => vec![pk("member", "redis-string"), col("score", "float")],
+        _ => vec![pk("key", "string"), col("value", "redis-string")],
     }
 }
 
@@ -750,7 +781,7 @@ fn value_to_outcome(value: redis::Value, max_rows: usize) -> QueryOutcome {
     let rows_affected = if rows.is_empty() { 1 } else { 0 };
     QueryOutcome {
         original_rows: None,
-        columns: vec![col("path", "string"), col("value", "string")],
+        columns: vec![col("path", "string"), col("value", "redis-string")],
         rows,
         rows_affected,
         truncated,
@@ -773,7 +804,7 @@ fn flatten(path: &str, value: &redis::Value, rows: &mut Vec<Vec<JsonValue>>) {
         }
         redis::Value::BulkString(bytes) => rows.push(vec![
             JsonValue::String(path.into()),
-            JsonValue::String(String::from_utf8_lossy(bytes).into_owned()),
+            redis_cell(bytes),
         ]),
         redis::Value::Double(value) => {
             rows.push(vec![JsonValue::String(path.into()), json!(value)])
@@ -825,6 +856,31 @@ fn split_command(line: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+fn redis_cell(bytes: &[u8]) -> JsonValue {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
+        {
+            return json!(text);
+        }
+    }
+    json!({"$redisBytes": crate::sqlutil::json_blob(bytes)})
+}
+
+fn redis_bytes(value: &JsonValue) -> AppResult<Vec<u8>> {
+    if let Some(object) = value.as_object() {
+        if object.len() == 1 {
+            if let Some(encoded) = object.get("$redisBytes") {
+                return crate::sqlutil::binary_cell_bytes(encoded)
+                    .ok_or_else(|| AppError::msg("Redis 二进制单元格编码无效"));
+            }
+        }
+        return Err(AppError::msg("Redis 单元格值格式无效"));
+    }
+    Ok(json_text(value).into_bytes())
 }
 
 fn json_text(value: &JsonValue) -> String {
@@ -1411,7 +1467,7 @@ mod tests {
             values: vec![field("value", "new")],
         };
         let args = cas_args("{test}:hash", &change).unwrap();
-        assert_eq!(&args[..5], ["hash", "update", "", "old", "new"]);
+        assert_eq!(&args[..5], ["hash", "update", "", "old", "new"].map(str::as_bytes));
         let command = redis::cmd("EVAL")
             .arg(CAS_SCRIPT)
             .arg(1)

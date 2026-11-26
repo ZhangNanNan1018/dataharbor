@@ -1,7 +1,7 @@
 {
   "name": "dataharbor",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DataHarbor — independent cross-platform database client",
   "license": "MIT",
   "type": "module",

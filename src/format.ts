@@ -1,4 +1,4 @@
-import type { ColumnMeta, JsonValue } from "./types";
+import type { ColumnMeta, Engine, JsonValue } from "./types";
 
 export function isBoolType(dataType: string): boolean {
   return dataType.toLowerCase().startsWith("bool");
@@ -75,8 +75,22 @@ export function imageMime(bytes: Uint8Array): string {
   return "image/png";
 }
 
+export function redisBinaryValue(value: JsonValue | undefined, type?: string): string | undefined {
+  if (type !== "redis-string" || !value || typeof value !== "object" || Array.isArray(value)) return;
+  if (typeof value.$redisBytes === "string") return value.$redisBytes;
+}
+
+function isGeometryCell(value: JsonValue | undefined, type?: string): value is { wkt: string; srid: number } {
+  return /^(geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geom(?:etry)?collection)$/i.test(type ?? "")
+    && !!value && typeof value === "object" && !Array.isArray(value)
+    && typeof value.wkt === "string" && typeof value.srid === "number";
+}
+
 export function displayCell(value: JsonValue | undefined, dataType?: string): string {
   if (value === null || value === undefined) return "NULL";
+  if (isGeometryCell(value, dataType)) return value.wkt;
+  const redisBytes = redisBinaryValue(value, dataType);
+  if (redisBytes !== undefined) return displayCell(redisBytes, "binary");
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "string") {
     if (dataType && isBoolType(dataType)) {
@@ -99,6 +113,7 @@ export function sameValue(left: JsonValue | undefined, right: JsonValue | undefi
 
 /** BSON uses Extended JSON so objects, scalar types and typed wrappers survive editing. */
 export function cellEditorText(value: JsonValue, column: ColumnMeta): string {
+  if (isGeometryCell(value, column.dataType) || column.dataType === "redis-string") return value === null ? "" : displayCell(value, column.dataType);
   if (/^jsonb?$/i.test(column.dataType) && typeof value === "string") return value;
   if (isJsonCell(column, value)) return JSON.stringify(value);
   return value === null ? "" : displayCell(value, column.dataType);
@@ -108,8 +123,22 @@ function isJsonCell(column: ColumnMeta, value: JsonValue): boolean {
   return /^(bson|jsonb?)$/i.test(column.dataType) || (value !== null && typeof value === "object");
 }
 
-export function parseEditedCell(raw: string, column: ColumnMeta, original: JsonValue): JsonValue {
+export function parseEditedCell(raw: string, column: ColumnMeta, original: JsonValue, engine?: Engine): JsonValue {
   if (raw === cellEditorText(original, column)) return original;
+  if (engine === "mysql" || engine === "mariadb") {
+    const match = /^bit(?:\((\d+)\))?$/i.exec(column.dataType);
+    if (match) {
+      const width = Number(match[1] ?? 1);
+      const decimal = raw.trim().replace(/^0+(?=\d)/, "");
+      if (!/^\d{1,20}$/.test(decimal) || BigInt(decimal) >= (1n << BigInt(width))) {
+        throw new Error(`BIT(${width}) 需要位宽范围内的无符号十进制整数`);
+      }
+      const number = Number(decimal);
+      return Number.isSafeInteger(number) ? number : decimal;
+    }
+  }
+  if (isGeometryCell(original, column.dataType)) return { srid: original.srid, wkt: raw.trim() };
+  if (column.dataType === "redis-string") return raw;
   if (!isJsonCell(column, original)) return parseCell(raw, column, false);
   try {
     const value = JSON.parse(raw) as JsonValue;

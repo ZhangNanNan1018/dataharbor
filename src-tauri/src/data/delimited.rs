@@ -1,6 +1,7 @@
 //! Shared CSV/TSV encoding. Empty text stays empty; \N denotes NULL. Only
 //! strings made of backslashes followed by N are escaped; UNC paths stay intact.
 use crate::error::{AppError, AppResult};
+use crate::models::ColumnMeta;
 use crate::operations::OperationContext;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -12,6 +13,18 @@ pub(crate) fn cell(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+pub(crate) fn typed_cell(value: &Value, column: Option<&ColumnMeta>) -> String {
+    if let (Some(srid), Some(wkt)) = (
+        value.get("srid").and_then(Value::as_u64),
+        value.get("wkt").and_then(Value::as_str),
+    ) {
+        if column.is_some_and(|c| crate::mysql_values::is_geometry(&c.data_type)) {
+            return format!("SRID={srid};{wkt}");
+        }
+    }
+    cell(value)
 }
 
 pub(crate) fn parse_cell(text: &str) -> Value {
@@ -85,7 +98,7 @@ pub(crate) fn write(
 ) -> AppResult<()> {
     write_with_operation(
         writer,
-        columns,
+        &columns.iter().map(ColumnMeta::named).collect::<Vec<_>>(),
         rows,
         delimiter,
         &OperationContext::detached(),
@@ -94,7 +107,7 @@ pub(crate) fn write(
 
 pub(crate) fn write_with_operation(
     writer: impl Write,
-    columns: &[String],
+    columns: &[ColumnMeta],
     rows: &[Vec<Value>],
     delimiter: u8,
     operation: &OperationContext,
@@ -104,12 +117,16 @@ pub(crate) fn write_with_operation(
         .delimiter(delimiter)
         .from_writer(writer);
     writer
-        .write_record(columns)
+        .write_record(columns.iter().map(|c| &c.name))
         .map_err(|err| AppError::msg(err.to_string()))?;
     for (index, row) in rows.iter().enumerate() {
         operation.checkpoint()?;
         writer
-            .write_record(row.iter().map(cell))
+            .write_record(
+                row.iter()
+                    .enumerate()
+                    .map(|(i, v)| typed_cell(v, columns.get(i))),
+            )
             .map_err(|err| AppError::msg(err.to_string()))?;
         if index % 500 == 0 {
             operation.report(

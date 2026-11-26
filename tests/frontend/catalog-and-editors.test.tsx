@@ -3,6 +3,7 @@ import { App, ConfigProvider } from "antd";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import { api } from "../../src/api";
+import { QueryResultTable } from "../../src/components/QueryResultTable";
 import { CellValue } from "../../src/components/CellEditors";
 import { ConnFields } from "../../src/components/studio/shared";
 import { Sidebar } from "../../src/components/Sidebar";
@@ -49,6 +50,29 @@ beforeEach(() => {
 });
 
 describe("结构化单元格编辑", () => {
+  it("查询表格按字段类型显示精确位值、坐标、文本和二进制", () => {
+    const types = ["bit(1)", "bit(64)", "geometry", "text", "binary"];
+    mount(<QueryResultTable statement={{
+      index: 0, sql: "SELECT *", ok: true, columns: types.map((dataType) => ({ ...column, name: dataType, dataType })),
+      rows: [[0, "18446744073709551615", { srid: 4326, wkt: "POINT(121 32)" }, "0x4142", "base64:AP8="]],
+      rowsAffected: 0, page: 1, pageSize: 20, pageable: false, elapsedMs: 0, message: "", truncated: false, hasMore: false,
+    }} />);
+    for (const text of ["0", "18446744073709551615", "POINT(121 32)", "0x4142", "二进制 2 字节"]) {
+      expect(screen.getByText(text)).toBeInTheDocument();
+    }
+  });
+
+  it("Redis 十六进制编辑器保留二进制类型", async () => {
+    const commit = vi.fn();
+    mount(<CellValue column={{ ...column, dataType: "redis-string" }} value={{ $redisBytes: "base64:AP8=" }}
+      dirty={false} disabled={false} alwaysEdit connectionId="fixture" database="0" onCommit={commit} />);
+    fireEvent.click(screen.getByRole("button", { name: "十六进制" }));
+    const input = await screen.findByDisplayValue("00 ff");
+    fireEvent.change(input, { target: { value: "ff 00" } });
+    fireEvent.click(screen.getByRole("button", { name: "写回单元格" }));
+    expect(commit).toHaveBeenCalledWith({ $redisBytes: "base64:/wA=" });
+  });
+
   it.each<JsonValue>([null, true, false, 3, "text", [1, "two"], { nested: { keep: true } }, { $numberLong: "9007199254740993" }, { $date: { $numberLong: "123" } }])("不修改后失焦保留原类型：%j", (original) => {
     const commit = vi.fn();
     mount(<CellValue column={column} value={original} dirty={false} disabled={false} alwaysEdit connectionId="fixture" database="fixture" onCommit={commit} />);

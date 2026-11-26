@@ -341,3 +341,135 @@ fn postgres_native_copy_backup_restores_through_restricted_psql() {
     assert_eq!(fixture.page().rows, expected);
     let _ = std::process::Command::new("docker").args(["exec", &container, "rm", "-f", &remote_dump, &remote_ready]).status();
 }
+
+#[test]
+#[ignore = "requires disposable MySQL 8 at DATAHARBOR_TEST_MYSQL_PORT"]
+fn mysql_bit_binary_geometry_round_trip() {
+    check_bit_binary_geometry(Engine::Mysql, "DATAHARBOR_TEST_MYSQL_PORT");
+    if std::env::var_os("DATAHARBOR_TEST_MARIADB_PORT").is_some() {
+        check_bit_binary_geometry(Engine::Mariadb, "DATAHARBOR_TEST_MARIADB_PORT");
+    }
+}
+
+fn check_bit_binary_geometry(engine: Engine, port: &str) {
+    let f = Fixture::open(engine, port);
+    let axis = if engine == Engine::Mysql {
+        ",'axis-order=long-lat'"
+    } else {
+        ""
+    };
+    let t = &f.table_sql;
+    f.sql(&format!("DROP TABLE {t}"));
+    f.sql(&format!("CREATE TABLE {t} (k BIT(64) PRIMARY KEY, flag BIT(1), mask8 BIT(8), g POINT, bin VARBINARY(8), txt TEXT)"));
+    f.sql(&format!("INSERT INTO {t} VALUES (18446744073709551615,1,65,ST_GeomFromText('POINT(120.5 31.25)',4326{axis}),X'00FF','0x4142'),(18446744073709551614,0,255,NULL,X'','base64:QQ=='),(256,NULL,0,NULL,NULL,NULL)"));
+    let page = f.page();
+    let select = |query: &str| {
+        f.state
+            .with_session(&f.id, |s| s.execute(&f.database, query, None))
+            .unwrap()
+    };
+    let result = select(&format!("SELECT * FROM {t} ORDER BY k"));
+    assert_eq!(page.rows, result.rows);
+    assert_eq!(result.columns[4].data_type, "binary");
+    assert_eq!(result.columns[5].data_type, "text");
+    assert_eq!(result.rows[0][0], json!(256));
+    assert!(result.rows[0][1].is_null());
+    assert_eq!(result.rows[1][1..3], [json!(0), json!(255)]);
+    assert_eq!(
+        result.rows[1][4..],
+        [json!("base64:"), json!("base64:QQ==")]
+    );
+    for (column, op, value) in [("k", "eq", "18446744073709551615"), ("mask8", "contains", "65")] {
+        let filtered = fetch_rows(&f.state, FetchRowsRequest {
+            connection_id: f.id.clone(), database: f.database.clone(), schema: f.schema.clone(), table: f.table.clone(),
+            filters: vec![FilterSpec { column: column.into(), op: op.into(), value: Some(value.into()) }],
+            sorts: vec![], page: 1, page_size: 10,
+        }).unwrap();
+        assert_eq!(filtered.rows, vec![page.rows[2].clone()]);
+    }
+    let last = &page.rows[2];
+    assert_eq!(
+        last[..3],
+        [json!("18446744073709551615"), json!(1), json!(65)]
+    );
+    assert_eq!(last[3]["wkt"], "POINT(120.5 31.25)");
+    assert_eq!(last[3]["srid"], 4326);
+    assert_eq!(last[4..], [json!("base64:AP8="), json!("0x4142")]);
+    let field = |name: &str, value| FieldValue {
+        column: name.into(),
+        value,
+    };
+    let commit = |page: &DataPage, op: &str, values| {
+        let row = &page.rows[2];
+        commit_changes(
+            &f.state,
+            CommitRequest {
+                connection_id: f.id.clone(),
+                database: f.database.clone(),
+                schema: f.schema.clone(),
+                table: f.table.clone(),
+                changes: vec![RowChange {
+                    kind: op.into(),
+                    pk: vec![field("k", row[0].clone())],
+                    values,
+                    original: Some(
+                        page.columns
+                            .iter()
+                            .zip(row)
+                            .map(|(c, v)| field(&c.name, v.clone()))
+                            .collect(),
+                    ),
+                }],
+            },
+        )
+    };
+    assert!(commit(&page, "update", vec![field("flag", json!("2"))]).is_err());
+    commit(&page, "update", vec![field("txt", json!("updated"))]).unwrap();
+    let updated = f.page();
+    assert_eq!(updated.rows[2][3], last[3]);
+    commit(
+        &updated,
+        "update",
+        vec![
+            field("g", json!({"srid":4326,"wkt":"POINT(121 32)"})),
+            field("bin", json!("base64:/wA=")),
+        ],
+    )
+    .unwrap();
+    let expected = f.page();
+    assert_eq!(expected.rows[2][3]["wkt"], "POINT(121 32)");
+    assert_eq!(expected.rows[2][4], "base64:/wA=");
+    let path = f.dir.join("typed.csv").display().to_string();
+    export_table_csv(
+        &f.state,
+        ExportTableRequest {
+            connection_id: f.id.clone(),
+            database: f.database.clone(),
+            schema: f.schema.clone(),
+            table: f.table.clone(),
+            filters: vec![],
+            sorts: vec![],
+            path: path.clone(),
+        },
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("SRID=4326;POINT(121 32)"));
+    commit(&expected, "delete", vec![]).unwrap();
+    assert_eq!(f.page().rows.len(), 2);
+    f.sql(&format!("DELETE FROM {t}"));
+    import_table_csv(
+        &f.state,
+        ImportCsvRequest {
+            connection_id: f.id.clone(),
+            database: f.database.clone(),
+            schema: f.schema.clone(),
+            table: f.table.clone(),
+            path,
+            truncate: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(f.page().rows, expected.rows);
+}

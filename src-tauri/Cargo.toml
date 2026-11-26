@@ -1,6 +1,6 @@
 [package]
 name = "dataharbor"
-version = "0.1.1"
+version = "0.1.2"
 description = "DataHarbor — independent cross-platform database client"
 authors = ["DataHarbor contributors"]
 license = "MIT"
@@ -43,6 +43,8 @@ redis = { version = "0.27", features = ["cluster", "sentinel"] }
 # macOS and Linux still compile; those builds refuse Windows Authentication.
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "winauth", "native-tls"] }
 dameng = "0.1"
+dameng-types = "0.1"
+geozero = { version = "0.15", default-features = false, features = ["with-wkb", "with-wkt"] }
 # lz4 is lz4_flex (pure Rust). zstd bundles its C sources with cc, the same toolchain Tauri already needs on Windows and macOS.
 parquet = { version = "59.3", default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "zstd", "lz4"] }
 arrow-array = "59.3"

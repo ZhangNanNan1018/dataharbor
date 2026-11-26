@@ -20,7 +20,7 @@ import { useLongOperation } from "../operations";
 import { TaskProgress } from "./TaskProgress";
 import type { ForeignKeyRef } from "../api";
 import { CellValue } from "./CellEditors";
-import { isNumericType, sameValue } from "../format";
+import { displayCell, isNumericType, sameValue } from "../format";
 import { useTabStore } from "../stores/useTabStore";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useUiStore } from "../stores/useUiStore";
@@ -45,7 +45,8 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   const exportInFlight = useRef(false);
   const setStatus = useUiStore((state) => state.setStatus);
   const setDirty = useTabStore((state) => state.setDirty);
-  const supportsFilters = useConnectionStore((state) => engineCapabilities(state.profiles.find((profile) => profile.id === tab.connectionId)?.engine)?.filters ?? false);
+  const engine = useConnectionStore((state) => state.profiles.find((profile) => profile.id === tab.connectionId)?.engine);
+  const supportsFilters = engineCapabilities(engine)?.filters ?? false;
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [rows, setRows] = useState<GridRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -409,6 +410,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
     align: isNumericType(column.dataType) ? "right" : "left",
     render: (_value, row) => (
       <CellValue
+        engine={engine}
         column={column}
         value={row.cells[index] ?? null}
         dirty={Boolean(row.original) && !sameValue(row.cells[index], row.original?.[index])}
@@ -518,7 +520,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
             <div key={`${change.kind}-${index}`} className="xb-review-row">
               <span className="xb-review-kind">{change.kind === "insert" ? "新增" : change.kind === "delete" ? "删除" : "更新"}</span>
               <span>
-                {change.values.map((field) => `${field.column}=${field.value === null ? "NULL" : String(field.value)}`).join(", ") || change.pk.map((field) => field.column).join(", ")}
+                {change.values.map((field) => `${field.column}=${displayCell(field.value, columns.find((column) => column.name === field.column)?.dataType)}`).join(", ") || change.pk.map((field) => field.column).join(", ")}
               </span>
             </div>
           ))}
@@ -539,6 +541,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
                 <label key={column.name} className="text-xs">
                   <span className="text-[var(--xb-muted)]">{column.name}</span>
                   <CellValue
+                    engine={engine}
                     alwaysEdit
                     column={column}
                     value={row.cells[index] ?? null}

@@ -205,6 +205,19 @@
     },
     {
       "ecosystem": "cargo",
+      "name": "approx",
+      "version": "0.5.1",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/brendanzab/approx",
+      "licenseFiles": [
+        {
+          "file": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
       "name": "arbitrary",
       "version": "1.5.0",
       "license": "MIT OR Apache-2.0",
@@ -3340,6 +3353,45 @@
           "file": "LICENSE",
           "sha256": "eb69613e00e596e13d2f58e820aee10e9d51754b91d7111bc997f1fc90791f66"
         }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "geo-traits",
+      "version": "0.3.0",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/georust/geo",
+      "licenseFiles": [],
+      "needsReview": [
+        "未找到授权原文；metadata 中的 license 不能替代完整授权文本"
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "geo-types",
+      "version": "0.7.20",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/georust/geo",
+      "licenseFiles": [
+        {
+          "file": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "sha256": "2f8267b247fd81e9555a2e196e119a5b341bcae21011cd93985c312f1312f727"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "geozero",
+      "version": "0.15.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/georust/geozero",
+      "licenseFiles": [],
+      "needsReview": [
+        "未找到授权原文；metadata 中的 license 不能替代完整授权文本"
       ]
     },
     {
@@ -7519,6 +7571,19 @@
     },
     {
       "ecosystem": "cargo",
+      "name": "scroll",
+      "version": "0.13.0",
+      "license": "MIT",
+      "repository": "https://github.com/m4b/scroll",
+      "licenseFiles": [
+        {
+          "file": "LICENSE",
+          "sha256": "6e24b7455f0b9afefdf4f3efd59a56ce76a3020c2dc4371937e281fc5e587fd7"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
       "name": "sct",
       "version": "0.7.1",
       "license": "Apache-2.0 OR ISC OR MIT",
@@ -11365,6 +11430,23 @@
         {
           "file": "LICENSE-MIT",
           "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "wkt",
+      "version": "0.14.0",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/georust/wkt",
+      "licenseFiles": [
+        {
+          "file": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "LICENSE-MIT",
+          "sha256": "2f8267b247fd81e9555a2e196e119a5b341bcae21011cd93985c312f1312f727"
         }
       ]
     },

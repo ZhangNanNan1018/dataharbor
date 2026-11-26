@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../../src/sqlIntelligence";
-import { isNumericType, parseCell } from "../../src/format";
+import { cellEditorText, displayCell, isNumericType, parseCell, parseEditedCell } from "../../src/format";
 import type { ColumnMeta } from "../../src/types";
 
 function monacoFixture() {
@@ -93,6 +93,25 @@ describe("多连接 SQL 结构隔离", () => {
 });
 
 describe("精确数值编辑", () => {
+  it("formats binary, spatial and bit cells without confusing ordinary strings", () => {
+    const geometry = { srid: 4326, wkt: "POINT(120 31)", wkb: "base64:original" };
+    expect(displayCell(geometry, "point")).toBe("POINT(120 31)");
+    expect(cellEditorText(geometry, column("point"))).toBe("POINT(120 31)");
+    expect(parseEditedCell("POINT(120 31)", column("point"), geometry)).toBe(geometry);
+    expect(parseEditedCell("POINT(121 32)", column("point"), geometry)).toEqual({ srid: 4326, wkt: "POINT(121 32)" });
+    for (const text of ["base64:QQ==", "0x4142"]) {
+      expect(displayCell(text, "text")).toBe(text);
+      expect(displayCell(text, "redis-string")).toBe(text);
+    }
+    expect(displayCell({ $redisBytes: "base64:AP8=" }, "redis-string")).toBe("二进制 2 字节");
+    expect(displayCell("base64:", "binary")).toBe("二进制 0 字节");
+    expect(displayCell(null, "binary")).toBe("NULL");
+    expect(parseEditedCell("18446744073709551615", column("bit(64)"), null, "mysql")).toBe("18446744073709551615");
+    expect(() => parseEditedCell("2", column("bit(1)"), 0, "mariadb")).toThrow("BIT(1)");
+    expect(parseEditedCell("0011", column("bit(4)"), null, "postgres")).toBe("0011");
+    expect(displayCell("18446744073709551615", "bit(64)")).toBe("18446744073709551615");
+  });
+
   const column = (dataType: string): ColumnMeta => ({ name: "value", dataType, nullable: true, primaryKey: false, autoIncrement: false });
   it("高精度十进制和大整数不会经过 JS 浮点数舍入", () => {
     const exact = "123456789012345678.123456789012345678";

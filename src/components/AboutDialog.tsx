@@ -12,7 +12,7 @@ export function AboutDialog() {
       <div className="mb-3 flex items-center gap-3">
         <Logo size={36} />
         <div>
-          <div className="text-base font-semibold">DataHarbor {info?.version ?? "0.1.1"}</div>
+          <div className="text-base font-semibold">DataHarbor {info?.version ?? "0.1.2"}</div>
           <div className="text-[var(--xb-muted)]">DataHarbor · MIT</div>
         </div>
       </div>

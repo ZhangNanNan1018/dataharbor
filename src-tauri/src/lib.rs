@@ -12,6 +12,7 @@ mod mail;
 mod migrate;
 mod models;
 mod native;
+mod mysql_values;
 mod operations;
 mod persistence;
 mod run_history;

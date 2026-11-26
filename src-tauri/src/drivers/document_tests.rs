@@ -359,3 +359,132 @@ fn redis_single_key_cas_preserves_new_values_type_ttl_and_list_members() {
     assert_eq!(later.total, 600);
     assert_eq!(later.rows[0], vec![json!(550), json!("550")]);
 }
+
+#[test]
+#[ignore = "requires disposable Redis 6+ at DATAHARBOR_TEST_REDIS_PORT"]
+fn redis_binary_command_and_grid_round_trip() {
+    let fixture = Fixture::open(Engine::Redis, "DATAHARBOR_TEST_REDIS_PORT");
+    let port = std::env::var("DATAHARBOR_TEST_REDIS_PORT").unwrap();
+    let mut wire = redis::Client::open(format!("redis://127.0.0.1:{port}"))
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let bytes: &[u8] = &[0, 255];
+    let tag = json!({"$redisBytes":"base64:AP8="});
+    for (suffix, cmd) in [
+        ("string", "SET"),
+        ("hash", "HSET"),
+        ("list", "RPUSH"),
+        ("set", "SADD"),
+        ("zset", "ZADD"),
+    ] {
+        let key = format!("{}_{suffix}", fixture.prefix);
+        let mut create = redis::cmd(cmd);
+        create.arg(&key);
+        if suffix == "hash" {
+            create.arg(bytes);
+        }
+        if suffix == "zset" {
+            create.arg("1");
+        }
+        create.arg(bytes).query::<()>(&mut wire).unwrap();
+        let page = fixture.page(&key, vec![], 1, 10);
+        assert!(page.rows[0].contains(&tag));
+        if suffix == "string" {
+            assert_eq!(fixture.command(&format!("GET {key}")).rows[0][1], tag);
+            fixture.command(&format!("PEXPIRE {key} 30000"));
+        }
+        if matches!(suffix, "set" | "zset") {
+            fixture.change(&key, &page, 0, "delete", vec![]).unwrap();
+            assert_eq!(
+                fixture.command(&format!("EXISTS {key}")).rows[0][1],
+                json!(0)
+            );
+        } else {
+            if suffix == "hash" {
+                assert_eq!(page.rows[0][0], tag);
+            }
+            let update = vec![field("value", json!({"$redisBytes":"base64:/wE="}))];
+            fixture
+                .change(&key, &page, 0, "update", update.clone())
+                .unwrap();
+            assert!(fixture.change(&key, &page, 0, "update", update).is_err());
+            let fresh = fixture.page(&key, vec![], 1, 10);
+            assert_eq!(fresh.rows[0][1], json!({"$redisBytes":"base64:/wE="}));
+            if suffix == "string" {
+                assert!(
+                    fixture.command(&format!("PTTL {key}")).rows[0][1]
+                        .as_i64()
+                        .unwrap()
+                        > 0
+                );
+            }
+            fixture
+                .change(
+                    &key,
+                    &fresh,
+                    0,
+                    "update",
+                    vec![field("value", json!("base64:QQ=="))],
+                )
+                .unwrap();
+            assert_eq!(
+                fixture.page(&key, vec![], 1, 10).rows[0][1],
+                json!("base64:QQ==")
+            );
+        }
+        let more = json!({"$redisBytes":"base64:gIA="});
+        let values = match suffix {
+            "hash" => vec![field("field", more.clone()), field("value", more.clone())],
+            "set" => vec![field("member", more.clone())],
+            "zset" => vec![field("member", more.clone()), field("score", json!(2))],
+            _ => vec![field("value", more.clone())],
+        };
+        // A Redis collection disappears with its last member. Seed the type
+        // before testing insert, as the grid does when opening an existing key.
+        match suffix {
+            "string" => {
+                fixture.command(&format!("DEL {key}"));
+            }
+            "set" => {
+                fixture.command(&format!("SADD {key} seed"));
+            }
+            "zset" => {
+                fixture.command(&format!("ZADD {key} 0 seed"));
+            }
+            _ => {}
+        }
+        commit_changes(
+            &fixture.state,
+            CommitRequest {
+                connection_id: fixture.id.clone(),
+                database: fixture.database.clone(),
+                schema: String::new(),
+                table: key.clone(),
+                changes: vec![RowChange {
+                    kind: "insert".into(),
+                    pk: vec![],
+                    original: None,
+                    values,
+                }],
+            },
+        )
+        .unwrap();
+        assert!(fixture
+            .page(&key, vec![], 1, 10)
+            .rows
+            .iter()
+            .any(|r| r.contains(&more)));
+        if suffix == "string" {
+            fixture.command(&format!("SET {key} a�b"));
+            let readable = fixture.page(&key, vec![], 1, 10);
+            assert_eq!(readable.rows[0][1], "a�b");
+            let mut legacy = readable.clone();
+            legacy.original_rows = None;
+            assert!(fixture.change(&key, &legacy, 0, "delete", vec![]).is_err());
+            fixture
+                .change(&key, &readable, 0, "delete", vec![])
+                .unwrap();
+        }
+    }
+}

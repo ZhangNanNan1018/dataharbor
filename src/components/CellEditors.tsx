@@ -14,14 +14,16 @@ import {
   isBoolType,
   isImageBytes,
   parseEditedCell,
+  redisBinaryValue,
   sameValue,
 } from "../format";
-import type { ColumnMeta, JsonValue } from "../types";
+import type { ColumnMeta, Engine, JsonValue } from "../types";
 
 const HEX_EDIT_LIMIT = 1_000_000;
 
 export function CellValue({
   column,
+  engine,
   value,
   dirty,
   disabled,
@@ -32,6 +34,7 @@ export function CellValue({
   onCommit,
 }: {
   column: ColumnMeta;
+  engine?: Engine;
   value: JsonValue;
   dirty: boolean;
   disabled: boolean;
@@ -49,7 +52,16 @@ export function CellValue({
   const [draft, setDraft] = useState(() => cellEditorText(value, column));
   const [editError, setEditError] = useState("");
   const inputRef = useRef<InputRef>(null);
-  const binary = isBinaryType(column.dataType);
+  const redisString = column.dataType === "redis-string";
+  const redisBytes = redisBinaryValue(value, column.dataType);
+  const binary = isBinaryType(column.dataType) || redisBytes !== undefined;
+  function modalValue(): JsonValue {
+    if (!redisString) return value;
+    return redisBytes ?? (typeof value === "string" ? bytesToBase64(new TextEncoder().encode(value)) : null);
+  }
+  function commitBytes(encoded: JsonValue) {
+    commitValue(redisString ? { $redisBytes: encoded } : encoded);
+  }
   const shown = displayCell(value, column.dataType);
   const open = alwaysEdit || editing;
 
@@ -69,7 +81,7 @@ export function CellValue({
   function finishEdit(input: HTMLInputElement) {
     if (binary || disabled) return;
     try {
-      const next = parseEditedCell(draft, column, value);
+      const next = parseEditedCell(draft, column, value, engine);
       if (!sameValue(next, value)) onCommit(next);
       input.setCustomValidity("");
       setEditError("");
@@ -149,7 +161,7 @@ export function CellValue({
               引用
             </Button>
           )}
-          {binary && (
+          {(binary || redisString) && (
             <Button size="small" onMouseDown={(event) => event.preventDefault()} onClick={() => setHexOpen(true)}>
               十六进制
             </Button>
@@ -183,20 +195,20 @@ export function CellValue({
       )}
       <HexModal
         open={hexOpen}
-        value={value}
+        value={hexOpen ? modalValue() : null}
         onClose={() => setHexOpen(false)}
         onSave={(next) => {
-          commitValue(next);
+          commitBytes(next);
           setHexOpen(false);
           if (!alwaysEdit) setEditing(false);
         }}
       />
       <ImageModal
         open={imageOpen}
-        value={value}
+        value={imageOpen ? modalValue() : null}
         onClose={() => setImageOpen(false)}
         onSave={(next) => {
-          commitValue(next);
+          commitBytes(next);
           setImageOpen(false);
           if (!alwaysEdit) setEditing(false);
         }}

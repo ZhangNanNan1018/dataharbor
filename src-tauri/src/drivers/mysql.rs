@@ -228,32 +228,26 @@ impl DbSession for MysqlSession {
             .conn
             .query_iter(sql)
             .map_err(|err| AppError::msg(err.to_string()))?;
-        let binary_columns = result
+        let formats: Vec<_> = result
             .columns()
             .as_ref()
             .iter()
-            .map(|column| {
-                use mysql::consts::ColumnType::*;
-                column.character_set() == 63
-                    && matches!(
-                        column.column_type(),
-                        MYSQL_TYPE_BLOB
-                            | MYSQL_TYPE_TINY_BLOB
-                            | MYSQL_TYPE_MEDIUM_BLOB
-                            | MYSQL_TYPE_LONG_BLOB
-                            | MYSQL_TYPE_STRING
-                            | MYSQL_TYPE_VAR_STRING
-                            | MYSQL_TYPE_VARCHAR
-                    )
-            })
-            .collect::<Vec<_>>();
-        let columns: Vec<ColumnMeta> = result
+            .map(column_format)
+            .collect();
+        let columns: Vec<_> = result
             .columns()
             .as_ref()
             .iter()
-            .map(|column| {
+            .zip(&formats)
+            .map(|(column, format)| {
                 let mut meta = ColumnMeta::named(column.name_str().to_string());
-                meta.data_type = format!("{:?}", column.column_type());
+                meta.data_type = match format {
+                    ColumnFormat::Bit => format!("bit({})", column.column_length()),
+                    ColumnFormat::Binary => "binary".into(),
+                    ColumnFormat::Text => "text".into(),
+                    ColumnFormat::Geometry => "geometry".into(),
+                    ColumnFormat::Other => format!("{:?}", column.column_type()),
+                };
                 meta
             })
             .collect();
@@ -283,10 +277,7 @@ impl DbSession for MysqlSession {
             let mut cells = Vec::with_capacity(columns.len());
             for index in 0..columns.len() {
                 let value = row.get(index).unwrap_or(Value::NULL);
-                cells.push(match value {
-                    Value::Bytes(bytes) if binary_columns[index] => json_blob(&bytes),
-                    other => mysql_to_json(other),
-                });
+                cells.push(formats[index].decode(value)?);
             }
             rows.push(cells);
         }
@@ -337,6 +328,55 @@ impl MysqlSession {
                     .collect()
             })
             .collect())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColumnFormat {
+    Bit,
+    Binary,
+    Text,
+    Geometry,
+    Other,
+}
+
+fn column_format(column: &mysql::Column) -> ColumnFormat {
+    use mysql::consts::ColumnType::*;
+    match column.column_type() {
+        MYSQL_TYPE_BIT => ColumnFormat::Bit,
+        MYSQL_TYPE_GEOMETRY => ColumnFormat::Geometry,
+        MYSQL_TYPE_BLOB
+        | MYSQL_TYPE_TINY_BLOB
+        | MYSQL_TYPE_MEDIUM_BLOB
+        | MYSQL_TYPE_LONG_BLOB
+        | MYSQL_TYPE_STRING
+        | MYSQL_TYPE_VAR_STRING
+        | MYSQL_TYPE_VARCHAR => {
+            if column.character_set() == 63 {
+                ColumnFormat::Binary
+            } else {
+                ColumnFormat::Text
+            }
+        }
+        _ => ColumnFormat::Other,
+    }
+}
+
+impl ColumnFormat {
+    fn decode(self, value: Value) -> AppResult<JsonValue> {
+        match (self, value) {
+            (Self::Bit, Value::Bytes(bytes)) => {
+                if bytes.is_empty() || bytes.len() > 8 {
+                    return Err(AppError::msg("MySQL BIT 字段长度无效"));
+                }
+                let mut word = [0; 8];
+                word[8 - bytes.len()..].copy_from_slice(&bytes);
+                Ok(json_u64(u64::from_be_bytes(word)))
+            }
+            (Self::Binary, Value::Bytes(bytes)) => Ok(json_blob(&bytes)),
+            (Self::Geometry, Value::Bytes(bytes)) => crate::mysql_values::geometry_cell(&bytes),
+            (_, value) => Ok(mysql_to_json(value)),
+        }
     }
 }
 

@@ -130,7 +130,7 @@ pub(super) fn export_streaming_file_with_hook(
         &columns,
     )?;
     while let Some(rows) = batch {
-        writer.batch(&columns, &rows, operation)?;
+        writer.batch(&columns, &reader.columns, &rows, operation)?;
         after_batch(reader.loaded);
         batch = reader.next(operation)?;
     }
@@ -189,6 +189,7 @@ impl<W: Write> TextTableWriter<W> {
     fn batch(
         &mut self,
         columns: &[String],
+        metadata: &[crate::models::ColumnMeta],
         rows: &[Vec<JsonValue>],
         operation: &OperationContext,
     ) -> AppResult<()> {
@@ -196,7 +197,7 @@ impl<W: Write> TextTableWriter<W> {
             operation.checkpoint()?;
             match self {
                 Self::Delimited(writer) => writer
-                    .write_record(row.iter().map(delimited::cell))
+                    .write_record(row.iter().enumerate().map(|(i, value)| delimited::typed_cell(value, metadata.get(i))))
                     .map_err(io_error)?,
                 Self::Json(writer, first) => {
                     if !*first {

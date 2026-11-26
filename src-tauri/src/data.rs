@@ -495,7 +495,17 @@ fn compile_where(
                 };
                 format!("{ident} {operator} {literal}")
             }
-            "contains" => like_contains(engine, &ident, filter.value.as_deref().unwrap_or(""))?,
+            "contains" => {
+                let text = filter.value.as_deref().unwrap_or("");
+                if matches!(engine, Engine::Mysql | Engine::Mariadb)
+                    && crate::mysql_values::bit_width(&column.data_type).is_some()
+                {
+                    let decimal = literal_for_column(engine, column, text)?;
+                    like_contains(engine, &format!("CAST(CAST({ident} AS UNSIGNED) AS CHAR)"), &decimal)?
+                } else {
+                    like_contains(engine, &ident, text)?
+                }
+            }
             "is_null" => format!("{ident} IS NULL"),
             "is_not_null" => format!("{ident} IS NOT NULL"),
             _ => return Err(AppError::msg("不支持的筛选运算符")),
@@ -654,7 +664,12 @@ fn pk_predicate(engine: Engine, columns: &[ColumnMeta], pk: &[FieldValue]) -> Ap
         if field.value.is_null() {
             parts.push(format!("{ident} IS NULL"));
         } else {
-            parts.push(format!("{ident} = {}", sql_literal(engine, &field.value)?));
+            let literal = if matches!(engine, Engine::Mysql | Engine::Mariadb) {
+                crate::mysql_values::original_literal(engine, &column.data_type, &field.value)?
+            } else {
+                sql_literal(engine, &field.value)?
+            };
+            parts.push(format!("{ident} = {literal}"));
         }
     }
     Ok(parts.join(" AND "))
@@ -683,7 +698,7 @@ fn edit_predicate(engine: Engine, columns: &[ColumnMeta], change: &RowChange) ->
         if field.value.is_null() {
             parts.push(format!("{ident} IS NULL"));
         } else {
-            let literal = value_sql(engine, &column.data_type, &field.value)?;
+            let literal = crate::mysql_values::original_literal(engine, &column.data_type, &field.value)?;
             // JSON/legacy text columns have no equality operator on some
             // engines. Compare their canonical textual representation.
             let kind = column.data_type.to_ascii_lowercase();
@@ -695,7 +710,8 @@ fn edit_predicate(engine: Engine, columns: &[ColumnMeta], change: &RowChange) ->
                     format!("CAST({ident} AS NVARCHAR(MAX)) = {literal}")
                 }
                 Engine::Mysql | Engine::Mariadb
-                    if !crate::sqlutil::is_numeric_type(&kind)
+                    if crate::mysql_values::bit_width(&kind).is_none()
+                        && !crate::sqlutil::is_numeric_type(&kind)
                         && !crate::sqlutil::is_binary_type(&kind) =>
                 {
                     format!("BINARY {ident} = BINARY {literal}")
@@ -758,11 +774,7 @@ fn write_csv_operation(
     writer
         .write_all(&[0xEF, 0xBB, 0xBF])
         .map_err(|err| AppError::msg(err.to_string()))?;
-    let names = columns
-        .iter()
-        .map(|column| column.name.clone())
-        .collect::<Vec<_>>();
-    delimited::write_with_operation(&mut writer, &names, rows, b',', operation)?;
+    delimited::write_with_operation(&mut writer, columns, rows, b',', operation)?;
     writer
         .flush()
         .map_err(|err| AppError::msg(err.to_string()))?;

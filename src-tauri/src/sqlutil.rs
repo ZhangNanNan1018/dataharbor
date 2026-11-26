@@ -219,6 +219,14 @@ pub fn blob_literal(engine: Engine, bytes: &[u8]) -> AppResult<String> {
 }
 
 pub fn value_sql(engine: Engine, data_type: &str, value: &JsonValue) -> AppResult<String> {
+    if matches!(engine, Engine::Mysql | Engine::Mariadb) && !value.is_null() {
+        if let Some(width) = crate::mysql_values::bit_width(data_type) {
+            return crate::mysql_values::bit_literal(width, value);
+        }
+        if crate::mysql_values::is_geometry(data_type) {
+            return crate::mysql_values::geometry_literal(engine, value);
+        }
+    }
     if let JsonValue::String(text) = value {
         if is_numeric_type(data_type) {
             return exact_numeric_literal(text);

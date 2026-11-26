@@ -71,7 +71,26 @@ impl DamengSession {
         for row in result.iter() {
             let mut cells = Vec::with_capacity(columns.len());
             for index in 0..columns.len() {
-                cells.push(cell_value(&row, index, &columns[index].data_type));
+                let kind = &columns[index].data_type;
+                let value = if crate::sqlutil::is_binary_type(kind) {
+                    let meta = &row.columns[index];
+                    binary_value(
+                        kind,
+                        row.row.values[index].as_deref(),
+                        (meta.lob_tab_id, meta.lob_col_id),
+                        |locator| {
+                            let data = self.client.read_lob(locator);
+                            let freed = self.client.free_lob(locator);
+                            let data = data
+                                .map_err(|e| AppError::msg(format!("读取达梦 BLOB 失败：{e}")))?;
+                            freed.map_err(|e| AppError::msg(format!("释放达梦 BLOB 失败：{e}")))?;
+                            Ok(data)
+                        },
+                    )?
+                } else {
+                    cell_value(&row, index, kind)
+                };
+                cells.push(value);
             }
             rows.push(cells);
         }
@@ -224,6 +243,27 @@ fn looks_like_query(sql: &str) -> bool {
     matches!(head.as_str(), "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "DESC" | "DESCRIBE")
 }
 
+fn binary_value(
+    kind: &str,
+    bytes: Option<&[u8]>,
+    metadata: (i32, i16),
+    read_lob: impl FnOnce(&dameng_types::LobLocator) -> AppResult<Vec<u8>>,
+) -> AppResult<JsonValue> {
+    use crate::sqlutil::json_blob;
+    use dameng_types::{decode_value, DmValue, DmValueType};
+    let Some(bytes) = bytes else {
+        return Ok(JsonValue::Null);
+    };
+    if !kind.eq_ignore_ascii_case("BLOB") || bytes.is_empty() {
+        return Ok(json_blob(bytes));
+    }
+    match decode_value(DmValueType::BLOB, bytes, Some(metadata)) {
+        Some(DmValue::Bytea(data)) => Ok(json_blob(&data)),
+        Some(DmValue::LobLocator(locator)) => read_lob(&locator).map(|data| json_blob(&data)),
+        _ => Err(AppError::msg("达梦 BLOB 数据或定位信息无效")),
+    }
+}
+
 fn cell_value(row: &dameng::QueryRowRef<'_>, index: usize, type_name: &str) -> JsonValue {
     if row.is_null(index) {
         return JsonValue::Null;
@@ -266,5 +306,41 @@ fn lossy(row: &dameng::QueryRowRef<'_>, index: usize) -> JsonValue {
     match row.row.values.get(index) {
         Some(Some(bytes)) => JsonValue::String(String::from_utf8_lossy(bytes).into_owned()),
         _ => JsonValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_inline_binary_and_resolves_external_blob_locators() {
+        let binary =
+            |kind, bytes| binary_value(kind, bytes, (1, 2), |_| panic!("unexpected LOB read"));
+        assert_eq!(binary("VARBINARY", None).unwrap(), JsonValue::Null);
+        assert_eq!(binary("BINARY", Some(&[])).unwrap(), json!("base64:"));
+        let mut head = vec![0; 13];
+        head[0] = 1;
+        head[9] = 2;
+        head.extend([0, 255]);
+        assert_eq!(binary("BLOB", Some(&head)).unwrap(), json!("base64:AP8="));
+        assert!(binary("BLOB", Some(&head[..head.len() - 1])).is_err());
+        let mut locator = vec![0; 32];
+        locator[0] = 2;
+        assert_eq!(
+            binary_value("BLOB", Some(&locator), (3, 4), |loc| {
+                assert_eq!(loc.raw, locator);
+                Ok(vec![255])
+            })
+            .unwrap(),
+            json!("base64:/w==")
+        );
+        assert!(
+            binary_value("BLOB", Some(&locator), (3, 4), |_| Err(AppError::msg(
+                "LOBREAD"
+            )))
+            .is_err()
+        );
     }
 }
