@@ -17,7 +17,7 @@ use crate::store;
 use crate::tunnel::TunnelGuard;
 
 mod sessions;
-pub(crate) use sessions::IsolatedSession;
+pub(crate) use sessions::{IsolatedSession, Transport};
 use sessions::{ConnectionLocks, QuerySessions, SessionSlot};
 
 pub struct AppState {
@@ -71,12 +71,8 @@ impl AppState {
         &self.debuggers
     }
 
-    pub(crate) fn live_config(&self, id: &str) -> AppResult<SessionConfig> {
-        let sessions = lock(&self.sessions);
-        sessions
-            .get(id)
-            .map(|slot| slot.live.clone())
-            .ok_or_else(|| AppError::msg("连接未打开，请先在左侧连接"))
+    pub(crate) fn live_transport(&self, id: &str) -> AppResult<Arc<Transport>> {
+        Ok(self.session_owner(id)?.transport())
     }
 
     pub fn app_info(&self) -> AppInfo {
@@ -335,27 +331,17 @@ impl AppState {
         let _lifecycle = lock(&lifecycle);
         let profile = self.profile_by_id(id)?;
         if lock(&self.sessions).contains_key(id) {
-            match self.with_session(id, |session| session.version()) {
-                Ok(version) => {
-                    return Ok(ConnectResult {
-                        id: id.to_string(),
-                        engine: profile.engine,
-                        version,
-                        database: display_database(&profile),
-                    });
-                }
-                Err(_) => self.drop_session(id),
-            }
+            let version = self.with_read_session(id, "", |session| session.version())?;
+            return Ok(ConnectResult {
+                id: id.into(),
+                engine: profile.engine,
+                version,
+                database: display_database(&profile),
+            });
         }
-        let mut config = self.session_config(&profile)?;
-        let tunnels = open_with_tunnels(&profile, &mut config)?;
-        let mut session = drivers::open_session(&config)?;
-        let version = session.version()?;
-        let slot = Arc::new(SessionSlot {
-            inner: Mutex::new(session),
-            tunnel: tunnels,
-            live: config,
-        });
+        let config = self.session_config(&profile)?;
+        let slot = Arc::new(SessionSlot::new(profile.clone(), config)?);
+        let version = lock(&slot.inner).version()?;
         let tunnel_count = slot.tunnel_count();
         lock(&self.sessions).insert(id.to_string(), slot);
         let version = if tunnel_count > 1 {
@@ -476,14 +462,9 @@ impl AppState {
         id: &str,
         f: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
     ) -> AppResult<T> {
-        let slot = {
-            let sessions = lock(&self.sessions);
-            sessions
-                .get(id)
-                .cloned()
-                .ok_or_else(|| AppError::msg("连接未打开，请先在左侧连接"))?
-        };
+        let slot = self.session_owner(id)?;
         let mut guard = lock(&slot.inner);
+        slot.check_active()?;
         f(&mut **guard)
     }
 
@@ -494,7 +475,7 @@ impl AppState {
         operation: &crate::operations::OperationContext,
         f: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
     ) -> AppResult<T> {
-        self.with_session_wait(id, operation, |session| {
+        self.with_session_wait(id, database, operation, |session| {
             let interrupt = operation.bind_interrupt(session.cancel_handle(database)?)?;
             operation.checkpoint()?;
             let result = f(session);
@@ -506,9 +487,10 @@ impl AppState {
         })
     }
 
-    pub(crate) fn with_session_wait<T>(
+    fn with_session_wait<T>(
         &self,
         id: &str,
+        database: &str,
         operation: &crate::operations::OperationContext,
         f: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
     ) -> AppResult<T> {
@@ -528,7 +510,7 @@ impl AppState {
             }
         };
         operation.checkpoint()?;
-        f(&mut **session)
+        slot.read(&mut session, database, f)
     }
 
     fn profile_by_id(&self, id: &str) -> AppResult<StoredProfile> {
@@ -650,9 +632,13 @@ impl AppState {
     }
 
     fn drop_session(&self, id: &str) {
-        crate::pldbg::discard(self, id);
+        let removed = lock(&self.sessions).remove(id);
+        if let Some(slot) = &removed {
+            slot.retired
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.query_sessions.remove_connection(id);
-        lock(&self.sessions).remove(id);
+        crate::pldbg::discard(self, id);
     }
 }
 
@@ -1069,7 +1055,7 @@ mod tests {
                 let updated = state.save_connection(request.clone()).unwrap();
                 assert!(updated.needs_reconnect);
                 assert!(!updated.connection.connected);
-                assert!(state.live_config(&id).is_err());
+                assert!(state.live_transport(&id).is_err());
             }
         }
         fs::remove_dir_all(directory).unwrap();

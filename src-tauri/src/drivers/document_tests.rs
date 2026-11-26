@@ -488,3 +488,20 @@ fn redis_binary_command_and_grid_round_trip() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires disposable Redis at DATAHARBOR_TEST_REDIS_PORT"]
+fn redis_shared_socket_recovers_after_client_kill() {
+    let f = Fixture::open(Engine::Redis, "DATAHARBOR_TEST_REDIS_PORT");
+    let old = f.command("CLIENT ID").rows[0][1].clone();
+    let mut control = f.state.open_connected_session(&f.id).unwrap();
+    control
+        .execute(
+            "0",
+            &format!("CLIENT KILL ID {}", old.as_u64().unwrap()),
+            None,
+        )
+        .unwrap();
+    crate::schema::list_databases(&f.state, &f.id).unwrap();
+    assert_ne!(old, f.command("CLIENT ID").rows[0][1]);
+}

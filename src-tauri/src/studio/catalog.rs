@@ -380,13 +380,13 @@ pub fn reference_rows(
                 .map(|item| item.name)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .or_else(|e| if e.disconnect_phase().is_some() { Err(e) } else { Ok(Vec::new()) })?;
     if !names.iter().any(|name| name.eq_ignore_ascii_case(column)) {
         names.insert(0, column.to_string());
     }
     let borrowed = names.iter().map(String::as_str).collect::<Vec<_>>();
     let sql = crate::sqlutil::reference_sql(engine, database, schema, table, &borrowed, query, 40)?;
-    let outcome = state.with_session(id, |session| session.execute(database, &sql, Some(40)))?;
+    let outcome = state.with_read_session(id, database, |session| session.execute(database, &sql, Some(40)))?;
     Ok(GridResult {
         columns: outcome
             .columns
@@ -408,7 +408,7 @@ fn load_fks(
 ) -> AppResult<Vec<FkSnap>> {
     if engine == Engine::Sqlite {
         let quoted = quote_ident(Engine::Sqlite, table)?;
-        let outcome = state.with_session(id, |session| {
+        let outcome = state.with_read_session(id, database, |session| {
             session.execute(
                 database,
                 &format!("PRAGMA foreign_key_list({quoted})"),
@@ -430,7 +430,7 @@ fn load_fks(
     let Some(sql) = fk_query(engine, database, schema) else {
         return Ok(Vec::new());
     };
-    let outcome = state.with_session(id, |session| session.execute(database, &sql, Some(500)))?;
+    let outcome = state.with_read_session(id, database, |session| session.execute(database, &sql, Some(500)))?;
     Ok(outcome
         .rows
         .into_iter()
@@ -478,7 +478,7 @@ fn load_view_sql(
         ),
         _ => return Ok(None),
     };
-    let outcome = state.with_session(id, |session| session.execute(database, &sql, Some(1)))?;
+    let outcome = state.with_read_session(id, database, |session| session.execute(database, &sql, Some(1)))?;
     Ok(outcome
         .rows
         .first()

@@ -75,12 +75,13 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
         }
         let map = parse_address_map(&config.address_map);
         if map.is_empty() {
-            let client = redis::cluster::ClusterClient::new(nodes)
-                .map_err(|err| AppError::msg(err.to_string()))?;
+            // Never let the cluster driver repeat a command after losing its response.
+            let client = redis::cluster::ClusterClient::builder(nodes).retries(0).build()
+                .map_err(connection_error)?;
             RedisLink::Cluster(
                 client
                     .get_connection()
-                    .map_err(|err| AppError::msg(format!("Redis Cluster 连接失败: {err}")))?,
+                    .map_err(connection_error)?,
             )
         } else {
             RedisLink::Mapped(MappedCluster::open(
@@ -97,10 +98,10 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
             config.database.trim()
         };
         let addr = sentinel_master(config, master)?;
-        let client = redis::Client::open(addr).map_err(|err| AppError::msg(err.to_string()))?;
+        let client = redis::Client::open(addr).map_err(connection_error)?;
         let conn = client
             .get_connection()
-            .map_err(|err| AppError::msg(format!("Redis Sentinel 主节点连接失败: {err}")))?;
+            .map_err(connection_error)?;
         RedisLink::Single(conn)
     } else {
         let client = redis::Client::open(redis_url(
@@ -110,10 +111,10 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
             &config.password,
             0,
         ))
-        .map_err(|err| AppError::msg(err.to_string()))?;
+        .map_err(connection_error)?;
         let conn = client
             .get_connection()
-            .map_err(|err| AppError::msg(format!("Redis 连接失败: {err}")))?;
+            .map_err(connection_error)?;
         conn.set_read_timeout(Some(Duration::from_secs(15))).ok();
         conn.set_write_timeout(Some(Duration::from_secs(15))).ok();
         RedisLink::Single(conn)
@@ -176,15 +177,15 @@ fn sentinel_master(config: &SessionConfig, service: &str) -> AppResult<String> {
         &config.password,
         0,
     ))
-    .map_err(|err| AppError::msg(err.to_string()))?;
+    .map_err(connection_error)?;
     let mut conn = client
         .get_connection()
-        .map_err(|err| AppError::msg(format!("无法连接 Sentinel: {err}")))?;
+        .map_err(connection_error)?;
     let reply: Vec<String> = redis::cmd("SENTINEL")
         .arg("get-master-addr-by-name")
         .arg(service)
         .query(&mut conn)
-        .map_err(|err| AppError::msg(format!("Sentinel 没有返回主节点: {err}")))?;
+        .map_err(connection_error)?;
     if reply.len() < 2 {
         return Err(AppError::msg(format!("Sentinel 服务 {service} 没有主节点")));
     }
@@ -211,8 +212,19 @@ impl RedisSession {
         redis::cmd("SELECT")
             .arg(db)
             .query::<()>(self.conn.as_mut())
-            .map_err(|err| AppError::msg(err.to_string()))
+            .map_err(connection_error)
     }
+}
+
+pub(super) fn connection_error(err: redis::RedisError) -> AppError {
+    AppError::driver(
+        &err,
+        err.is_io_error()
+            || matches!(
+                err.kind(),
+                redis::ErrorKind::ClusterDown | redis::ErrorKind::ClusterConnectionNotFound
+            ),
+    )
 }
 
 impl DbSession for RedisSession {
@@ -224,11 +236,26 @@ impl DbSession for RedisSession {
         true
     }
 
+    fn probe(&mut self, _database: &str) -> AppResult<()> {
+        if let RedisLink::Mapped(cluster) = &mut self.conn {
+            for node in &mut cluster.nodes {
+                redis::cmd("PING")
+                    .query::<String>(&mut node.conn)
+                    .map_err(connection_error)?;
+            }
+            return Ok(());
+        }
+        redis::cmd("PING")
+            .query::<String>(self.conn.as_mut())
+            .map(|_| ())
+            .map_err(connection_error)
+    }
+
     fn version(&mut self) -> AppResult<String> {
         let info: String = redis::cmd("INFO")
             .arg("server")
             .query(self.conn.as_mut())
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         let version = info
             .lines()
             .find_map(|line| line.strip_prefix("redis_version:"))
@@ -252,7 +279,11 @@ impl DbSession for RedisSession {
             .arg("GET")
             .arg("databases")
             .query::<redis::Value>(self.conn.as_mut())
-            .ok()
+            .map(Some)
+            .or_else(|err| {
+                let err = connection_error(err);
+                if err.disconnect_phase().is_some() { Err(err) } else { Ok(None) }
+            })?
             .and_then(|value| match value {
                 redis::Value::Array(items) => items.get(1).and_then(redis_int),
                 _ => None,
@@ -268,7 +299,7 @@ impl DbSession for RedisSession {
     }
 
     fn list_tables(&mut self, database: &str, _schema: &str) -> AppResult<Vec<String>> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let mut cursor = 0i64;
         let mut keys = Vec::new();
         for _ in 0..20 {
@@ -277,7 +308,7 @@ impl DbSession for RedisSession {
                 .arg("COUNT")
                 .arg(100)
                 .query(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             keys.extend(batch);
             cursor = next;
             if cursor == 0 || keys.len() >= 300 {
@@ -300,7 +331,7 @@ impl DbSession for RedisSession {
         _schema: &str,
         object_name: &str,
     ) -> AppResult<Vec<ColumnMeta>> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let kind = key_type(self.conn.as_mut(), object_name)?;
         Ok(columns_for(&kind))
     }
@@ -311,7 +342,7 @@ impl DbSession for RedisSession {
         _schema: &str,
         object_name: &str,
     ) -> AppResult<Option<String>> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let kind = key_type(self.conn.as_mut(), object_name)?;
         if kind == "none" {
             Ok(None)
@@ -326,7 +357,7 @@ impl DbSession for RedisSession {
         sql: &str,
         max_rows: Option<usize>,
     ) -> AppResult<QueryOutcome> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let line = sql.trim().trim_end_matches(';').trim();
         if line.is_empty() {
             return Err(AppError::msg("没有 Redis 命令"));
@@ -342,7 +373,7 @@ impl DbSession for RedisSession {
         }
         let value: redis::Value = cmd
             .query(self.conn.as_mut())
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         Ok(value_to_outcome(value, max_rows.unwrap_or(500)))
     }
 
@@ -361,7 +392,7 @@ impl DbSession for RedisSession {
                 "Redis 网格不支持自定义筛选或排序，请使用 Redis 命令",
             ));
         }
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let kind = key_type(self.conn.as_mut(), table)?;
         let columns = columns_for(&kind);
         let mut rows = match kind.as_str() {
@@ -369,7 +400,7 @@ impl DbSession for RedisSession {
                 let value: Option<Vec<u8>> = redis::cmd("GET")
                     .arg(table)
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 vec![vec![
                     JsonValue::String(table.into()),
                     value.as_deref().map(redis_cell).unwrap_or(JsonValue::Null),
@@ -379,7 +410,7 @@ impl DbSession for RedisSession {
                 let mut map: Vec<(Vec<u8>, Vec<u8>)> = redis::cmd("HGETALL")
                     .arg(table)
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 map.sort_by(|left, right| left.0.cmp(&right.0));
                 map.into_iter()
                     .map(|(field, value)| vec![redis_cell(&field), redis_cell(&value)])
@@ -391,7 +422,7 @@ impl DbSession for RedisSession {
                     .arg(offset)
                     .arg(u64::from(offset) + u64::from(limit) - 1)
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 values
                     .into_iter()
                     .enumerate()
@@ -404,7 +435,7 @@ impl DbSession for RedisSession {
                 let mut values: Vec<Vec<u8>> = redis::cmd("SMEMBERS")
                     .arg(table)
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 values.sort();
                 values
                     .into_iter()
@@ -418,7 +449,7 @@ impl DbSession for RedisSession {
                     .arg(u64::from(offset) + u64::from(limit) - 1)
                     .arg("WITHSCORES")
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 values
                     .into_iter()
                     .map(|(member, score)| vec![redis_cell(&member), JsonValue::String(score)])
@@ -468,26 +499,26 @@ impl DbSession for RedisSession {
     }
 
     fn count_relation(&mut self, database: &str, _schema: &str, table: &str) -> AppResult<u64> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         let kind = key_type(self.conn.as_mut(), table)?;
         let count: i64 = match kind.as_str() {
             "string" => 1,
             "hash" => redis::cmd("HLEN")
                 .arg(table)
                 .query::<i64>(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "list" => redis::cmd("LLEN")
                 .arg(table)
                 .query::<i64>(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "set" => redis::cmd("SCARD")
                 .arg(table)
                 .query::<i64>(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "zset" => redis::cmd("ZCARD")
                 .arg(table)
                 .query::<i64>(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             _ => 0,
         };
         Ok(count.max(0) as u64)
@@ -500,7 +531,7 @@ impl DbSession for RedisSession {
         table: &str,
         change: &RowChange,
     ) -> AppResult<()> {
-        self.select_db(database)?;
+        self.select_db(database).map_err(AppError::before_send)?;
         if matches!(change.kind.as_str(), "update" | "delete") {
             let args = cas_args(table, change)?;
             let result: i64 = redis::cmd("EVAL")
@@ -509,7 +540,7 @@ impl DbSession for RedisSession {
                 .arg(table)
                 .arg(args)
                 .query(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             return if result == 1 {
                 Ok(())
             } else {
@@ -536,7 +567,7 @@ impl DbSession for RedisSession {
                     .arg(value)
                     .arg("NX")
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 i64::from(result.is_some())
             }
             "hash" => redis::cmd("HSETNX")
@@ -544,17 +575,17 @@ impl DbSession for RedisSession {
                 .arg(field_of(change, "field")?)
                 .arg(value)
                 .query(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "list" => redis::cmd("RPUSH")
                 .arg(table)
                 .arg(value)
                 .query(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "set" => redis::cmd("SADD")
                 .arg(table)
                 .arg(field_of(change, "member")?)
                 .query(self.conn.as_mut())
-                .map_err(|err| AppError::msg(err.to_string()))?,
+                .map_err(connection_error)?,
             "zset" => {
                 let score = change
                     .values
@@ -568,7 +599,7 @@ impl DbSession for RedisSession {
                     .arg(score)
                     .arg(field_of(change, "member")?)
                     .query(self.conn.as_mut())
-                    .map_err(|err| AppError::msg(err.to_string()))?
+                    .map_err(connection_error)?
             }
             _ => return Err(AppError::msg(format!("不能对 {kind} 新增行"))),
         };
@@ -728,7 +759,7 @@ fn key_type(conn: &mut dyn redis::ConnectionLike, key: &str) -> AppResult<String
     redis::cmd("TYPE")
         .arg(key)
         .query(conn)
-        .map_err(|err| AppError::msg(err.to_string()))
+        .map_err(connection_error)
 }
 
 fn columns_for(kind: &str) -> Vec<ColumnMeta> {
@@ -924,7 +955,7 @@ impl MappedCluster {
         let value: redis::Value = redis::cmd("CLUSTER")
             .arg("SLOTS")
             .query(&mut self.nodes[0].conn)
-            .map_err(|err| AppError::msg(format!("CLUSTER SLOTS 失败: {err}")))?;
+            .map_err(connection_error)?;
         let ranges = parse_cluster_slots(&value);
         if ranges.is_empty() {
             return Err(AppError::msg(
@@ -1335,10 +1366,10 @@ fn node_hostport(url: &str) -> Option<String> {
 }
 
 fn dial_url(url: &str) -> AppResult<redis::Connection> {
-    let client = redis::Client::open(url).map_err(|err| AppError::msg(err.to_string()))?;
+    let client = redis::Client::open(url).map_err(connection_error)?;
     let conn = client
         .get_connection()
-        .map_err(|err| AppError::msg(err.to_string()))?;
+        .map_err(connection_error)?;
     conn.set_read_timeout(Some(Duration::from_secs(15))).ok();
     conn.set_write_timeout(Some(Duration::from_secs(15))).ok();
     Ok(conn)
@@ -1354,7 +1385,7 @@ pub fn publish(config: &SessionConfig, channel: &str, message: &str) -> AppResul
         .arg(channel)
         .arg(message)
         .query(session.conn.as_mut())
-        .map_err(|err| AppError::msg(err.to_string()))?;
+        .map_err(connection_error)?;
     Ok(receivers)
 }
 
@@ -1366,14 +1397,14 @@ pub fn read_pubsub(config: &SessionConfig, channel: &str, wait_ms: u64) -> AppRe
         &config.password,
         0,
     ))
-    .map_err(|err| AppError::msg(err.to_string()))?;
+    .map_err(connection_error)?;
     let mut conn = client
         .get_connection()
-        .map_err(|err| AppError::msg(err.to_string()))?;
+        .map_err(connection_error)?;
     let mut pubsub = conn.as_pubsub();
     pubsub
         .subscribe(channel)
-        .map_err(|err| AppError::msg(err.to_string()))?;
+        .map_err(connection_error)?;
     pubsub
         .set_read_timeout(Some(Duration::from_millis(wait_ms.clamp(200, 10_000))))
         .ok();

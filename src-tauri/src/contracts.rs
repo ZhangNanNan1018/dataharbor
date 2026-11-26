@@ -14,6 +14,7 @@ fn typescript_contracts_match_rust() {
             output.push('\n');
         };
     }
+    emit!(crate::error::DisconnectPhase);
     emit!(crate::error::ErrorKind);
     emit!(crate::error::ErrorPayload);
     emit!(crate::models::Engine);

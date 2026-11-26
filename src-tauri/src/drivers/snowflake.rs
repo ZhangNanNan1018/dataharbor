@@ -48,6 +48,19 @@ fn snowflake_host(host: &str) -> String {
     }
 }
 
+pub(super) fn request_error(method: &str, error: ureq::Error) -> AppError {
+    use ureq::ErrorKind::{ConnectionFailed, Dns, Io, ProxyConnect};
+    let kind = error.kind();
+    let lost = matches!(kind, ConnectionFailed | Dns | Io | ProxyConnect)
+        || matches!(&error, ureq::Error::Status(408 | 502 | 503 | 504, _));
+    let err = AppError::driver(error, lost);
+    if method == "POST" && matches!(kind, ConnectionFailed | Dns | ProxyConnect) {
+        err.before_send()
+    } else {
+        err
+    }
+}
+
 impl SnowflakeSession {
     fn request(&self, method: &str, path: &str, body: Option<&JsonValue>) -> AppResult<(u16, JsonValue)> {
         let url = format!("https://{}/api/v2/statements{path}", self.host);
@@ -62,10 +75,10 @@ impl SnowflakeSession {
         };
         let response = match response {
             Ok(response) | Err(ureq::Error::Status(429, response)) => response,
-            Err(error) => return Err(AppError::msg(format!("Snowflake 请求失败: {error}"))),
+            Err(error) => return Err(request_error(method, error)),
         };
         let status = response.status();
-        let text = response.into_string().map_err(|err| AppError::msg(err.to_string()))?;
+        let text = response.into_string().map_err(|err| AppError::driver(err, true))?;
         let document = serde_json::from_str(&text)
             .map_err(|err| AppError::msg(format!("Snowflake 响应无法解析: {err}")))?;
         Ok((status, document))

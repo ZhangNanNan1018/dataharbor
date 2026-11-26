@@ -51,14 +51,28 @@ pub fn connect(config: &SessionConfig) -> AppResult<MongoSession> {
         if !config.database.trim().is_empty() {
             options.default_database = Some(config.database.trim().to_string());
         }
-        let client = Client::with_options(options).map_err(|err| AppError::msg(err.to_string()))?;
+        // The caller owns any new execution after an ambiguous response.
+        options.retry_reads = Some(false);
+        options.retry_writes = Some(false);
+        let client = Client::with_options(options).map_err(connection_error)?;
         client
             .database("admin")
             .run_command(doc! { "ping": 1 }, None)
             .await
-            .map_err(|err| AppError::msg(format!("MongoDB 连接失败: {err}")))?;
+            .map_err(connection_error)?;
         Ok(MongoSession { client })
     })
+}
+
+pub(super) fn connection_error(err: mongodb::error::Error) -> AppError {
+    use mongodb::error::ErrorKind;
+    let lost = matches!(
+        &*err.kind,
+        ErrorKind::Io(_)
+            | ErrorKind::ServerSelection { .. }
+            | ErrorKind::ConnectionPoolCleared { .. }
+    ) || matches!(&*err.kind, ErrorKind::Command(e) if matches!(e.code, 6 | 7 | 89 | 91 | 9001 | 11600));
+    AppError::driver(err, lost)
 }
 
 impl DbSession for MongoSession {
@@ -70,6 +84,16 @@ impl DbSession for MongoSession {
         true
     }
 
+    fn probe(&mut self, _database: &str) -> AppResult<()> {
+        block_on(
+            self.client
+                .database("admin")
+                .run_command(doc! { "ping": 1 }, None),
+        )
+        .map(|_| ())
+        .map_err(connection_error)
+    }
+
     fn version(&mut self) -> AppResult<String> {
         block_on(async {
             let doc = self
@@ -77,7 +101,7 @@ impl DbSession for MongoSession {
                 .database("admin")
                 .run_command(doc! { "buildInfo": 1 }, None)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             let version = doc.get_str("version").unwrap_or("unknown");
             Ok(format!("MongoDB {version}"))
         })
@@ -88,7 +112,7 @@ impl DbSession for MongoSession {
             self.client
                 .list_database_names(None, None)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))
+                .map_err(connection_error)
         })
     }
 
@@ -106,7 +130,7 @@ impl DbSession for MongoSession {
                 .database(database)
                 .list_collection_names(None)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))
+                .map_err(connection_error)
         })
     }
 
@@ -127,11 +151,11 @@ impl DbSession for MongoSession {
                 .collection::<Document>(object_name)
                 .find(doc! {}, FindOptions::builder().limit(1).build())
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             let doc = cursor
                 .try_next()
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
                 .unwrap_or_default();
             let mut columns = Vec::new();
             if !doc.contains_key("_id") {
@@ -202,7 +226,7 @@ impl DbSession for MongoSession {
                     })
                     .run_command(command, None)
                     .await
-                    .map_err(|err| AppError::msg(err.to_string()))?;
+                    .map_err(connection_error)?;
                 Ok(document_outcome(doc))
             });
         }
@@ -235,12 +259,12 @@ impl DbSession for MongoSession {
                 .collection::<Document>(table)
                 .find(filter, options)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             let mut docs = Vec::new();
             while let Some(doc) = cursor
                 .try_next()
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
             {
                 docs.push(doc);
             }
@@ -266,7 +290,7 @@ impl DbSession for MongoSession {
                 .collection::<Document>(table)
                 .count_documents(filter, None)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))
+                .map_err(connection_error)
         })
     }
 
@@ -291,7 +315,7 @@ impl DbSession for MongoSession {
                     }
                     coll.insert_one(doc, None)
                         .await
-                        .map_err(|err| AppError::msg(err.to_string()))?;
+                        .map_err(connection_error)?;
                 }
                 "update" => {
                     let id = original_filter(change)?;
@@ -314,7 +338,7 @@ impl DbSession for MongoSession {
                         let result = coll
                             .update_one(id, doc! { "$set": set }, None)
                             .await
-                            .map_err(|err| AppError::msg(err.to_string()))?;
+                            .map_err(connection_error)?;
                         if result.matched_count != 1 {
                             return Err(conflict());
                         }
@@ -326,7 +350,7 @@ impl DbSession for MongoSession {
                     let result = coll
                         .delete_one(original_filter(change)?, None)
                         .await
-                        .map_err(|err| AppError::msg(err.to_string()))?;
+                        .map_err(connection_error)?;
                     if result.deleted_count != 1 {
                         return Err(conflict());
                     }
@@ -360,12 +384,12 @@ impl MongoSession {
                 .collection::<Document>(collection)
                 .find(filter, options)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             let mut docs = Vec::new();
             while let Some(doc) = cursor
                 .try_next()
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
             {
                 docs.push(doc);
             }
@@ -398,12 +422,12 @@ impl MongoSession {
                 .collection::<Document>(collection)
                 .aggregate(pipeline, None)
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(connection_error)?;
             let mut docs = Vec::new();
             while let Some(doc) = cursor
                 .try_next()
                 .await
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
             {
                 docs.push(doc);
             }

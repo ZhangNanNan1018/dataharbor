@@ -15,7 +15,7 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useRef, useState } from "react";
-import { api, errorText, isOperationCancelled, pickCsvFile, pickSaveCsv } from "../api";
+import { api, disconnectPhase, errorText, isOperationCancelled, pickCsvFile, pickSaveCsv } from "../api";
 import { useLongOperation } from "../operations";
 import { TaskProgress } from "./TaskProgress";
 import type { ForeignKeyRef } from "../api";
@@ -60,7 +60,8 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   const [readOnly, setReadOnly] = useState(tab.readOnly);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [refreshRequired, setRefreshRequired] = useState(false);
+  const [refreshReason, setRefreshRequired] = useState<false | "committed" | "verify">(false);
+  const refreshRequired = Boolean(refreshReason);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [importOpen, setImportOpen] = useState(false);
@@ -73,6 +74,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   const [csvPath, setCsvPath] = useState("");
   const [importing, setImporting] = useState(false);
   const requestId = useRef(0);
+  const generation = useRef(0);
   const rowsRef = useRef<GridRow[]>([]);
   const columnsRef = useRef<ColumnMeta[]>([]);
   const writeInFlight = useRef(false);
@@ -102,11 +104,27 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }, [tab.id]);
 
   useEffect(() => {
+    const invalidate = () => {
+      ++generation.current;
+      ++requestId.current;
+    };
+    const unsubscribe = useConnectionStore.subscribe((next, prev) => {
+      const connected = (profiles: typeof next.profiles) => profiles.find((p) => p.id === tab.connectionId)?.connected;
+      if (!connected(prev.profiles) || connected(next.profiles)) return;
+      invalidate();
+      setLoading(false);
+      if (writeInFlight.current) {
+        setRefreshRequired("verify");
+        setError("连接已关闭，请核对本次写入的结果。");
+      }
+    });
+    const current = generation.current;
     void load({ page: 1, size: pageSize, filters: [], sorts: [], force: true });
     void api
       .foreignKeys(tab.connectionId, tab.database, tab.schema, tab.table)
-      .then(setForeignKeys)
-      .catch(() => setForeignKeys([]));
+      .then((keys) => { if (current === generation.current) setForeignKeys(keys); })
+      .catch(() => { if (current === generation.current) setForeignKeys([]); });
+    return () => { invalidate(); unsubscribe(); };
     // The grid reloads when the opened object changes. Filters stay local to that visit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.connectionId, tab.database, tab.schema, tab.table]);
@@ -119,10 +137,11 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
     force?: boolean;
     afterWrite?: boolean;
   }) {
+    const current = generation.current;
     if (writeInFlight.current && !input.afterWrite) return false;
     if (!input.force && rowsRef.current.some((row) => row.status !== "clean")) {
       const ok = await confirmDiscard(modal);
-      if (!ok || writeInFlight.current) return false;
+      if (!ok || writeInFlight.current || current !== generation.current) return false;
     }
     const token = ++requestId.current;
     const appliedFilters = supportsFilters ? input.filters : [];
@@ -255,6 +274,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }
 
   async function commit() {
+    const current = generation.current;
     if (writeInFlight.current || exportInFlight.current || task.active || loading || readOnly || refreshRequired) return;
     writeInFlight.current = true;
     const active = document.activeElement;
@@ -285,6 +305,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         table: tab.table,
         changes,
       });
+      if (current !== generation.current) return;
       const note = `已提交 ${result.applied} 条更改`;
       setStatus(note);
       message.success(note);
@@ -294,15 +315,16 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
       }));
       rowsRef.current = clean;
       setRows(clean);
-      setRefreshRequired(true);
+      setRefreshRequired("committed");
       const loaded = await load({ page, size: pageSize, filters, sorts, force: true, afterWrite: true });
-      if (!loaded) {
+      if (!loaded && current === generation.current) {
         setStatus(`${note}，重新读取失败，请刷新后继续编辑`);
         message.warning("提交已成功，重新读取失败。请刷新后继续编辑，不要重复提交。");
       }
     } catch (err) {
-      if (err && typeof err === "object" && "kind" in err && err.kind === "partialWrite") {
-        setRefreshRequired(true);
+      if (current !== generation.current) return;
+      if (disconnectPhase(err) === "outcomeUnknown" || (err && typeof err === "object" && "kind" in err && err.kind === "partialWrite")) {
+        setRefreshRequired("verify");
       }
       const text = errorText(err);
       setError(text);
@@ -317,26 +339,36 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }
   commitRef.current = commit;
 
+  function checkGeneration(current: number) {
+    if (current !== generation.current) throw new Error("连接或表已更改，本次操作未发送");
+  }
+
   async function exportCsv() {
+    const current = generation.current;
     if (exportInFlight.current || writeInFlight.current || task.active) return;
     exportInFlight.current = true;
     try {
       const path = await pickSaveCsv(`${tab.table}.csv`);
-      if (!path) return;
-      const exported = await task.execute("导出表数据 CSV", (operationId) => api.exportTableCsv({
-        connectionId: tab.connectionId,
-        database: tab.database,
-        schema: tab.schema,
-        table: tab.table,
-        filters: supportsFilters ? filters : [],
-        sorts: supportsFilters ? sorts : [],
-        path,
-      }, operationId));
+      if (!path || current !== generation.current) return;
+      const exported = await task.execute("导出表数据 CSV", (operationId) => {
+        checkGeneration(current);
+        return api.exportTableCsv({
+          connectionId: tab.connectionId,
+          database: tab.database,
+          schema: tab.schema,
+          table: tab.table,
+          filters: supportsFilters ? filters : [],
+          sorts: supportsFilters ? sorts : [],
+          path,
+        }, operationId);
+      });
+      if (current !== generation.current) return;
       const text = `已导出 ${exported.rowCount} 行${exported.truncated ? "，结果已截断，仅包含部分数据" : ""}`;
       if (exported.truncated) message.warning(text);
       else message.success(text);
       setStatus(`CSV 已写入 ${exported.path}`);
     } catch (err) {
+      if (current !== generation.current) return;
       setStatus(errorText(err));
       if (!isOperationCancelled(err)) message.error(errorText(err));
     } finally {
@@ -345,6 +377,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
   }
 
   async function importCsv() {
+    const current = generation.current;
     if (writeInFlight.current || exportInFlight.current || task.active || loading || refreshRequired) return;
     if (!csvPath) {
       message.warning("先选择 CSV 文件");
@@ -367,29 +400,40 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         });
         if (!ok) return;
       }
+      if (current !== generation.current) return;
       editsLocked.current = true;
       setImporting(true);
-      const result = await task.execute("导入 CSV", (operationId) => api.importTableCsv({
-        connectionId: tab.connectionId,
-        database: tab.database,
-        schema: tab.schema,
-        table: tab.table,
-        path: csvPath,
-        truncate,
-      }, operationId));
+      const result = await task.execute("导入 CSV", (operationId) => {
+        checkGeneration(current);
+        return api.importTableCsv({
+          connectionId: tab.connectionId,
+          database: tab.database,
+          schema: tab.schema,
+          table: tab.table,
+          path: csvPath,
+          truncate,
+        }, operationId);
+      });
+      if (current !== generation.current) return;
       message.success(`已导入 ${result.inserted} 行`);
       setImportOpen(false);
       setCsvPath("");
       setTruncate(false);
       rowsRef.current = [];
       setRows([]);
-      setRefreshRequired(true);
+      setRefreshRequired("committed");
       await load({ page: 1, size: pageSize, filters, sorts, force: true, afterWrite: true });
     } catch (err) {
+      if (current !== generation.current) return;
       setStatus(errorText(err));
+      if (disconnectPhase(err) === "outcomeUnknown") {
+        setRefreshRequired("verify");
+        setImportOpen(false);
+        setError(errorText(err));
+      }
       if (isOperationCancelled(err)) {
         const detail = err as { committed?: number };
-        if ((detail.committed ?? 0) > 0) setRefreshRequired(true);
+        if ((detail.committed ?? 0) > 0) setRefreshRequired("committed");
       } else message.error(errorText(err));
     } finally {
       writeInFlight.current = false;
@@ -596,7 +640,7 @@ export function DataGridPanel({ tab }: { tab: DataTab }) {
         <Alert type="warning" showIcon message="没有主键，不能更新或删除已有行。仍可以新增行。" />
       )}
       {error && <Alert type="error" showIcon message={error} />}
-      {refreshRequired && <Alert type="warning" showIcon message="数据已提交，请刷新成功后继续编辑。" />}
+      {refreshRequired && <Alert type="warning" showIcon message={refreshReason === "verify" ? "请先刷新并核对数据库中的提交结果，再继续编辑。" : "数据已提交，请刷新成功后继续编辑。"} />}
       <div className="xb-grid-wrap">
         <Table<GridRow>
           size="small"

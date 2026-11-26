@@ -14,6 +14,7 @@ use crate::state::AppState;
 /// Control connection plus the target thread that is blocked inside the function.
 pub struct DebugSlot {
     control: Mutex<Client>,
+    _transport: std::sync::Arc<crate::state::Transport>,
     session_id: i64,
     function: String,
     target: Mutex<Option<JoinHandle<String>>>,
@@ -112,7 +113,8 @@ pub fn launch(
     call_sql: &str,
     line: i32,
 ) -> AppResult<DebugSnapshot> {
-    let config = state.live_config(connection_id)?;
+    let transport = state.live_transport(connection_id)?;
+    let config = &transport.live;
     if config.engine != Engine::Postgres {
         return Err(AppError::msg("交互式单步只覆盖已安装 pldbgapi 的 PostgreSQL。MySQL 和 Oracle 没有可用协议。"));
     }
@@ -126,7 +128,7 @@ pub fn launch(
     if call_sql.is_empty() {
         return Err(AppError::msg("请填写目标会话要执行的调用，例如 SELECT public.add_book(1)"));
     }
-    let mut control = postgres::open_configured(&config, &database)?;
+    let mut control = postgres::open_configured(config, &database)?;
     let extension = run_simple(&mut control, sql_extension(), Some(5))?;
     let installed = extension.rows.iter().any(|row| {
         row.first().and_then(|value| value.as_str()) == Some("pldbgapi")
@@ -142,10 +144,10 @@ pub fn launch(
     let oid = first_i64(&proc).ok_or_else(|| AppError::msg(format!("找不到函数 {function}")))?;
     run_simple(&mut control, &sql_breakpoint(session_id, oid, line), Some(1))?;
 
-    let target_config = config.clone();
+    let target_transport = transport.clone();
     let target_db = database.clone();
     let target_sql = call_sql.clone();
-    let handle = std::thread::spawn(move || match postgres::open_configured(&target_config, &target_db) {
+    let handle = std::thread::spawn(move || match postgres::open_configured(&target_transport.live, &target_db) {
         Ok(mut client) => match run_simple(&mut client, &target_sql, Some(20)) {
             Ok(outcome) => format!(
                 "目标会话返回 {} 行，影响 {} 行。",
@@ -174,6 +176,7 @@ pub fn launch(
     };
     let slot = DebugSlot {
         control: Mutex::new(control),
+        _transport: transport,
         session_id,
         function,
         target: Mutex::new(Some(handle)),

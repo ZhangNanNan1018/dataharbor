@@ -69,12 +69,12 @@ pub fn connect(config: &SessionConfig) -> AppResult<MssqlSession> {
         let port = if config.port == 0 { 1433 } else { config.port };
         let tcp = tokio::time::timeout(Duration::from_secs(8), TcpStream::connect((config.host.trim(), port)))
             .await
-            .map_err(|_| AppError::msg("SQL Server 连接超时"))?
-            .map_err(|err| AppError::msg(format!("SQL Server 连接失败: {err}")))?;
+            .map_err(|_| AppError::driver("SQL Server 连接超时", true))?
+            .map_err(|err| AppError::driver(err, true))?;
         tcp.set_nodelay(true).ok();
         let client = Client::connect(tds, tcp.compat_write())
             .await
-            .map_err(|err| AppError::msg(format!("SQL Server 登录失败: {err}。若服务器强制加密，请打开 SSL。")))?;
+            .map_err(|e| connection_error(e).context("SQL Server 登录失败"))?;
         Ok(MssqlSession {
             client,
             current_db: config.database.trim().to_string(),
@@ -94,9 +94,23 @@ impl MssqlSession {
     }
 }
 
+pub(super) fn connection_error(err: tiberius::error::Error) -> AppError {
+    let lost = matches!(&err, tiberius::error::Error::Io { .. })
+        || matches!(&err, tiberius::error::Error::Server(e) if e.class() >= 20);
+    AppError::driver(err, lost)
+}
+
 impl DbSession for MssqlSession {
     fn engine(&self) -> Engine {
         Engine::Mssql
+    }
+
+    fn probe(&mut self, database: &str) -> AppResult<()> {
+        let result = self.execute(database, "SELECT 1", Some(1))?;
+        if result.rows.len() != 1 {
+            return Err(AppError::driver("未收到 SQL Server 探测响应", true));
+        }
+        Ok(())
     }
 
     fn version(&mut self) -> AppResult<String> {
@@ -115,12 +129,12 @@ impl DbSession for MssqlSession {
     }
 
     fn list_schemas(&mut self, database: &str) -> AppResult<Vec<String>> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         self.one_column("SELECT name FROM sys.schemas ORDER BY name")
     }
 
     fn list_tables(&mut self, database: &str, schema: &str) -> AppResult<Vec<String>> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         let schema = sql_literal(Engine::Mssql, &JsonValue::String(if schema.is_empty() { "dbo".into() } else { schema.into() }))?;
         self.one_column(&format!(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = {schema} ORDER BY TABLE_NAME"
@@ -128,7 +142,7 @@ impl DbSession for MssqlSession {
     }
 
     fn list_views(&mut self, database: &str, schema: &str) -> AppResult<Vec<String>> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         let schema = sql_literal(Engine::Mssql, &JsonValue::String(if schema.is_empty() { "dbo".into() } else { schema.into() }))?;
         self.one_column(&format!(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = {schema} ORDER BY TABLE_NAME"
@@ -136,7 +150,7 @@ impl DbSession for MssqlSession {
     }
 
     fn list_columns(&mut self, database: &str, schema: &str, object_name: &str) -> AppResult<Vec<ColumnMeta>> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         let schema_lit = sql_literal(Engine::Mssql, &JsonValue::String(if schema.is_empty() { "dbo".into() } else { schema.into() }))?;
         let table_lit = sql_literal(Engine::Mssql, &JsonValue::String(object_name.to_string()))?;
         let outcome = self.execute(
@@ -176,7 +190,7 @@ impl DbSession for MssqlSession {
     }
 
     fn relation_kind(&mut self, database: &str, schema: &str, object_name: &str) -> AppResult<Option<String>> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         let schema_lit = sql_literal(Engine::Mssql, &JsonValue::String(schema.to_string()))?;
         let name_lit = sql_literal(Engine::Mssql, &JsonValue::String(object_name.to_string()))?;
         let outcome = self.execute(
@@ -190,26 +204,26 @@ impl DbSession for MssqlSession {
     }
 
     fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
-        self.use_db(database)?;
+        self.use_db(database).map_err(AppError::before_send)?;
         block_on(async {
             self.client.execute(sql, &[]).await
                 .map(|result| result.total())
-                .map_err(|err| AppError::msg(err.to_string()))
+                .map_err(connection_error)
         })
     }
 
     fn execute(&mut self, database: &str, sql: &str, max_rows: Option<usize>) -> AppResult<QueryOutcome> {
         if !database.is_empty() {
-            self.use_db(database)?;
+            self.use_db(database).map_err(AppError::before_send)?;
         }
         let sql = sql.to_string();
         let max_rows = max_rows.unwrap_or(5_000);
         block_on(async {
-            let mut stream = self.client.query(&sql, &[]).await.map_err(|err| AppError::msg(err.to_string()))?;
+            let mut stream = self.client.query(&sql, &[]).await.map_err(connection_error)?;
             let mut columns = Vec::new();
             let mut rows = Vec::new();
             let mut truncated = false;
-            while let Some(item) = stream.try_next().await.map_err(|err| AppError::msg(err.to_string()))? {
+            while let Some(item) = stream.try_next().await.map_err(connection_error)? {
                 match item {
                     QueryItem::Metadata(meta) => {
                         if columns.is_empty() {

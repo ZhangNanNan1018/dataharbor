@@ -26,7 +26,7 @@ const IMPORT_BYTES: u64 = 50 * 1024 * 1024;
 pub fn fetch_rows(state: &AppState, request: FetchRowsRequest) -> AppResult<DataPage> {
     let page = request.page.max(1);
     let page_size = request.page_size.clamp(1, 500);
-    state.with_session(&request.connection_id, |session| {
+    state.with_read_session(&request.connection_id, &request.database, |session| {
         if session.is_document_store() {
             let outcome = session.browse_page(
                 &request.database,
@@ -112,7 +112,7 @@ fn with_write_session<T>(
     action: impl FnOnce(&mut dyn DbSession) -> AppResult<T>,
 ) -> AppResult<T> {
     operation.checkpoint()?;
-    let mut session = state.open_isolated_session(id)?;
+    let mut session = state.open_connected_session(id)?;
     operation.checkpoint()?;
     let engine = session.engine();
     action(&mut *session).map_err(|error| {
@@ -148,6 +148,7 @@ pub(crate) fn commit_changes_on_session(
             session
                 .apply_mutation(&request.database, &request.schema, &request.table, change)
                 .map_err(|err| AppError::PartialWrite {
+                    phase: err.disconnect_phase(),
                     applied: index,
                     failed_index: index + 1,
                     detail: err.to_string(),
@@ -159,9 +160,9 @@ pub(crate) fn commit_changes_on_session(
         });
     }
     let engine = session.engine();
-    let columns = session.list_columns(&request.database, &request.schema, &request.table)?;
+    let columns = session.list_columns(&request.database, &request.schema, &request.table).map_err(AppError::before_send)?;
     if session
-        .relation_kind(&request.database, &request.schema, &request.table)?
+        .relation_kind(&request.database, &request.schema, &request.table).map_err(AppError::before_send)?
         .as_deref()
         == Some("view")
     {
@@ -292,7 +293,7 @@ pub(crate) fn export_sql_csv_with_operation(
         request.session_id.as_deref(),
         operation,
         |session| {
-            let _interrupt = operation.bind_interrupt(session.cancel_handle(&request.database)?)?;
+            let _interrupt = operation.bind_interrupt(session.cancel_handle(&request.database).map_err(AppError::before_send)?)?;
             let read_limit = EXPORT_CAP as usize + 1;
             let mut outcome = if let Some(paged) =
                 paginate_query_sql(session.engine(), sql, read_limit as u32, 0)

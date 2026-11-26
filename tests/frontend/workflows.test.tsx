@@ -17,7 +17,7 @@ vi.mock("../../src/api", async (importOriginal) => {
   return { ...actual, api: { ...actual.api,
     fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn(),
     listDatabases: vi.fn(), listSchemas: vi.fn(), listTables: vi.fn(), listViews: vi.fn(), connect: vi.fn(),
-    closeQuerySession: vi.fn().mockResolvedValue(undefined), executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
+    reconnectQuerySession: vi.fn(async () => "tab:" + crypto.randomUUID()), closeQuerySession: vi.fn().mockResolvedValue(undefined), executeSql: vi.fn(), exportSqlCsv: vi.fn(), exportTableCsv: vi.fn(),
     aiSettings: vi.fn(), saveAiSettings: vi.fn(),
     createOperation: vi.fn(), operationStatus: vi.fn(), cancelOperation: vi.fn(), releaseOperation: vi.fn(),
     syncRows: vi.fn(), transferRows: vi.fn(),
@@ -163,6 +163,35 @@ describe("网格写入边界", () => {
     await act(async () => pending.resolve({ applied: 1 }));
   });
 
+  it("手动断开再连接后忽略旧读取结果，保留原表格供核对", async () => {
+    mount(<DataGridPanel tab={grid("a")} />);
+    await screen.findByDisplayValue("a original");
+    const pending = deferred<DataPage>();
+    vi.mocked(api.fetchRows).mockReturnValueOnce(pending.promise);
+    fireEvent.click(screen.getByRole("button", { name: "刷 新" }));
+    act(() => {
+      useConnectionStore.getState().markConnected(profile.id, false);
+      useConnectionStore.getState().markConnected(profile.id, true);
+    });
+    await act(async () => pending.resolve(page("retired")));
+    expect(screen.getByDisplayValue("a original")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("retired original")).not.toBeInTheDocument();
+  });
+
+  it("提交响应丢失时保留草稿，快捷键不能重复提交", async () => {
+    useTabStore.setState({ activeId: "a" });
+    vi.mocked(api.commitChanges).mockRejectedValueOnce({ kind: "connectionLost", disconnectPhase: "outcomeUnknown", message: "执行结果未知" });
+    mount(<DataGridPanel tab={grid("a")} />);
+    const input = await screen.findByDisplayValue("a original");
+    fireEvent.change(input, { target: { value: "pending" } });
+    fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+    await screen.findByText("请先刷新并核对数据库中的提交结果，再继续编辑。");
+    fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+    expect(api.commitChanges).toHaveBeenCalledTimes(1);
+    expect(screen.getByDisplayValue("pending")).toBeDisabled();
+    expect(useTabStore.getState().dirty.a).toBe(true);
+  });
+
   it("写入成功但刷新失败后，不会把已提交的草稿再次写入", async () => {
     useTabStore.setState({ activeId: "a" });
     mount(<DataGridPanel tab={grid("a")} />);
@@ -192,6 +221,49 @@ describe("网格写入边界", () => {
 });
 
 describe("查询结果上下文", () => {
+  it("健康会话主动重连需要确认，保留编辑器与结果直到再次运行", async () => {
+    openQuery();
+    mount(<QueryHarness />);
+    const run = screen.getByRole("button", { name: "运行 SQL" });
+    fireEvent.click(run);
+    await screen.findByText("A result");
+    const editor = screen.getByLabelText("SQL 编辑器");
+    fireEvent.change(editor, { target: { value: "SELECT 42" } });
+    fireEvent.click(screen.getByRole("button", { name: "重新连接此标签" }));
+    const dialog = await screen.findByRole("dialog");
+    const first = vi.mocked(api.executeSql).mock.calls[0][0].sessionId;
+    fireEvent.click(within(dialog).getByRole("button", { name: "重新连接" }));
+    await screen.findByText("来自上一次会话");
+    expect(api.reconnectQuerySession).toHaveBeenLastCalledWith(profile.id, "A", first);
+    expect(api.executeSql).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("A result")).toBeInTheDocument();
+    expect(screen.getByLabelText("SQL 编辑器")).toBe(editor);
+    expect(editor).toHaveValue("SELECT 42");
+    expect(screen.getByRole("button", { name: "导出 CSV" })).toBeDisabled();
+    fireEvent.click(run);
+    await waitFor(() => expect(screen.queryByText("来自上一次会话")).not.toBeInTheDocument());
+    const next = vi.mocked(api.executeSql).mock.calls[1][0];
+    expect(next.sessionId).not.toBe(first);
+    expect(next.sql).toBe("SELECT 42");
+  });
+
+  it("脚本断线后可直接重连，执行期间禁用重连，后续语句不自动发送", async () => {
+    openQuery();
+    const pending = deferred<{ statements: StatementResult[]; stopped: boolean }>();
+    vi.mocked(api.executeSql).mockReturnValueOnce(pending.promise);
+    mount(<QueryHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
+    const reconnect = screen.getByRole("button", { name: "重新连接此标签" });
+    await waitFor(() => expect(reconnect).toBeDisabled());
+    await act(async () => pending.resolve({ statements: [statement(), statement({ index: 1, ok: false, error: "执行结果未知", disconnectPhase: "outcomeUnknown" })], stopped: true }));
+    await screen.findByText("A result");
+    fireEvent.click(reconnect);
+    await screen.findByText("来自上一次会话");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.executeSql).toHaveBeenCalledTimes(1);
+    expect(api.exportSqlCsv).not.toHaveBeenCalled();
+  });
+
   it("查询和导出共享会话，换库和卸载释放旧会话", async () => {
     const id = openQuery();
     const mounted = mount(<QueryHarness />);

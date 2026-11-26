@@ -395,6 +395,8 @@ pub fn default_page_size() -> u32 {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct StatementResult {
+    #[cfg_attr(test, ts(optional = nullable))]
+    pub disconnect_phase: Option<crate::error::DisconnectPhase>,
     pub index: usize,
     pub sql: String,
     pub ok: bool,

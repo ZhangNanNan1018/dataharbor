@@ -26,11 +26,7 @@ pub fn connect(config: &SessionConfig) -> AppResult<DamengSession> {
     } else {
         client.connect(&config.username, &config.password)
     };
-    connected.map_err(|err| {
-        AppError::msg(format!(
-            "达梦连接失败: {err}。这是 dameng crate 的 DM8 线协议（默认端口 5236），不是 ODBC。TLS 使用系统信任库，不能跳过证书校验。"
-        ))
-    })?;
+    connected.map_err(|e| connection_error(e).context("达梦 DM8 线协议连接失败"))?;
     Ok(DamengSession {
         client,
         username: config.username.clone(),
@@ -54,7 +50,7 @@ impl DamengSession {
         let result = self
             .client
             .query(sql)
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         let columns = result
             .columns
             .iter()
@@ -81,9 +77,8 @@ impl DamengSession {
                         |locator| {
                             let data = self.client.read_lob(locator);
                             let freed = self.client.free_lob(locator);
-                            let data = data
-                                .map_err(|e| AppError::msg(format!("读取达梦 BLOB 失败：{e}")))?;
-                            freed.map_err(|e| AppError::msg(format!("释放达梦 BLOB 失败：{e}")))?;
+                            let data = data.map_err(|e| connection_error(e).context("读取达梦 BLOB 失败"))?;
+                            freed.map_err(|e| connection_error(e).context("释放达梦 BLOB 失败"))?;
                             Ok(data)
                         },
                     )?
@@ -118,9 +113,26 @@ impl DamengSession {
     }
 }
 
+pub(super) fn connection_error(err: dameng::Error) -> AppError {
+    use std::error::Error;
+    let lost = match &err {
+        dameng::Error::Io(_)
+        | dameng::Error::NotConnected
+        | dameng::Error::ConnectionFailed(_)
+        | dameng::Error::Timeout(_) => true,
+        dameng::Error::Protocol(cause) => cause.source().is_some_and(|e| e.is::<std::io::Error>()),
+        _ => false,
+    };
+    AppError::driver(err, lost)
+}
+
 impl DbSession for DamengSession {
     fn engine(&self) -> Engine {
         Engine::Dameng
+    }
+
+    fn probe(&mut self, _database: &str) -> AppResult<()> {
+        self.query("SELECT 1 FROM DUAL").map(|_| ())
     }
 
     fn version(&mut self) -> AppResult<String> {
@@ -136,6 +148,7 @@ impl DbSession for DamengSession {
     fn list_databases(&mut self) -> AppResult<Vec<String>> {
         match self.one_column("SELECT NAME FROM V$INSTANCE") {
             Ok(names) if !names.is_empty() => Ok(names),
+            Err(e) if e.disconnect_phase().is_some() => Err(e),
             _ => Ok(vec!["DAMENG".into()]),
         }
     }
@@ -168,7 +181,7 @@ impl DbSession for DamengSession {
             .one_column(&format!(
                 "SELECT cc.COLUMN_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc ON c.OWNER = cc.OWNER AND c.CONSTRAINT_NAME = cc.CONSTRAINT_NAME WHERE c.CONSTRAINT_TYPE = 'P' AND c.OWNER = {owner} AND c.TABLE_NAME = {table}"
             ))
-            .unwrap_or_default();
+            .or_else(|e| if e.disconnect_phase().is_some() { Err(e) } else { Ok(Vec::new()) })?;
         Ok(outcome
             .rows
             .into_iter()
@@ -221,7 +234,7 @@ impl DbSession for DamengSession {
         let affected = self
             .client
             .execute(sql)
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         Ok(QueryOutcome {
             original_rows: None,
             columns: Vec::new(),

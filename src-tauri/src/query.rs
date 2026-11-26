@@ -70,7 +70,12 @@ pub fn execute_sql_with_operation(
                     "取消会停止当前支持中断的语句及后续语句，已完成的写入不会自动撤销",
                 );
                 let started = Instant::now();
-                match run_one(session, &request.database, sql, page, page_size, operation) {
+                let result = state
+                    .check_query_generation(request.session_id.as_deref())
+                    .and_then(|()| {
+                        run_one(session, &request.database, sql, page, page_size, operation)
+                    });
+                match result {
                     Ok(mut result) => {
                         result.index = index;
                         result.sql = sql.clone();
@@ -88,11 +93,17 @@ pub fn execute_sql_with_operation(
                         if matches!(err, AppError::Cancelled { .. }) {
                             return Err(err);
                         }
+                        if err.disconnect_phase().is_some()
+                            && session.engine().capabilities().persistent_console
+                        {
+                            state.query_session_lost(request.session_id.as_deref());
+                        }
                         operation.report_failure(err.to_string());
                         results.push(StatementResult {
                             index,
                             sql: sql.clone(),
                             ok: false,
+                            disconnect_phase: err.disconnect_phase(),
                             error: Some(err.to_string()),
                             columns: Vec::new(),
                             rows: Vec::new(),
@@ -187,7 +198,9 @@ fn execute_one(
     let interrupt = operation.bind_interrupt(if completion {
         None
     } else {
-        session.cancel_handle(database)?
+        session
+            .cancel_handle(database)
+            .map_err(AppError::before_send)?
     })?;
     operation.checkpoint()?;
     let result = session.execute(database, sql, limit);
@@ -216,6 +229,7 @@ fn from_outcome(
         index: 0,
         sql: String::new(),
         ok: true,
+        disconnect_phase: None,
         error: None,
         columns: outcome.columns,
         rows: outcome.rows,

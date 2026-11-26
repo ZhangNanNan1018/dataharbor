@@ -133,7 +133,7 @@ pub fn open_client(
                     });
                     client
                 })
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
         } else {
             config
                 .connect(NoTls)
@@ -144,7 +144,7 @@ pub fn open_client(
                     });
                     client
                 })
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
         };
         Ok(client)
     });
@@ -205,7 +205,7 @@ impl PostgresSession {
     ) -> AppResult<T> {
         let database = self.resolve_db(database);
         if !self.clients.contains_key(&database) {
-            let client = self.open_client(&database)?;
+            let client = self.open_client(&database).map_err(AppError::before_send)?;
             self.clients.insert(database.clone(), client);
         }
         let client = self
@@ -228,6 +228,19 @@ impl PostgresSession {
             })
             .collect())
     }
+}
+
+fn connection_error(err: tokio_postgres::Error) -> AppError {
+    use std::error::Error;
+    let lost = err.is_closed()
+        || err.code().is_some_and(|code| {
+            code.code().starts_with("08")
+                || matches!(code.code(), "57P01" | "57P02" | "57P03" | "57P05")
+        })
+        || err
+            .source()
+            .is_some_and(|cause| cause.is::<std::io::Error>());
+    AppError::driver(err, lost)
 }
 
 impl DbSession for PostgresSession {
@@ -273,6 +286,14 @@ impl DbSession for PostgresSession {
         self.with_client(database, |client| {
             block_on(client.batch_execute("ROLLBACK"))
                 .map_err(|err| AppError::msg(format!("无法结束 PostgreSQL 快照：{err}")))
+        })
+    }
+
+    fn probe(&mut self, database: &str) -> AppResult<()> {
+        self.with_client(database, |client| {
+            block_on(client.simple_query(""))
+                .map(|_| ())
+                .map_err(connection_error)
         })
     }
 
@@ -450,7 +471,7 @@ pub(crate) fn run_simple(
         let messages = client
             .simple_query_raw(sql)
             .await
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         futures::pin_mut!(messages);
         let mut retained_bytes = 0usize;
         let mut columns: Vec<ColumnMeta> = Vec::new();
@@ -461,7 +482,7 @@ pub(crate) fn run_simple(
         while let Some(message) = messages
             .try_next()
             .await
-            .map_err(|err| AppError::msg(err.to_string()))?
+            .map_err(connection_error)?
         {
             match message {
                 SimpleQueryMessage::RowDescription(description) => {
@@ -489,7 +510,7 @@ pub(crate) fn run_simple(
                                     .map(|cell| bytes.saturating_add(cell.map_or(0, str::len)))
                             },
                         )
-                        .map_err(|err| AppError::msg(err.to_string()))?;
+                        .map_err(connection_error)?;
                     if truncated
                         || max_rows.is_some_and(|limit| rows.len() >= limit)
                         || retained_bytes.saturating_add(row_bytes) > MAX_RESULT_BYTES

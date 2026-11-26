@@ -473,3 +473,151 @@ fn check_bit_binary_geometry(engine: Engine, port: &str) {
     .unwrap();
     assert_eq!(f.page().rows, expected.rows);
 }
+
+#[test]
+#[ignore = "requires disposable MySQL and PostgreSQL; also tests MariaDB when configured"]
+fn idle_shared_connection_and_single_console_recovery() {
+    for (engine, port) in [
+        (Engine::Mysql, "DATAHARBOR_TEST_MYSQL_PORT"),
+        (Engine::Mariadb, "DATAHARBOR_TEST_MARIADB_PORT"),
+        (Engine::Postgres, "DATAHARBOR_TEST_POSTGRES_PORT"),
+    ] {
+        if engine == Engine::Mariadb && std::env::var_os(port).is_none() {
+            continue;
+        }
+        let f = Fixture::open(engine, port);
+        let identity = if engine == Engine::Postgres {
+            "SELECT pg_backend_pid()"
+        } else {
+            "SELECT CONNECTION_ID()"
+        };
+        let console = |previous: Option<&str>| {
+            f.state
+                .reconnect_query_session(&f.id, &f.database, previous)
+                .unwrap()
+        };
+        let run = |key: &str, sql: &str| {
+            crate::query::execute_sql(
+                &f.state,
+                ExecuteSqlRequest {
+                    connection_id: f.id.clone(),
+                    database: f.database.clone(),
+                    session_id: Some(key.into()),
+                    sql: sql.into(),
+                    page: 1,
+                    page_size: 20,
+                    only_statement: None,
+                },
+            )
+        };
+        let scalar = |key: &str, sql: &str| run(key, sql).unwrap().statements[0].rows[0][0].clone();
+        let a = console(None);
+        let b = console(None);
+        let b_id = scalar(&b, identity);
+        let (set_variable, read_variable) = if engine == Engine::Postgres {
+            (
+                "SET dataharbor.sentinel = 'preserved'",
+                "SELECT current_setting('dataharbor.sentinel')",
+            )
+        } else {
+            ("SET @sentinel = 'preserved'", "SELECT @sentinel")
+        };
+        assert!(!run(&b, set_variable).unwrap().stopped);
+        assert!(!run(&b, "CREATE TEMPORARY TABLE console_marker(n INTEGER); BEGIN; INSERT INTO console_marker VALUES (17)").unwrap().stopped);
+
+        let shared_id = || {
+            f.state
+                .with_read_session(&f.id, &f.database, |s| {
+                    Ok(s.execute(&f.database, identity, Some(1))?.rows[0][0].clone())
+                })
+                .unwrap()
+        };
+        if engine == Engine::Postgres {
+            let target = f
+                .state
+                .with_read_session(&f.id, "postgres", |s| {
+                    Ok(s.execute("postgres", identity, Some(1))?.rows[0][0].clone())
+                })
+                .unwrap();
+            assert!(
+                !run(
+                    &a,
+                    &format!(
+                        "SELECT pg_terminate_backend({}, 5000)",
+                        target.to_string().trim_matches('"')
+                    )
+                )
+                .unwrap()
+                .stopped
+            );
+            assert!(crate::schema::list_schemas(&f.state, &f.id, "postgres")
+                .unwrap()
+                .contains(&"public".into()));
+        }
+        let old = shared_id();
+        if engine == Engine::Postgres {
+            let kill = format!("SELECT pg_terminate_backend({old}, 5000)").replace('"', "");
+            assert!(!run(&a, &kill).unwrap().stopped);
+        } else {
+            f.sql("SET SESSION wait_timeout = 1");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        std::thread::scope(|scope| {
+            let reads: Vec<_> = (0..4).map(|_| scope.spawn(&shared_id)).collect();
+            let ids: Vec<_> = reads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_ne!(ids[0], old);
+            assert!(ids.iter().all(|id| id == &ids[0]));
+        });
+        assert!(
+            crate::schema::list_tables(&f.state, &f.id, &f.database, &f.schema)
+                .unwrap()
+                .contains(&f.table)
+        );
+        assert_eq!(f.page().total, 0);
+        let a_id = scalar(&a, identity).to_string().replace('"', "");
+        let terminate = if engine == Engine::Postgres {
+            format!("SELECT pg_terminate_backend({a_id})")
+        } else {
+            format!("KILL CONNECTION {a_id}")
+        };
+        let script = if engine == Engine::Postgres {
+            format!(
+                "SELECT 1; {terminate}; INSERT INTO {} VALUES ('unexpected', 1, 1)",
+                f.table_sql
+            )
+        } else {
+            f.sql(&terminate);
+            format!(
+                "SELECT 1; INSERT INTO {} VALUES ('unexpected', 1, 1)",
+                f.table_sql
+            )
+        };
+        let response = run(&a, &script).unwrap();
+        assert!(response.stopped, "{engine:?}");
+        assert_eq!(response.statements[0].ok, engine == Engine::Postgres);
+        let failed = response.statements.last().unwrap();
+        assert!(
+            failed.disconnect_phase.is_some(),
+            "{engine:?}: {}",
+            failed.message
+        );
+        assert_eq!(f.page().total, 0);
+        let next = console(Some(&a));
+        assert!(run(&a, identity).is_err());
+        assert_ne!(scalar(&next, identity).to_string().replace('"', ""), a_id);
+        assert_eq!(scalar(&b, identity), b_id);
+        assert_eq!(scalar(&b, read_variable), json!("preserved"));
+        assert_eq!(
+            scalar(&b, "SELECT n FROM console_marker")
+                .to_string()
+                .trim_matches('"'),
+            "17"
+        );
+        assert!(!run(&b, "ROLLBACK").unwrap().stopped);
+        assert!(
+            run(&b, "SELECT n FROM console_marker").unwrap().statements[0]
+                .rows
+                .is_empty()
+        );
+    }
+}

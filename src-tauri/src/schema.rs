@@ -3,11 +3,11 @@ use crate::models::ColumnMeta;
 use crate::state::AppState;
 
 pub fn list_databases(state: &AppState, connection_id: &str) -> AppResult<Vec<String>> {
-    state.with_session(connection_id, |session| session.list_databases())
+    state.with_read_session(connection_id, "", |session| session.list_databases())
 }
 
 pub fn list_schemas(state: &AppState, connection_id: &str, database: &str) -> AppResult<Vec<String>> {
-    state.with_session(connection_id, |session| session.list_schemas(database))
+    state.with_read_session(connection_id, database, |session| session.list_schemas(database))
 }
 
 pub fn list_tables(
@@ -16,7 +16,7 @@ pub fn list_tables(
     database: &str,
     schema: &str,
 ) -> AppResult<Vec<String>> {
-    state.with_session(connection_id, |session| session.list_tables(database, schema))
+    state.with_read_session(connection_id, database, |session| session.list_tables(database, schema))
 }
 
 pub fn list_views(
@@ -25,7 +25,7 @@ pub fn list_views(
     database: &str,
     schema: &str,
 ) -> AppResult<Vec<String>> {
-    state.with_session(connection_id, |session| session.list_views(database, schema))
+    state.with_read_session(connection_id, database, |session| session.list_views(database, schema))
 }
 
 pub fn list_columns(
@@ -35,7 +35,7 @@ pub fn list_columns(
     schema: &str,
     object_name: &str,
 ) -> AppResult<Vec<ColumnMeta>> {
-    state.with_session(connection_id, |session| {
+    state.with_read_session(connection_id, database, |session| {
         session.list_columns(database, schema, object_name)
     })
 }

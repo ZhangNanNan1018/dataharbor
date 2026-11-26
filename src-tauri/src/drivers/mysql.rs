@@ -53,13 +53,31 @@ pub fn connect(config: &SessionConfig) -> AppResult<MysqlSession> {
     // Keep the original transport, authentication and TLS policy for the
     // separate cancellation connection. It must never downgrade a tunnel/TLS.
     let cancel_options = mysql::Opts::from(opts.clone().db_name(None::<String>));
-    let conn = mysql::Conn::new(opts).map_err(|err| AppError::msg(err.to_string()))?;
+    let conn = mysql::Conn::new(opts).map_err(connection_error)?;
     Ok(MysqlSession {
         conn,
         engine: config.engine,
         current_db: config.database.trim().to_string(),
         cancel_options,
     })
+}
+
+pub(super) fn connection_error(err: mysql::Error) -> AppError {
+    use mysql::{DriverError, Error};
+    let lost = match &err {
+        Error::IoError(_) | Error::CodecError(_) => true,
+        Error::DriverError(e) => matches!(
+            e,
+            DriverError::ConnectTimeout
+                | DriverError::CouldNotConnect(_)
+                | DriverError::Timeout
+                | DriverError::PacketOutOfSync
+                | DriverError::UnexpectedPacket
+        ),
+        Error::MySqlError(e) => matches!(e.code, 1053 | 1927 | 2006 | 2013 | 4031),
+        _ => false,
+    };
+    AppError::driver(err, lost)
 }
 
 impl DbSession for MysqlSession {
@@ -83,7 +101,7 @@ impl DbSession for MysqlSession {
     }
 
     fn begin_read_snapshot(&mut self, database: &str) -> AppResult<()> {
-        self.activate(database)?;
+        self.activate(database).map_err(AppError::before_send)?;
         self.conn
             .query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .map_err(|err| AppError::msg(format!("无法设置 MySQL 快照隔离级别：{err}")))?;
@@ -119,6 +137,10 @@ impl DbSession for MysqlSession {
             return Err(AppError::msg("MySQL/MariaDB 全量同步要求 InnoDB 实体表，其他引擎或视图无法保证一致性快照；没有开始写入目标"));
         }
         Ok(())
+    }
+
+    fn probe(&mut self, _database: &str) -> AppResult<()> {
+        self.conn.ping().map_err(connection_error)
     }
 
     fn version(&mut self) -> AppResult<String> {
@@ -206,10 +228,10 @@ impl DbSession for MysqlSession {
     }
 
     fn execute_affected(&mut self, database: &str, sql: &str) -> AppResult<u64> {
-        self.activate(database)?;
+        self.activate(database).map_err(AppError::before_send)?;
         self.conn
             .query_drop(sql)
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         Ok(self.conn.affected_rows())
     }
 
@@ -223,11 +245,11 @@ impl DbSession for MysqlSession {
         if sql.is_empty() {
             return Ok(QueryOutcome::empty());
         }
-        self.activate(database)?;
+        self.activate(database).map_err(AppError::before_send)?;
         let mut result = self
             .conn
             .query_iter(sql)
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         let formats: Vec<_> = result
             .columns()
             .as_ref()
@@ -256,7 +278,7 @@ impl DbSession for MysqlSession {
             while result
                 .next()
                 .transpose()
-                .map_err(|err| AppError::msg(err.to_string()))?
+                .map_err(connection_error)?
                 .is_some()
             {}
             let mut outcome = QueryOutcome::empty();
@@ -268,7 +290,7 @@ impl DbSession for MysqlSession {
         while let Some(row) = result
             .next()
             .transpose()
-            .map_err(|err| AppError::msg(err.to_string()))?
+            .map_err(connection_error)?
         {
             if max_rows.is_some_and(|limit| rows.len() >= limit) {
                 truncated = true;
@@ -300,7 +322,7 @@ impl MysqlSession {
         let ident = crate::sqlutil::quote_ident(self.engine, database)?;
         self.conn
             .query_drop(format!("USE {ident}"))
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(connection_error)?;
         self.current_db = database.to_string();
         Ok(())
     }

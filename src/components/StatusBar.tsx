@@ -19,7 +19,7 @@ export function StatusBar() {
       </span>
       <span className="min-w-0 flex-1 truncate text-center">{status}</span>
       <span>
-        {tabs.length} 个标签 · 固定 {pinned} · {theme === "dark" ? "深色" : "浅色"} · {info?.version ?? "0.1.2"}
+        {tabs.length} 个标签 · 固定 {pinned} · {theme === "dark" ? "深色" : "浅色"} · {info?.version ?? "0.1.3"}
       </span>
     </footer>
   );

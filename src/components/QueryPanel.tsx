@@ -3,10 +3,10 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import "../monacoSetup";
 import { App, Alert, Button, Dropdown, Input, Modal, Pagination, Select, Space, Tag } from "antd";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, errorText, isOperationCancelled, pickSaveCsv, type PlanNode } from "../api";
+import { api, disconnectPhase, errorText, isOperationCancelled, pickSaveCsv, type PlanNode } from "../api";
 import { useLongOperation } from "../operations";
 import { TaskProgress } from "./TaskProgress";
-import { engineLabel } from "../engines";
+import { engineCapabilities, engineLabel } from "../engines";
 import { applyEditorTheme, editorFont } from "../monacoTheme";
 import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../sqlIntelligence";
 import { useConnectionStore } from "../stores/useConnectionStore";
@@ -28,10 +28,15 @@ interface QueryResult extends ExecuteSqlResponse {
 }
 
 export function QueryPanel({ tab }: { tab: QueryTab }) {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const task = useLongOperation(tab.id);
-  const sessionId = useMemo(() => crypto.randomUUID(), [tab.id, tab.connectionId, tab.database]);
-  useEffect(() => () => { void api.closeQuerySession(sessionId).catch(() => {}); }, [sessionId]);
+  const lease = useMemo(() => ({ id: "" }), [tab.id, tab.connectionId, tab.database]);
+  useEffect(() => () => {
+    if (lease.id) void api.closeQuerySession(lease.id).catch(() => {});
+  }, [lease]);
+  const [disconnected, setDisconnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectingRef = useRef(false);
   const theme = useUiStore((state) => state.theme);
   const setStatus = useUiStore((state) => state.setStatus);
   const profiles = useConnectionStore((state) => state.profiles);
@@ -63,10 +68,17 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   const statement = result?.statements[active] ?? null;
   const profile = profiles.find((item) => item.id === tab.connectionId);
 
+  const persistent = engineCapabilities(profile?.engine)?.persistentConsole;
+  const stale = Boolean(result && result.context.sessionId !== lease.id);
+  const blocked = Boolean(persistent && disconnected);
+
   function invalidateResults() {
     requestId.current += 1;
     runningRef.current = null;
     setRunning(false);
+    reconnectingRef.current = false;
+    setReconnecting(false);
+    setDisconnected(false);
     setResult(null);
     setPlan(null);
   }
@@ -75,6 +87,18 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     invalidateResults();
     return () => { requestId.current += 1; };
   }, [tab.connectionId, tab.database]);
+
+  useEffect(() => useConnectionStore.subscribe((next, prev) => {
+    const connected = (profiles: typeof next.profiles) => profiles.find((p) => p.id === tab.connectionId)?.connected;
+    if (!connected(prev.profiles) || connected(next.profiles)) return;
+    ++requestId.current;
+    lease.id = "";
+    runningRef.current = null;
+    setRunning(false);
+    reconnectingRef.current = false;
+    setReconnecting(false);
+    setDisconnected(true);
+  }), [lease, tab.connectionId]);
 
   function isCurrent(token: number, context: QueryContext) {
     return requestId.current === token && tabRef.current.connectionId === context.connectionId && tabRef.current.database === context.database;
@@ -97,7 +121,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function explain() {
     if (!tab.connectionId) return;
-    const context = { sessionId, connectionId: tab.connectionId, database: tab.database, sql: tab.sql };
+    const context = { sessionId: lease.id, connectionId: tab.connectionId, database: tab.database, sql: tab.sql };
     const token = requestId.current;
     const toolToken = ++toolRequestId.current;
     const current = () => isCurrent(token, context) && toolToken === toolRequestId.current && tabRef.current.sql === context.sql;
@@ -157,8 +181,17 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
   }
 
   async function execute(context: QueryContext, token: number, page: number, size: number, onlyStatement: number | null) {
-    await ensure(context.connectionId);
+    if (!lease.id) await ensure(context.connectionId);
     if (!isCurrent(token, context)) return null;
+    if (!lease.id) {
+      const id = await api.reconnectQuerySession(context.connectionId, context.database, null);
+      if (!isCurrent(token, context)) {
+        await api.closeQuerySession(id);
+        return null;
+      }
+      lease.id = id;
+      context.sessionId = id;
+    }
     return task.execute(`执行查询 · ${context.database || "默认数据库"}`, (operationId) => api.executeSql({
       ...context,
       page,
@@ -167,8 +200,52 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     }, operationId));
   }
 
+  function noteDisconnect(err: unknown) {
+    if (!disconnectPhase(err)) return;
+    if (err && typeof err === "object" && "kind" in err && err.kind === "sessionExpired") lease.id = "";
+    setDisconnected(true);
+  }
+
+  async function reconnect() {
+    if (!tab.connectionId || reconnectingRef.current || runningRef.current !== null || task.active || exportRef.current) return;
+    const token = ++requestId.current;
+    const context = { connectionId: tab.connectionId, database: tab.database, sql: tab.sql, sessionId: lease.id };
+    reconnectingRef.current = true;
+    setReconnecting(true);
+    try {
+      await ensure(context.connectionId);
+      if (!isCurrent(token, context)) return;
+      const id = await api.reconnectQuerySession(context.connectionId, context.database, lease.id || null);
+      if (!isCurrent(token, context)) { await api.closeQuerySession(id); return; }
+      lease.id = id;
+      setDisconnected(false);
+      setStatus("此标签已重新连接，可手动运行查询");
+    } catch (err) {
+      if (isCurrent(token, context)) {
+        if (err && typeof err === "object" && "kind" in err && err.kind === "sessionExpired") noteDisconnect(err);
+        message.error(errorText(err));
+      }
+    } finally {
+      if (isCurrent(token, context)) {
+        reconnectingRef.current = false;
+        setReconnecting(false);
+      }
+    }
+  }
+
+  function requestReconnect() {
+    if (disconnected || !lease.id) { void reconnect(); return; }
+    const token = requestId.current;
+    modal.confirm({
+      title: "重新连接此标签？",
+      content: "当前会话的未提交事务、临时表和会话变量将丢失。编辑内容和已有结果会保留。",
+      okText: "重新连接", cancelText: "取消",
+      onOk: () => { if (token === requestId.current) return reconnect(); },
+    });
+  }
+
   async function run(mode: "all" | "selection") {
-    if (runningRef.current !== null || task.active || exportRef.current) return;
+    if (blocked || reconnectingRef.current || runningRef.current !== null || task.active || exportRef.current) return;
     if (!tab.connectionId) {
       message.warning("先选择一个连接");
       return;
@@ -185,22 +262,27 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       return;
     }
     const sql = selected || tab.sql;
-    const context = { sessionId, connectionId: tab.connectionId, database: tab.database, sql };
+    const context = { sessionId: lease.id, connectionId: tab.connectionId, database: tab.database, sql };
     const token = ++requestId.current;
     runningRef.current = token;
     setRunning(true);
     try {
       const response = await execute(context, token, 1, pageSize, null);
       if (!response || !isCurrent(token, context)) return;
-      setResult({ ...response, context });
+      const failed = response.statements.find((item) => !item.ok);
+      if (failed?.disconnectPhase) setDisconnected(true);
+      if (!failed?.disconnectPhase || response.statements.some((item) => item.ok) || !result) {
+        setResult({ ...response, context });
+        setActive(Math.max(0, response.statements.findIndex((item) => item.ok && item.columns.length > 0)));
+        setResultView(response.statements.some((item) => item.columns.length > 0) ? "grid" : "messages");
+      }
       setHistory(pushHistory(sql));
-      setActive(Math.max(0, response.statements.findIndex((item) => item.ok && item.columns.length > 0)));
-      setResultView(response.statements.some((item) => item.columns.length > 0) ? "grid" : "messages");
-      const first = response.statements[0];
+      const first = failed || response.statements[0];
       setStatus(first?.ok ? first.message : first?.error || "执行结束");
-      if (response.stopped) message.error(first?.error || "语句执行失败，后续语句已停止");
+      if (failed) message.error(`第 ${failed.index + 1} 条语句失败：${failed.error || failed.message}`);
     } catch (err) {
       if (isCurrent(token, context)) {
+        noteDisconnect(err);
         setStatus(errorText(err));
         if (!isOperationCancelled(err)) message.error(errorText(err));
       }
@@ -213,7 +295,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function changePage(page: number, size: number) {
     const current = result?.statements[active];
-    if (!current || !result || runningRef.current !== null || task.active) return;
+    if (blocked || stale || reconnectingRef.current || !current || !result || runningRef.current !== null || task.active) return;
     if (!current.pageable) {
       message.info("这条语句不能分页");
       return;
@@ -227,6 +309,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       if (!response || !isCurrent(token, context)) return;
       const updated = response.statements[0];
       if (!updated) return;
+      if (updated.disconnectPhase) { setDisconnected(true); message.error(updated.message); setStatus(updated.message); return; }
       setPageSize(size);
       setResult((prev) => {
         if (!prev) return { ...response, context };
@@ -238,6 +321,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       setStatus(updated.ok ? updated.message : updated.error || "分页失败");
     } catch (err) {
       if (isCurrent(token, context)) {
+        noteDisconnect(err);
         setStatus(errorText(err));
         if (!isOperationCancelled(err)) message.error(errorText(err));
       }
@@ -248,7 +332,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   async function exportCsv() {
     const current = result?.statements[active];
-    if (exportRef.current || task.active || runningRef.current !== null) return;
+    if (blocked || stale || reconnectingRef.current || exportRef.current || task.active || runningRef.current !== null) return;
     if (!result || !current?.ok || current.columns.length === 0) {
       message.warning("没有可导出的结果");
       return;
@@ -271,11 +355,14 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
         sql: current.sql,
         path,
       }, operationId));
+      if (!isCurrent(token, context)) return;
       const text = `已导出 ${exported.rowCount} 行${exported.truncated ? "，结果已截断，仅包含部分数据" : ""}`;
       if (exported.truncated) message.warning(text);
       else message.success(text);
       setStatus(`CSV 已写入 ${exported.path}`);
     } catch (err) {
+      if (!isCurrent(token, context)) return;
+      noteDisconnect(err);
       setStatus(errorText(err));
       if (!isOperationCancelled(err)) message.error(errorText(err));
     } finally {
@@ -369,13 +456,14 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
           }))}
           onChange={(database: string) => { invalidateResults(); patchQuery(tab.id, { database }); }}
         />
-        <Button aria-label="运行 SQL" type="primary" disabled={task.active || exporting} loading={running} onClick={() => void run("all")}>
+        <Button aria-label="运行 SQL" type="primary" disabled={blocked || reconnecting || task.active || exporting} loading={running} onClick={() => void run("all")}>
           运行
         </Button>
-        <Button aria-label="运行选中 SQL" disabled={task.active || exporting} loading={running} onClick={() => void run("selection")}>
+        <Button aria-label="运行选中 SQL" disabled={blocked || reconnecting || task.active || exporting} loading={running} onClick={() => void run("selection")}>
           运行选中
         </Button>
-        <Button aria-label="导出 CSV" disabled={task.active || running} loading={exporting} onClick={() => void exportCsv()}>
+        {persistent && <Button aria-label="重新连接此标签" disabled={running || exporting || task.active} loading={reconnecting} onClick={requestReconnect}>重新连接此标签</Button>}
+        <Button aria-label="导出 CSV" disabled={blocked || stale || reconnecting || task.active || running} loading={exporting} onClick={() => void exportCsv()}>
           导出 CSV
         </Button>
         <Button
@@ -455,6 +543,8 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
           }}
         />
       </div>
+      {blocked && <Alert type="warning" showIcon message="此标签的连接已中断。重新连接后可手动运行 SQL。" />}
+      {stale && <Tag>来自上一次会话</Tag>}
       <div className="xb-result-switch" role="tablist">
         <button type="button" className={resultView === "grid" ? "active" : ""} onClick={() => setResultView("grid")}>结果</button>
         <button type="button" className={resultView === "messages" ? "active" : ""} onClick={() => setResultView("messages")}>消息</button>
@@ -513,7 +603,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
               total={totalOf(statement)}
               showSizeChanger
               pageSizeOptions={[50, 100, 200, 500, 1000]}
-              disabled={!statement.pageable || running}
+              disabled={blocked || stale || reconnecting || !statement.pageable || running || exporting}
               onChange={(page, size) => void changePage(page, size)}
             />
           </div>

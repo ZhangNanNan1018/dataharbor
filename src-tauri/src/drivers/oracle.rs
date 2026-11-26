@@ -42,6 +42,29 @@ pub fn connect(config: &SessionConfig) -> AppResult<OracleSession> {
     Ok(session)
 }
 
+pub(super) fn sqlplus_error(text: &str) -> AppError {
+    let lost = text
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("ORA-"))
+        .filter_map(|line| line.split_once(':'))
+        .any(|(code, _)| {
+            matches!(
+                code,
+                "01012"
+                    | "03113"
+                    | "03114"
+                    | "03135"
+                    | "12170"
+                    | "12537"
+                    | "12541"
+                    | "12547"
+                    | "12570"
+                    | "12571"
+            )
+        });
+    AppError::driver(text.trim(), lost)
+}
+
 impl OracleSession {
     fn query(&self, sql: &str) -> AppResult<QueryOutcome> {
         let script = sqlplus_script(&self.user, &self.password, &self.connect, sql);
@@ -55,27 +78,20 @@ impl OracleSession {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
                 .write_all(script.as_bytes())
-                .map_err(|err| AppError::msg(err.to_string()))?;
+                .map_err(|err| AppError::driver(err, true))?;
         }
         let output = child
             .wait_with_output()
-            .map_err(|err| AppError::msg(err.to_string()))?;
+            .map_err(|err| AppError::driver(err, true))?;
         let text = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::msg(format!("{text}{err}").trim().to_string()));
+            return Err(sqlplus_error(&format!("{text}{err}")));
         }
-        if text.to_ascii_lowercase().contains("ora-") || text.to_ascii_lowercase().contains("sp2-")
-        {
-            return Err(AppError::msg(
-                text.lines()
-                    .find(|line| {
-                        line.to_ascii_lowercase().contains("ora-")
-                            || line.to_ascii_lowercase().contains("sp2-")
-                    })
-                    .unwrap_or(text.trim())
-                    .to_string(),
-            ));
+        // SQL errors exit via WHENEVER SQLERROR. A successful query can itself
+        // return text containing an ORA code. SQL*Plus command errors use SP2.
+        if let Some(line) = text.lines().find(|line| line.trim_start().starts_with("SP2-")) {
+            return Err(sqlplus_error(line));
         }
         Ok(parse_sqlplus(&text))
     }

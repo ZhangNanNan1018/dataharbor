@@ -220,6 +220,23 @@ pub async fn list_run_history(app: tauri::AppHandle) -> AppResult<Vec<crate::run
 }
 
 #[tauri::command]
+pub async fn reconnect_query_session(
+    app: tauri::AppHandle,
+    connection_id: String,
+    database: String,
+    previous: Option<String>,
+) -> AppResult<String> {
+    run_blocking(move || {
+        app.state::<AppState>().reconnect_query_session(
+            &connection_id,
+            &database,
+            previous.as_deref(),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn close_query_session(app: tauri::AppHandle, session_id: String) -> AppResult<()> {
     run_blocking(move || { app.state::<AppState>().close_query_session(&session_id); Ok(()) }).await
 }

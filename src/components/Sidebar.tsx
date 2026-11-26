@@ -49,7 +49,7 @@ export function Sidebar({ width }: { width: number }) {
   const [keyword, setKeyword] = useState("");
   const [cache, setCache] = useState<Record<string, XNode[]>>({});
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
-  const [loadedKeys, setLoadedKeys] = useState<string[]>([]);
+  const loadedKeys = useMemo(() => Object.keys(cache), [cache]);
   const catalogRevisions = useRef<Record<string, number>>({});
   const previousProfiles = useRef(profiles);
   const [menu, setMenu] = useState<{ x: number; y: number; meta: NodeMeta } | null>(null);
@@ -57,7 +57,6 @@ export function Sidebar({ width }: { width: number }) {
   function clearConnectionTree(id: string) {
     catalogRevisions.current[id] = (catalogRevisions.current[id] ?? 0) + 1;
     setCache((previous) => Object.fromEntries(Object.entries(previous).filter(([key]) => !belongsToConnection(key, id))));
-    setLoadedKeys((keys) => keys.filter((key) => !belongsToConnection(key, id)));
     setExpandedKeys((keys) => keys.filter((key) => !belongsToConnection(key, id)));
   }
 
@@ -195,10 +194,10 @@ export function Sidebar({ width }: { width: number }) {
     const current = () => revision === (catalogRevisions.current[id] ?? 0);
     try {
       const children = await produceChildren(node.meta, key);
-      if (!current()) throw new Error("对象目录已刷新");
+      if (!current()) return;
       setCache((prev) => ({ ...prev, [key]: children }));
     } catch (err) {
-      if (!current()) throw err;
+      if (!current()) return;
       const text = errorText(err);
       setStatus(text);
       setCache((prev) => ({
@@ -363,7 +362,6 @@ export function Sidebar({ width }: { width: number }) {
             treeData={treeData}
             expandedKeys={expandedKeys}
             loadedKeys={loadedKeys}
-            onLoad={(keys) => setLoadedKeys(keys.map(String))}
             onExpand={(keys) => setExpandedKeys(keys.map(String))}
             loadData={onLoad}
             onDoubleClick={(_, node) => {

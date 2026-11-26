@@ -120,6 +120,7 @@ pub fn execute_read_query_with_operation(
     let total_rows = if paged.is_some() && !has_more { Some(u64::from(offset) + outcome.rows.len() as u64) } else { None };
     operation.report("只读查询已完成", outcome.rows.len() as u64, Some(outcome.rows.len() as u64), if enforced { "独立只读事务已结束" } else { "已通过语法只读校验；SELECT 函数的副作用由数据库定义" });
     Ok(ExecuteSqlResponse { statements: vec![StatementResult {
+        disconnect_phase: None,
         index: 0, sql, ok: true, error: None, columns: outcome.columns, rows: outcome.rows,
         rows_affected: 0, total_rows, page, page_size, pageable: paged.is_some(),
         elapsed_ms: started.elapsed().as_millis() as u64,

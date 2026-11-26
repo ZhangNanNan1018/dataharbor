@@ -180,7 +180,7 @@ fn closing_console_rejects_an_already_queued_script() {
         }
         f.state.close_query_session("A");
         release_tx.send(()).unwrap();
-        first.join().unwrap().unwrap();
+        assert!(first.join().unwrap().is_err(), "late result from closed generation");
         let result: AppResult<()> = queued.join().unwrap();
         assert!(result.unwrap_err().to_string().contains("排队的语句未执行"));
     });

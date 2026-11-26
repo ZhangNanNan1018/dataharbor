@@ -15,12 +15,16 @@ pub mod snowflake;
 pub mod sqlite;
 
 #[cfg(test)]
+pub(crate) mod disconnect_tests;
+#[cfg(test)]
 mod control_tests;
 #[cfg(test)]
 mod document_tests;
 
 pub trait DbSession: Send {
     fn engine(&self) -> Engine;
+    /// Probe only this physical connection, before dispatching the caller's request.
+    fn probe(&mut self, _database: &str) -> AppResult<()> { Ok(()) }
     fn version(&mut self) -> AppResult<String>;
     fn list_databases(&mut self) -> AppResult<Vec<String>>;
     fn list_schemas(&mut self, database: &str) -> AppResult<Vec<String>>;
@@ -141,7 +145,8 @@ pub trait DbSession: Send {
         } else {
             "BEGIN"
         };
-        self.execute(database, begin, None)?;
+        self.execute(database, begin, None)
+            .map_err(AppError::before_send)?;
         for (index, (sql, expected)) in statements.iter().enumerate() {
             operation.report(
                 "写入事务",
@@ -164,14 +169,21 @@ pub trait DbSession: Send {
                     }
                 });
             if let Err(err) = result {
-                let rollback = self.execute(database, "ROLLBACK", None);
-                if matches!(err, AppError::Cancelled { .. }) && rollback.is_ok() {
+                if err.disconnect_phase().is_some() {
                     return Err(err);
                 }
-                return Err(AppError::msg(match rollback {
-                    Ok(_) => format!("第 {} 条语句失败，已回滚：{err}", index + 1),
-                    Err(rollback_error) => format!("第 {} 条语句失败：{err}；回滚也失败：{rollback_error}。请检查连接和目标数据", index + 1),
-                }));
+                return match self.execute(database, "ROLLBACK", None) {
+                    Ok(_) if matches!(err, AppError::Cancelled { .. }) => Err(err),
+                    Ok(_) => Err(AppError::msg(format!(
+                        "第 {} 条语句失败，已回滚：{err}",
+                        index + 1
+                    ))),
+                    Err(e) if e.disconnect_phase().is_some() => Err(e),
+                    Err(e) => Err(AppError::msg(format!(
+                        "第 {} 条语句失败：{err}；回滚也失败：{e}。请检查连接和目标数据",
+                        index + 1
+                    ))),
+                };
             }
         }
         if let Err(cancelled) = operation.checkpoint() {
@@ -180,7 +192,9 @@ pub trait DbSession: Send {
             return Err(cancelled);
         }
         if let Err(err) = self.execute(database, "COMMIT", None) {
-            let _ = self.execute(database, "ROLLBACK", None);
+            if err.disconnect_phase().is_none() {
+                let _ = self.execute(database, "ROLLBACK", None);
+            }
             return Err(err);
         }
         Ok(statements.len())

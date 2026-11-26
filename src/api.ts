@@ -22,6 +22,13 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+export function disconnectPhase(error: unknown) {
+  if (error && typeof error === "object" && "disconnectPhase" in error) {
+    const phase = error.disconnectPhase;
+    if (phase === "beforeSend" || phase === "outcomeUnknown") return phase;
+  }
+}
+
 export function errorText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
@@ -67,6 +74,8 @@ export const api = {
     call<string[]>("list_views", { connectionId, database, schema }),
   listColumns: (connectionId: string, database: string, schema: string, objectName: string) =>
     call<ColumnMeta[]>("list_columns", { connectionId, database, schema, objectName }),
+  reconnectQuerySession: (connectionId: string, database: string, previous: string | null) =>
+    call<string>("reconnect_query_session", { connectionId, database, previous }),
   closeQuerySession: (sessionId: string) => call<void>("close_query_session", { sessionId }),
   executeSql: (request: ExecuteSqlRequest, operationId?: string) => call<ExecuteSqlResponse>("execute_sql", { request, operationId }),
   executeReadQuery: (request: ExecuteSqlRequest, operationId?: string) => call<ExecuteSqlResponse>("execute_read_query", { request, operationId }),
