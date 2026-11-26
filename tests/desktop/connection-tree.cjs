@@ -26,9 +26,15 @@ async page => {
   await label(sample.name).click();
   await label("表").click();
   await label("books").waitFor();
-  const initialTheme = await page.locator("html").getAttribute("data-theme");
-  for (let i = 0; i < 2; i++) {
-    // Start each theme with an unselected, collapsed table.
+  const initial = await page.evaluate(() => localStorage.getItem("xb-theme") || "system");
+  async function theme(value) {
+    await page.getByRole("button", { name: "切换主题" }).click();
+    await page.getByRole("menuitem", { name: { light: "明亮", dark: "暗色", system: "跟随系统" }[value] }).click();
+  }
+  for (const mode of ["light", "dark"]) {
+    await theme(mode);
+    await page.waitForFunction(value => document.documentElement.dataset.theme === value, mode);
+    // Select the folder first so the table starts unselected.
     await label("表").click();
     await expanded("表", false);
     await label("表").click();
@@ -65,15 +71,19 @@ async page => {
     await page.mouse.move(arrowBox.x - 5, y);
     if (await content.evaluate(el => el.matches(":hover"))) throw new Error("Indent should stay outside the hit area");
     await page.mouse.click(arrowX, y);
-    await expanded("books", true);
+    if (await row("books").getAttribute("aria-expanded") !== null) throw new Error("Tables must be leaves");
     await row("books").and(tree.locator(".ant-tree-treenode-selected")).waitFor();
     await waitForColor(colors[1]);
     await page.mouse.click(trailingX, y);
-    await expanded("books", false);
+    if (await arrow("books").locator("svg").count()) throw new Error("Table showed an expand arrow");
     await row("books").and(tree.locator(".ant-tree-treenode-selected")).waitFor();
+    await page.mouse.move(labelX, y);
+    await page.mouse.down();
+    await page.mouse.move(trailingX, y, { steps: 6 });
+    await page.mouse.up();
+    if (await page.evaluate(() => !!window.getSelection()?.toString())) throw new Error("Dragging a tree label selected text");
     await label("books").click({ button: "right" });
-    await page.getByRole("button", { name: "打开数据", exact: true }).waitFor();
-    await expanded("books", false);
+    await page.getByRole("button", { name: "查看结构", exact: true }).waitFor();
     await page.locator(".xb-sidebar input").first().click();
     const keyboard = page.locator(".xb-tree input");
     await keyboard.focus();
@@ -85,11 +95,18 @@ async page => {
     await expanded(group, true);
     const focus = await body(group).evaluate(el => getComputedStyle(el).outlineStyle);
     if (focus === "none") throw new Error("Keyboard navigation must retain its row outline");
-    await page.getByRole("button", { name: "切换主题" }).click();
   }
-  if (await page.locator("html").getAttribute("data-theme") !== initialTheme) throw new Error("Theme did not restore");
+  await theme(initial);
   await label("books").dblclick();
   await page.getByRole("tabpanel", { name: "books", exact: true }).waitFor();
-  await expanded("books", true);
-  return "Verified tree hit areas, selection, expansion, double-click and keyboard navigation in the desktop app";
+  if (await row("books").getAttribute("aria-expanded") !== null) throw new Error("Tables must be leaves");
+  await label("视图").click();
+  await label("book_catalog").click();
+  if (await row("book_catalog").getAttribute("aria-expanded") !== null || await arrow("book_catalog").locator("svg").count()) throw new Error("Views must be leaves");
+  await label("book_catalog").click({ button: "right" });
+  await page.getByRole("button", { name: "查看结构", exact: true }).waitFor();
+  await page.locator(".xb-sidebar input").first().click();
+  await label("book_catalog").dblclick();
+  await page.getByRole("tabpanel", { name: "book_catalog", exact: true }).waitFor();
+  return "Verified table and view leaves, context menus, double-click, row highlights and keyboard navigation";
 }

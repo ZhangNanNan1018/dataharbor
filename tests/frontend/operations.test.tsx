@@ -45,7 +45,7 @@ describe("长任务生命周期", () => {
     const action = vi.fn(() => pending.promise);
     mount(action);
     fireEvent.click(screen.getByRole("button", { name: "开始任务" }));
-    await waitFor(() => expect(action).toHaveBeenCalledWith("op-1"));
+    await waitFor(() => expect(action).toHaveBeenCalledWith("op-1", expect.objectContaining({ aborted: false })));
     await screen.findByText(/本阶段已处理 25 \/ 100/);
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "25");
     fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
@@ -92,7 +92,7 @@ describe("长任务生命周期", () => {
     vi.mocked(api.operationStatus).mockResolvedValue(snapshot("created-later", { status: "cancelled", cancelRequested: true }));
     await act(async () => created.resolve(snapshot("created-later", { status: "queued" })));
     await waitFor(() => expect(api.cancelOperation).toHaveBeenCalledWith("created-later"));
-    expect(action).toHaveBeenCalledWith("created-later");
+    expect(action).toHaveBeenCalledWith("created-later", expect.objectContaining({ aborted: true }));
     await screen.findByText("任务已取消");
   });
 
@@ -109,7 +109,7 @@ describe("长任务生命周期", () => {
     await act(async () => first.resolve("done"));
     await waitFor(() => expect(screen.getByRole("button", { name: "开始任务" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "开始任务" }));
-    await waitFor(() => expect(action).toHaveBeenCalledWith("second"));
+    await waitFor(() => expect(action).toHaveBeenCalledWith("second", expect.objectContaining({ aborted: false })));
     await act(async () => late.resolve(snapshot("first", { phase: "过期阶段", completed: 99 })));
     expect(screen.queryByText("过期阶段")).not.toBeInTheDocument();
     vi.mocked(api.operationStatus).mockResolvedValue(snapshot("second", { status: "succeeded", completed: 100 }));

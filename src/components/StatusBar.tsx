@@ -17,9 +17,9 @@ export function StatusBar() {
         已连接 {connected}/{profiles.length}
         {info ? ` · 凭据：${info.encryption}` : ""}
       </span>
-      <span className="min-w-0 flex-1 truncate text-center">{status}</span>
+      <span className="min-w-0 flex-1 select-text truncate text-center">{status}</span>
       <span>
-        {tabs.length} 个标签 · 固定 {pinned} · {theme === "dark" ? "深色" : "浅色"} · {info?.version ?? "0.1.4"}
+        {tabs.length} 个标签 · 固定 {pinned} · {theme === "dark" ? "深色" : "浅色"} · {info?.version ?? "0.1.5"}
       </span>
     </footer>
   );

@@ -49,7 +49,7 @@ pub struct ErrorPayload {
 pub enum AppError {
     #[error("{0}")]
     Message(String),
-    #[error("标签原会话已关闭，本次请求未执行，请重新连接此标签")]
+    #[error("标签原会话已关闭，本次请求未执行")]
     SessionExpired,
     #[error("{phase}：{detail}")]
     ConnectionLost {

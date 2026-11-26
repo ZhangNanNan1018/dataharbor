@@ -262,8 +262,6 @@ async function groupAction(group: string, action: string) {
 }
 
 it("单击树行选中并切换展开状态，叶节点只选中，右键和双击不重复展开", async () => {
-  const columns = deferred<ColumnMeta[]>();
-  vi.mocked(api.listColumns).mockReturnValueOnce(columns.promise);
   mount(<Sidebar width={260} />);
   const group = screen.getByText("测试组");
   const groupRow = group.closest('[role="treeitem"]')!;
@@ -282,21 +280,16 @@ it("单击树行选中并切换展开状态，叶节点只选中，右键和双�
   const row = table.closest('[role="treeitem"]')!;
   fireEvent.contextMenu(table);
   expect(screen.getByRole("button", { name: "打开数据" })).toBeInTheDocument();
-  expect(row).toHaveAttribute("aria-expanded", "false");
+  expect(row).not.toHaveAttribute("aria-expanded");
   fireEvent.click(table, { detail: 1 });
-  expect(row).toHaveAttribute("aria-expanded", "true");
+  expect(row).toHaveClass("ant-tree-treenode-selected");
+  expect(useTabStore.getState().tabs).toHaveLength(0);
   fireEvent.click(table, { detail: 2 });
   fireEvent.doubleClick(table, { detail: 2 });
-  expect(row).toHaveAttribute("aria-expanded", "true");
   expect(useTabStore.getState().tabs).toHaveLength(1);
   expect(useTabStore.getState().tabs[0]).toMatchObject({ kind: "data", table: "books" });
-  await act(async () => columns.resolve([column]));
-  const field = await screen.findByText("payload");
-  fireEvent.click(field);
-  expect(field.closest('[role="treeitem"]')).toHaveClass("ant-tree-treenode-selected");
-  expect(row).not.toHaveClass("ant-tree-treenode-selected");
-  expect(row).toHaveAttribute("aria-expanded", "true");
-  expect(api.listColumns).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText("payload")).not.toBeInTheDocument();
+  expect(api.listColumns).not.toHaveBeenCalled();
 });
 
 it("筛选时重命名整组，保留展开的连接和已加载的数据库", async () => {

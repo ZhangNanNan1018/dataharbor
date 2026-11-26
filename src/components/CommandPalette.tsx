@@ -5,7 +5,7 @@ import { engineLabel } from "../engines";
 import { PLACEHOLDERS } from "../placeholders";
 import { useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
-import { useUiStore } from "../stores/useUiStore";
+import { themeOptions, useUiStore } from "../stores/useUiStore";
 import { App } from "antd";
 
 interface Entry {
@@ -22,8 +22,7 @@ export function CommandPalette() {
   const openPalette = useUiStore((state) => state.openPalette);
   const closePalette = useUiStore((state) => state.closePalette);
   const openConnection = useUiStore((state) => state.openConnection);
-  const toggleTheme = useUiStore((state) => state.toggleTheme);
-  const theme = useUiStore((state) => state.theme);
+  const setTheme = useUiStore((state) => state.setTheme);
   const toggleFocus = useUiStore((state) => state.toggleFocus);
   const focusMode = useUiStore((state) => state.focusMode);
   const setAboutOpen = useUiStore((state) => state.setAboutOpen);
@@ -199,12 +198,12 @@ export function CommandPalette() {
         label: focusMode ? "退出专注" : "进入专注",
         run: toggleFocus,
       },
-      {
-        id: "theme",
+      ...themeOptions.map(option => ({
+        id: `theme-${option.key}`,
         group: "工作区",
-        label: theme === "dark" ? "切换到浅色" : "切换到深色",
-        run: toggleTheme,
-      },
+        label: `主题 · ${option.label}`,
+        run: () => setTheme(option.key),
+      })),
       {
         id: "about",
         group: "工作区",
@@ -241,9 +240,8 @@ export function CommandPalette() {
     profiles,
     setAboutOpen,
     setStatus,
-    theme,
     toggleFocus,
-    toggleTheme,
+    setTheme,
   ]);
 
   const goEntries = useMemo<Entry[]>(() => {

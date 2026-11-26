@@ -493,7 +493,7 @@ fn idle_shared_connection_and_single_console_recovery() {
         };
         let console = |previous: Option<&str>| {
             f.state
-                .reconnect_query_session(&f.id, &f.database, previous)
+                .prepare_query_session(&f.id, &f.database, previous, true)
                 .unwrap()
         };
         let run = |key: &str, sql: &str| {
@@ -604,6 +604,7 @@ fn idle_shared_connection_and_single_console_recovery() {
         assert_eq!(f.page().total, 0);
         let next = console(Some(&a));
         assert!(run(&a, identity).is_err());
+        assert_eq!(console(Some(&b)), b);
         assert_ne!(scalar(&next, identity).to_string().replace('"', ""), a_id);
         assert_eq!(scalar(&b, identity), b_id);
         assert_eq!(scalar(&b, read_variable), json!("preserved"));

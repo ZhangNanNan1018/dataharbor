@@ -313,7 +313,7 @@ impl AppState {
         }
         if console.disconnected.load(Ordering::Acquire) {
             return Err(
-                AppError::driver("此标签的连接已中断，请重新连接此标签", true).before_send(),
+                AppError::driver("此标签的连接已中断", true).before_send(),
             );
         }
         if guard.is_none() {
@@ -337,11 +337,22 @@ impl AppState {
     }
 
     /// A managed ID names exactly one generation. Execution can never recreate it.
+    #[cfg(test)]
     pub(crate) fn reconnect_query_session(
         &self,
         id: &str,
         database: &str,
         previous: Option<&str>,
+    ) -> AppResult<String> {
+        self.prepare_query_session(id, database, previous, false)
+    }
+
+    pub(crate) fn prepare_query_session(
+        &self,
+        id: &str,
+        database: &str,
+        previous: Option<&str>,
+        reuse_healthy: bool,
     ) -> AppResult<String> {
         let owner = self.session_owner(id)?;
         let old = previous.and_then(|key| lock(&self.query_sessions.0).get(key).cloned());
@@ -353,7 +364,7 @@ impl AppState {
                 return Err(AppError::msg("标签所属连接已改变"));
             }
         }
-        let _idle = old
+        let mut idle = old
             .as_ref()
             .map(|old| {
                 old.session
@@ -361,6 +372,25 @@ impl AppState {
                     .map_err(|_| AppError::msg("标签正在执行操作"))
             })
             .transpose()?;
+        if let (true, Some(old), Some(guard), Some(key)) = (reuse_healthy, &old, &mut idle, previous) {
+            if old.retired.load(Ordering::Acquire) {
+                return Err(AppError::SessionExpired);
+            }
+            if !old.disconnected.load(Ordering::Acquire) {
+                if let Some(session) = guard.as_mut() {
+                    match session.probe(database) {
+                        Ok(()) => {
+                            self.check_query_generation(Some(key))?;
+                            return Ok(key.to_owned());
+                        }
+                        Err(e) if e.disconnect_phase().is_some() => {
+                            old.disconnected.store(true, Ordering::Release);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
         let mut session = owner.open(database)?;
         session.probe(database).map_err(AppError::before_send)?;
         let key = format!("tab:{}", uuid::Uuid::new_v4());

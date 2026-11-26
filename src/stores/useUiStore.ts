@@ -1,9 +1,14 @@
 import { create } from "zustand";
 
 export type ThemeMode = "dark" | "light";
+export type ThemePreference = ThemeMode | "system";
+export const themeOptions: { key: ThemePreference; label: string }[] = [
+  { key: "system", label: "跟随系统" }, { key: "light", label: "明亮" }, { key: "dark", label: "暗色" },
+];
 
 interface UiState {
   theme: ThemeMode;
+  themePreference: ThemePreference;
   status: string;
   sidebarWidth: number;
   connectionOpen: boolean;
@@ -14,8 +19,7 @@ interface UiState {
   sidebarCollapsed: boolean;
   palette: "command" | "go" | null;
   pinned: { id: string; title: string; text: string }[];
-  setTheme: (theme: ThemeMode) => void;
-  toggleTheme: () => void;
+  setTheme: (theme: ThemePreference) => void;
   setStatus: (status: string) => void;
   setSidebarWidth: (width: number) => void;
   openConnection: (id: string | null, group?: string) => void;
@@ -29,13 +33,21 @@ interface UiState {
   unpin: (id: string) => void;
 }
 
-function initialTheme(): ThemeMode {
+function initialTheme(): ThemePreference {
   const stored = localStorage.getItem("xb-theme");
-  return stored === "light" ? "light" : "dark";
+  return stored === "light" || stored === "dark" ? stored : "system";
 }
 
+function resolveTheme(preference: ThemePreference): ThemeMode {
+  if (preference !== "system") return preference;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+const initialPreference = initialTheme();
+
 export const useUiStore = create<UiState>((set, get) => ({
-  theme: initialTheme(),
+  theme: resolveTheme(initialPreference),
+  themePreference: initialPreference,
   status: "就绪",
   sidebarWidth: 292,
   connectionOpen: false,
@@ -46,14 +58,9 @@ export const useUiStore = create<UiState>((set, get) => ({
   sidebarCollapsed: false,
   palette: null,
   pinned: [],
-  setTheme: (theme) => {
-    localStorage.setItem("xb-theme", theme);
-    set({ theme });
-  },
-  toggleTheme: () => {
-    const theme = get().theme === "dark" ? "light" : "dark";
-    localStorage.setItem("xb-theme", theme);
-    set({ theme });
+  setTheme: (preference) => {
+    localStorage.setItem("xb-theme", preference);
+    set({ themePreference: preference, theme: resolveTheme(preference) });
   },
   setStatus: (status) => set({ status }),
   setSidebarWidth: (width) => set({ sidebarWidth: width }),
@@ -70,3 +77,16 @@ export const useUiStore = create<UiState>((set, get) => ({
     }),
   unpin: (id) => set({ pinned: get().pinned.filter((item) => item.id !== id) }),
 }));
+
+export function watchSystemTheme() {
+  const query = window.matchMedia?.("(prefers-color-scheme: dark)");
+  if (!query) return;
+  const sync = () => {
+    if (useUiStore.getState().themePreference === "system") {
+      useUiStore.setState({ theme: query.matches ? "dark" : "light" });
+    }
+  };
+  sync();
+  query.addEventListener("change", sync);
+  return () => query.removeEventListener("change", sync);
+}

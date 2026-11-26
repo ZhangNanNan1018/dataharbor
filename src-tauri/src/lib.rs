@@ -217,6 +217,7 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     TrayIconBuilder::new()
+        .icon(tauri::include_image!("./icons/tray.png"))
         .menu(&menu)
         .tooltip("DataHarbor")
         .on_menu_event(|app, event| match event.id.as_ref() {

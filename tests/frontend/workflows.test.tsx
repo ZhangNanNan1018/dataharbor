@@ -168,7 +168,8 @@ describe("网格写入边界", () => {
     await screen.findByDisplayValue("a original");
     const pending = deferred<DataPage>();
     vi.mocked(api.fetchRows).mockReturnValueOnce(pending.promise);
-    fireEvent.click(screen.getByRole("button", { name: "刷 新" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^刷\s*新$/ }));
+    await waitFor(() => expect(api.fetchRows).toHaveBeenCalledTimes(2));
     act(() => {
       useConnectionStore.getState().markConnected(profile.id, false);
       useConnectionStore.getState().markConnected(profile.id, true);
@@ -221,47 +222,78 @@ describe("网格写入边界", () => {
 });
 
 describe("查询结果上下文", () => {
-  it("健康会话主动重连需要确认，保留编辑器与结果直到再次运行", async () => {
+  it("恢复会话期间取消，不发送业务 SQL", async () => {
+    openQuery();
+    const preparing = deferred<string>();
+    vi.mocked(api.reconnectQuerySession).mockReturnValueOnce(preparing.promise);
+    mount(<QueryHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
+    await waitFor(() => expect(api.reconnectQuerySession).toHaveBeenCalledTimes(1));
+    await act(() => useOperationStore.getState().active[0].cancel());
+    await act(async () => preparing.resolve("recovered"));
+    await waitFor(() => expect(api.releaseOperation).toHaveBeenCalled());
+    expect(api.executeSql).not.toHaveBeenCalled();
+  });
+
+  it("历史记录只填入编辑器，压缩直接显示在工具栏", async () => {
+    openQuery();
+    localStorage.setItem("xb-sql-history", JSON.stringify(["SELECT 37"]));
+    mount(<QueryHarness />);
+    expect(screen.getByRole("button", { name: "压缩" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "SELECT 37" }));
+    expect(screen.getByLabelText("SQL 编辑器")).toHaveValue("SELECT 37");
+    expect(api.executeSql).not.toHaveBeenCalled();
+  });
+
+  it.each(["beforeSend", "outcomeUnknown"] as const)("第一条语句断线：%s", async phase => {
+    openQuery();
+    vi.mocked(api.executeSql).mockResolvedValueOnce({
+      stopped: true, statements: [statement({ ok: false, disconnectPhase: phase, error: "断线" })],
+    });
+    mount(<QueryHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
+    await waitFor(() => expect(api.releaseOperation).toHaveBeenCalledTimes(phase === "beforeSend" ? 2 : 1));
+    expect(api.executeSql).toHaveBeenCalledTimes(phase === "beforeSend" ? 2 : 1);
+  });
+
+  it("明确运行时检查当前会话，恢复后只执行新点击的 SQL", async () => {
     openQuery();
     mount(<QueryHarness />);
     const run = screen.getByRole("button", { name: "运行 SQL" });
+    expect(screen.queryByRole("button", { name: "重新连接此标签" })).not.toBeInTheDocument();
     fireEvent.click(run);
     await screen.findByText("A result");
+    const first = vi.mocked(api.executeSql).mock.calls[0][0].sessionId;
     const editor = screen.getByLabelText("SQL 编辑器");
     fireEvent.change(editor, { target: { value: "SELECT 42" } });
-    fireEvent.click(screen.getByRole("button", { name: "重新连接此标签" }));
-    const dialog = await screen.findByRole("dialog");
-    const first = vi.mocked(api.executeSql).mock.calls[0][0].sessionId;
-    fireEvent.click(within(dialog).getByRole("button", { name: "重新连接" }));
-    await screen.findByText("来自上一次会话");
-    expect(api.reconnectQuerySession).toHaveBeenLastCalledWith(profile.id, "A", first);
-    expect(api.executeSql).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("A result")).toBeInTheDocument();
-    expect(screen.getByLabelText("SQL 编辑器")).toBe(editor);
-    expect(editor).toHaveValue("SELECT 42");
-    expect(screen.getByRole("button", { name: "导出 CSV" })).toBeDisabled();
     fireEvent.click(run);
-    await waitFor(() => expect(screen.queryByText("来自上一次会话")).not.toBeInTheDocument());
+    await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(2));
+    expect(api.reconnectQuerySession).toHaveBeenLastCalledWith(profile.id, "A", first);
     const next = vi.mocked(api.executeSql).mock.calls[1][0];
     expect(next.sessionId).not.toBe(first);
     expect(next.sql).toBe("SELECT 42");
+    expect(screen.getByLabelText("SQL 编辑器")).toBe(editor);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("脚本断线后可直接重连，执行期间禁用重连，后续语句不自动发送", async () => {
+  it("脚本中途断线保留结果，等待用户下次运行才恢复", async () => {
     openQuery();
     const pending = deferred<{ statements: StatementResult[]; stopped: boolean }>();
     vi.mocked(api.executeSql).mockReturnValueOnce(pending.promise);
     mount(<QueryHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "运行 SQL" }));
-    const reconnect = screen.getByRole("button", { name: "重新连接此标签" });
-    await waitFor(() => expect(reconnect).toBeDisabled());
+    const run = screen.getByRole("button", { name: "运行 SQL" });
+    fireEvent.click(run);
+    await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(1));
     await act(async () => pending.resolve({ statements: [statement(), statement({ index: 1, ok: false, error: "执行结果未知", disconnectPhase: "outcomeUnknown" })], stopped: true }));
     await screen.findByText("A result");
-    fireEvent.click(reconnect);
-    await screen.findByText("来自上一次会话");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出 CSV" })).toBeDisabled();
+    expect(api.reconnectQuerySession).toHaveBeenCalledTimes(1);
     expect(api.executeSql).toHaveBeenCalledTimes(1);
     expect(api.exportSqlCsv).not.toHaveBeenCalled();
+    fireEvent.click(run);
+    await waitFor(() => expect(api.executeSql).toHaveBeenCalledTimes(2));
+    expect(api.reconnectQuerySession).toHaveBeenCalledTimes(2);
   });
 
   it("查询和导出共享会话，换库和卸载释放旧会话", async () => {
@@ -337,6 +369,43 @@ describe("查询结果上下文", () => {
 });
 
 describe("草稿与服务设置", () => {
+  it("右击后台标签可批量关闭其左侧标签，取消保留草稿，确认后激活右击的标签", async () => {
+    const store = useTabStore.getState();
+    const first = store.openQuery({ title: "第一份" });
+    store.openQuery({ title: "第二份" });
+    const anchor = store.openQuery({ title: "保留的标签" });
+    const last = store.openQuery({ title: "末尾标签" });
+    store.setActive(first);
+    mount(<Workspace />);
+    const closeLeft = async () => {
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "保留的标签" }));
+      fireEvent.click(await screen.findByRole("menuitem", { name: "关闭左侧标签" }));
+      return screen.findByRole("dialog");
+    };
+    const dialog = await closeLeft();
+    expect(dialog).toHaveTextContent("关闭这 2 个标签");
+    expect(useTabStore.getState().activeId).toBe(first);
+    fireEvent.click(within(dialog).getByRole("button", { name: /留\s*下/ }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(useTabStore.getState().tabs).toHaveLength(4);
+    fireEvent.click(within(await closeLeft()).getByRole("button", { name: /关\s*闭/ }));
+    await waitFor(() => expect(useTabStore.getState().tabs.map((tab) => tab.id)).toEqual([anchor, last]));
+    expect(useTabStore.getState().activeId).toBe(anchor);
+  });
+
+  it("复制查询标签沿用连接、数据库和草稿，不发送 SQL", async () => {
+    const original = openQuery();
+    mount(<Workspace />);
+    fireEvent.contextMenu(screen.getByRole("tab", { selected: true }));
+    expect(await screen.findByRole("menuitem", { name: "关闭其他标签" })).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByRole("menuitem", { name: "复制查询标签" }));
+    const [source, copy] = useTabStore.getState().tabs as QueryTab[];
+    expect(copy.id).not.toBe(original);
+    expect(copy).toMatchObject({ connectionId: source.connectionId, database: source.database, sql: source.sql });
+    expect(useTabStore.getState().activeId).toBe(copy.id);
+    expect(api.executeSql).not.toHaveBeenCalled();
+  });
+
   it("按需打开工作台工具，切换标签后保留工具草稿", async () => {
     vi.mocked(api.aiSettings).mockResolvedValue({ endpoint: "https://service.example/v1/chat/completions", model: "fixture", hasKey: true });
     const aiTab = useTabStore.getState().openPlaceholder("ai");

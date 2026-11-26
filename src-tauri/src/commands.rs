@@ -234,12 +234,14 @@ pub async fn reconnect_query_session(
     connection_id: String,
     database: String,
     previous: Option<String>,
+    reuse_healthy: Option<bool>,
 ) -> AppResult<String> {
     run_blocking(move || {
-        app.state::<AppState>().reconnect_query_session(
+        app.state::<AppState>().prepare_query_session(
             &connection_id,
             &database,
             previous.as_deref(),
+            reuse_healthy.unwrap_or(false),
         )
     })
     .await

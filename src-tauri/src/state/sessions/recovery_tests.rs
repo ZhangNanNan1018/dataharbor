@@ -56,6 +56,67 @@ impl DbSession for Wire {
 }
 
 #[test]
+fn console_preflight_preserves_healthy_sessions_and_only_replaces_the_dead_generation() {
+    let dir = std::env::temp_dir().join(format!("dataharbor-console-{}", uuid::Uuid::new_v4()));
+    let state = AppState::open_in(dir.clone(), true).unwrap();
+    let id = state
+        .save_connection(SaveConnectionRequest {
+            engine: Engine::Sqlite,
+            file_path: dir.join("fixture.db").display().to_string(),
+            name: "preflight".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .connection
+        .id;
+    state.connect(&id).unwrap();
+    let prepare = |key: Option<&str>| state.prepare_query_session(&id, "", key, true);
+    let a = prepare(None).unwrap();
+    let b = prepare(None).unwrap();
+    let sql = |key: &str, text: &str| {
+        state.with_query_session(&id, "", Some(key), &OperationContext::detached(), |s| {
+            s.execute("", text, None)
+        })
+    };
+    sql(&b, "CREATE TEMP TABLE marker(n INTEGER)").unwrap();
+    sql(&b, "BEGIN").unwrap();
+    sql(&b, "INSERT INTO marker VALUES (7)").unwrap();
+    sql(&a, "CREATE TABLE counter(n INTEGER)").unwrap();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let old = lock(&state.query_sessions.0)[&a].clone();
+    let install = |error| {
+        lock(&old.session).as_mut().unwrap().inner = Box::new(Wire {
+            sent: sent.clone(),
+            fail_on: "unused".into(),
+            before_send: false,
+            probe_error: Some(error),
+        });
+    };
+    install(AppError::msg("probe permission denied"));
+    assert!(prepare(Some(&a)).is_err());
+    assert_eq!(prepare(Some(&a)).unwrap(), a);
+    install(AppError::driver("socket closed", true));
+    let next = prepare(Some(&a)).unwrap();
+    assert_ne!(a, next);
+    assert!(sql(&a, "INSERT INTO counter VALUES (1)").is_err());
+    sql(&next, "INSERT INTO counter VALUES (1)").unwrap();
+    assert_eq!(
+        sql(&next, "SELECT COUNT(*) FROM counter").unwrap().rows[0][0],
+        serde_json::json!(1)
+    );
+    assert!(lock(&sent).is_empty());
+    assert_eq!(prepare(Some(&b)).unwrap(), b);
+    assert_eq!(
+        sql(&b, "SELECT n FROM marker").unwrap().rows[0][0],
+        serde_json::json!(7)
+    );
+    sql(&b, "ROLLBACK").unwrap();
+    drop(old);
+    state.disconnect(&id);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn lost_responses_never_replay_sql_paging_export_or_script_tail() {
     let dir = std::env::temp_dir().join(format!("dataharbor-wire-{}", uuid::Uuid::new_v4()));
     let state = AppState::open_in(dir.clone(), true).unwrap();

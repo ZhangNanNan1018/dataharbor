@@ -47,6 +47,7 @@ struct MappedCluster {
 pub struct RedisSession {
     conn: RedisLink,
     mode: String,
+    in_multi: bool,
 }
 
 pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
@@ -119,7 +120,11 @@ pub fn connect(config: &SessionConfig) -> AppResult<RedisSession> {
         conn.set_write_timeout(Some(Duration::from_secs(15))).ok();
         RedisLink::Single(conn)
     };
-    Ok(RedisSession { conn, mode })
+    Ok(RedisSession {
+        conn,
+        mode,
+        in_multi: false,
+    })
 }
 
 fn split_host_port(item: &str, default_port: u16) -> (String, u16) {
@@ -237,6 +242,22 @@ impl DbSession for RedisSession {
     }
 
     fn probe(&mut self, _database: &str) -> AppResult<()> {
+        // PING would be queued. Redis answers a nested MULTI immediately without
+        // changing the transaction or its EXEC results. A socket flag alone
+        // cannot detect an idle connection that the server has already closed.
+        if self.in_multi {
+            match redis::cmd("MULTI").query::<()>(self.conn.as_mut()) {
+                Err(err) if err.detail() == Some("MULTI calls can not be nested") => return Ok(()),
+                Err(err) => return Err(connection_error(err)),
+                Ok(()) => {
+                    // The original transaction is gone. Discard the empty probe
+                    // transaction before asking the session owner to reconnect.
+                    redis::cmd("DISCARD").query::<()>(self.conn.as_mut()).map_err(connection_error)?;
+                    self.in_multi = false;
+                    return Err(AppError::driver("Redis 事务会话已更换", true));
+                }
+            }
+        }
         if let RedisLink::Mapped(cluster) = &mut self.conn {
             for node in &mut cluster.nodes {
                 redis::cmd("PING")
@@ -357,7 +378,9 @@ impl DbSession for RedisSession {
         sql: &str,
         max_rows: Option<usize>,
     ) -> AppResult<QueryOutcome> {
-        self.select_db(database).map_err(AppError::before_send)?;
+        if !self.in_multi {
+            self.select_db(database).map_err(AppError::before_send)?;
+        }
         let line = sql.trim().trim_end_matches(';').trim();
         if line.is_empty() {
             return Err(AppError::msg("没有 Redis 命令"));
@@ -371,9 +394,16 @@ impl DbSession for RedisSession {
         for part in parts {
             cmd.arg(part);
         }
-        let value: redis::Value = cmd
-            .query(self.conn.as_mut())
-            .map_err(connection_error)?;
+        let result = cmd.query::<redis::Value>(self.conn.as_mut());
+        if result.as_ref().is_err_and(|e| e.kind() == redis::ErrorKind::ExecAbortError) {
+            self.in_multi = false;
+        }
+        let value = result.map_err(connection_error)?;
+        match name.as_str() {
+            "MULTI" => self.in_multi = true,
+            "EXEC" | "DISCARD" | "RESET" => self.in_multi = false,
+            _ => {}
+        }
         Ok(value_to_outcome(value, max_rows.unwrap_or(500)))
     }
 

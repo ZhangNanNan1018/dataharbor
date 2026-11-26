@@ -114,6 +114,7 @@ export function antdConfig(mode: ThemeMode): ThemeConfig {
       fontSize: 13,
       fontFamily: fontSans,
       controlHeight: 32,
+      controlHeightSM: 28,
       wireframe: false,
       boxShadow: "0 8px 28px rgba(16, 18, 24, 0.08)",
       boxShadowSecondary: "0 16px 40px rgba(16, 18, 24, 0.16)",

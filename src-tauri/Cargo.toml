@@ -1,6 +1,6 @@
 [package]
 name = "dataharbor"
-version = "0.1.4"
+version = "0.1.5"
 description = "DataHarbor — independent cross-platform database client"
 authors = ["DataHarbor contributors"]
 license = "MIT"

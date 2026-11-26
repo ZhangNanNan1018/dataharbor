@@ -27,7 +27,7 @@ interface TabState {
   openData: (input: OpenDataInput) => string;
   openStructure: (input: Omit<OpenDataInput, "readOnly">) => string;
   openPlaceholder: (feature: string, context?: StudioContext) => string;
-  close: (id: string) => void;
+  close: (target: string | string[], fallbackId?: string) => void;
   setActive: (id: string) => void;
   patchQuery: (id: string, patch: Partial<Pick<QueryTab, "connectionId" | "database" | "sql" | "title">>) => void;
   setDirty: (id: string, dirty: boolean) => void;
@@ -165,11 +165,15 @@ export const useTabStore = create<TabState>((set, get) => ({
     });
     return id;
   },
-  close: (id) => {
-    const tabs = get().tabs.filter((tab) => tab.id !== id);
+  close: (target, fallbackId) => {
+    const ids = new Set(typeof target === "string" ? [target] : target);
+    const tabs = get().tabs.filter((tab) => !ids.has(tab.id));
     const dirty = { ...get().dirty };
-    delete dirty[id];
-    const activeId = get().activeId === id ? tabs.at(-1)?.id ?? null : get().activeId;
+    for (const id of ids) delete dirty[id];
+    const current = get().activeId;
+    const activeId = current && ids.has(current)
+      ? tabs.find((tab) => tab.id === fallbackId)?.id ?? tabs.at(-1)?.id ?? null
+      : current;
     set({ tabs, activeId, dirty });
   },
   setActive: (id) => set({ activeId: id }),

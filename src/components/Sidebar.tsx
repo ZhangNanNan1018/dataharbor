@@ -19,7 +19,7 @@ import type { GroupEdit } from "../generated/contracts";
 const SEP = "\u001f";
 
 interface NodeMeta {
-  kind: "group" | "connection" | "database" | "schema" | "folder" | "table" | "view" | "column" | "note";
+  kind: "group" | "connection" | "database" | "schema" | "folder" | "table" | "view" | "note";
   connectionId?: string;
   engine?: Engine;
   database?: string;
@@ -107,7 +107,11 @@ export function Sidebar({ width }: { width: number }) {
     if (!menu) return;
     const close = () => setMenu(null);
     window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
+    window.addEventListener("contextmenu", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close, true);
+    };
   }, [menu]);
 
   const treeData = useMemo(
@@ -178,7 +182,7 @@ export function Sidebar({ width }: { width: number }) {
         key: nodeKey(meta.folder!, meta.connectionId!, meta.database!, meta.schema!, name),
         title: name,
         icon: meta.folder === "views" ? <Eye size={14} /> : <Table2 size={14} />,
-        isLeaf: false,
+        isLeaf: true,
         meta: {
           kind: meta.folder === "views" ? "view" : "table",
           connectionId: meta.connectionId,
@@ -187,29 +191,6 @@ export function Sidebar({ width }: { width: number }) {
           schema: meta.schema,
           name,
           searchText: name,
-        },
-      }));
-    }
-    if ((meta.kind === "table" || meta.kind === "view") && meta.connectionId && meta.name) {
-      const columns = await api.listColumns(
-        meta.connectionId,
-        meta.database ?? "",
-        meta.schema ?? "",
-        meta.name,
-      );
-      return columns.map((column) => ({
-        key: nodeKey("col", meta.connectionId!, meta.database ?? "", meta.schema ?? "", meta.name!, column.name),
-        title: (
-          <span>
-            {column.name} <span className="text-[var(--xb-muted)]">{column.dataType}</span>
-            {column.primaryKey ? " PK" : ""}
-          </span>
-        ),
-        isLeaf: true,
-        meta: {
-          kind: "column",
-          connectionId: meta.connectionId,
-          searchText: `${column.name} ${column.dataType}`,
         },
       }));
     }
@@ -235,7 +216,7 @@ export function Sidebar({ width }: { width: number }) {
         [key]: [
           {
             key: `${key}${SEP}error`,
-            title: text,
+            title: <span className="select-text">{text}</span>,
             isLeaf: true,
             meta: { kind: "note", searchText: text, connectionId: node.meta.connectionId },
           },
@@ -604,10 +585,8 @@ function connectionNode(profile: ConnectionPublic, cache: Record<string, XNode[]
     title: (
       <span className="xb-conn">
         <EngineGlyph engine={profile.engine} size={16} />
-        <i className="xb-dot" style={{ background: profile.color || "var(--xb-accent)" }} />
         <span>{profile.name}</span>
         <span className="xb-conn-engine">{engineLabel(profile.engine)}</span>
-        {profile.connected && <span className="xb-live">在线</span>}
       </span>
     ),
     children: attach(cache, key),

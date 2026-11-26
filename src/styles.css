@@ -97,6 +97,20 @@ select {
   font-family: inherit;
 }
 
+/* Limit selection suppression to controls so results and diagnostics stay copyable. */
+:where(
+  button, [role="tablist"], [role="menu"],
+  .xb-toolbar, .xb-activity, .xb-sidebar, .xb-runbar, .xb-palette-card, .xb-status,
+  .ant-pagination, .ant-select-selector, .ant-select-item-option,
+  .ant-form-item-label, .ant-checkbox-wrapper, .ant-radio-wrapper, .ant-modal-title
+) {
+  user-select: none;
+}
+
+:where(input, textarea, [contenteditable="true"], [contenteditable="plaintext-only"]) {
+  user-select: text;
+}
+
 :focus-visible {
   outline: 2px solid var(--xb-accent);
   outline-offset: 2px;
@@ -245,6 +259,7 @@ select {
 }
 
 .xb-workspace {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -268,6 +283,8 @@ select {
 
 .xb-tree.ant-tree {
   --xb-tree-arrow-width: 16px;
+  width: max-content;
+  min-width: 100%;
   background: transparent;
   font-size: 13px;
 }
@@ -316,6 +333,7 @@ select {
 .xb-tree .ant-tree-title {
   display: inline-flex;
   align-items: center;
+  white-space: nowrap;
 }
 
 .xb-tree .ant-tree-node-content-wrapper:hover {
@@ -330,13 +348,6 @@ select {
 .xb-tree .ant-tree-node-content-wrapper.ant-tree-node-selected {
   background: var(--xb-accent-soft) !important;
   color: var(--xb-text);
-}
-
-.xb-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 99px;
-  display: inline-block;
 }
 
 .xb-glyph {
@@ -354,17 +365,11 @@ select {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
 }
 
-.xb-conn-engine,
-.xb-live {
+.xb-conn-engine {
   color: var(--xb-muted);
   font-size: 11px;
-}
-
-.xb-live {
-  color: var(--xb-ok);
 }
 
 .xb-menu {
@@ -490,6 +495,54 @@ select {
   border-radius: 8px 8px 0 0 !important;
 }
 
+.xb-tab-exits {
+  position: absolute;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.xb-tab-exit {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: 8px 8px 0 0;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.xb-tab-exit::after {
+  content: "×";
+  margin-inline-start: 8px;
+  color: var(--xb-muted);
+}
+
+@keyframes xb-tab-enter {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .xb-tabs > .ant-tabs-nav .ant-tabs-tab {
+    animation: xb-tab-enter 140ms ease-out;
+    transition: background-color 100ms ease-out, border-color 100ms ease-out;
+  }
+
+  .xb-tabs > .ant-tabs-nav .ant-tabs-tab-btn {
+    transition: color 100ms ease-out;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .xb-tabs > .ant-tabs-nav :is(.ant-tabs-tab, .ant-tabs-tab-btn, .ant-tabs-tab-remove, .ant-tabs-nav-list) {
+    transition: none;
+    translate: none !important;
+  }
+
+  .xb-tab-exits { display: none; }
+}
+
 .xb-tabs .ant-tabs-ink-bar {
   background: var(--xb-accent);
 }
@@ -515,6 +568,12 @@ select {
   flex-direction: column;
   padding: 10px 12px 12px;
   gap: 8px;
+}
+
+/* Stacked forms scroll as a unit; their fields keep the component's own height. */
+.xb-panel.overflow-auto > :is(.ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-select, .ant-space, .ant-space-compact, .ant-form, .ant-radio-group),
+.xb-runbar {
+  flex-shrink: 0;
 }
 
 .xb-grid-wrap {
@@ -675,7 +734,7 @@ select {
 }
 
 .xb-bool {
-  height: 24px;
+  height: 28px;
   border: 1px solid var(--xb-line);
   border-radius: 6px;
   background: var(--xb-panel);

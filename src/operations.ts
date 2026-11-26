@@ -24,6 +24,7 @@ function terminal(snapshot: OperationSnapshot) {
 }
 
 interface RunningOperation {
+  cancellation: AbortController;
   key: string;
   id?: string;
   finished: boolean;
@@ -60,6 +61,7 @@ export function useLongOperation(ownerOverride?: string) {
   async function requestCancel(run: RunningOperation): Promise<void> {
     if (run.finished || (run.latest && terminal(run.latest))) return;
     run.cancelWanted = true;
+    run.cancellation.abort();
     if (mounted.current) setCancelPending(true);
     if (!run.id) return;
     if (run.cancelFlight) return run.cancelFlight;
@@ -87,9 +89,9 @@ export function useLongOperation(ownerOverride?: string) {
     if (run) await requestCancel(run);
   }
 
-  async function execute<T>(label: string, action: (id: string) => Promise<T>): Promise<T> {
+  async function execute<T>(label: string, action: (id: string, cancellation: AbortSignal) => Promise<T>): Promise<T> {
     if (running.current) throw new Error("当前任务尚未结束，请等待后再操作");
-    const run: RunningOperation = { key: crypto.randomUUID(), finished: false, settling: false, cancelWanted: false, cancelAcknowledged: false, latest: null };
+    const run: RunningOperation = { key: crypto.randomUUID(), cancellation: new AbortController(), finished: false, settling: false, cancelWanted: false, cancelAcknowledged: false, latest: null };
     running.current = run;
     if (mounted.current) { setActive(true); setSnapshot(null); setCancelError(null); setCancelPending(false); }
     let resolveDone!: () => void;
@@ -108,7 +110,7 @@ export function useLongOperation(ownerOverride?: string) {
       update(run, created);
       if (run.cancelWanted) await requestCancel(run).catch(() => {});
       run.timer = setTimeout(() => void poll(), 400);
-      return await action(created.id);
+      return await action(created.id, run.cancellation.signal);
     } catch (error) {
       failed = true;
       throw error;

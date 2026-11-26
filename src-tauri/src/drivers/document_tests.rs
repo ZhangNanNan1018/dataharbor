@@ -238,6 +238,34 @@ fn mongo_filters_sparse_snapshots_and_conflicts_round_trip() {
 }
 
 #[test]
+#[ignore = "requires disposable Redis at DATAHARBOR_TEST_REDIS_PORT"]
+fn redis_console_probes_do_not_enqueue_commands_inside_multi() {
+    let fixture = Fixture::open(Engine::Redis, "DATAHARBOR_TEST_REDIS_PORT");
+    let prepare = |previous| {
+        fixture.state.prepare_query_session(&fixture.id, &fixture.database, previous, true).unwrap()
+    };
+    let key = prepare(None);
+    let command = |sql| {
+        fixture.state.with_query_session(
+            &fixture.id,
+            &fixture.database,
+            Some(&key),
+            &crate::operations::OperationContext::detached(),
+            |session| session.execute(&fixture.database, sql, None),
+        ).unwrap()
+    };
+    let client_id = command("CLIENT ID").rows[0][1].as_i64().unwrap();
+    command("MULTI");
+    assert_eq!(prepare(Some(&key)), key);
+    command("ECHO marker");
+    assert_eq!(prepare(Some(&key)), key);
+    assert_eq!(command("EXEC").rows, vec![vec![json!("result[0]"), json!("marker")]]);
+    command("MULTI");
+    fixture.command(&format!("CLIENT KILL ID {client_id}"));
+    assert_ne!(prepare(Some(&key)), key);
+}
+
+#[test]
 #[ignore = "requires disposable Redis 6+ at DATAHARBOR_TEST_REDIS_PORT"]
 fn redis_single_key_cas_preserves_new_values_type_ttl_and_list_members() {
     let fixture = Fixture::open(Engine::Redis, "DATAHARBOR_TEST_REDIS_PORT");
