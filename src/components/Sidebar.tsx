@@ -1,12 +1,12 @@
 import { Database, Eye, Folder, Table2 } from "lucide-react";
-import { App, Button, Empty, Input, Spin, Tree } from "antd";
+import { Alert, App, Button, Empty, Input, Modal, Spin, Tree } from "antd";
 import type { DataNode, EventDataNode } from "antd/es/tree";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorText } from "../api";
 import { engineLabel, qualifiedTable, usesSchema } from "../engines";
 import { touchRecent } from "../recent";
 import type { StudioContext } from "../types";
-import { useConnectionStore } from "../stores/useConnectionStore";
+import { sessionProfile, useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
 import type { ConnectionPublic, Engine } from "../types";
@@ -14,6 +14,7 @@ import { EngineGlyph } from "./EngineGlyph";
 import { belongsToConnection } from "../catalogTree";
 import { invalidateSqlCatalog } from "../sqlCatalog";
 import { ensureConnection } from "../connectionReady";
+import type { GroupEdit } from "../generated/contracts";
 
 const SEP = "\u001f";
 
@@ -25,6 +26,7 @@ interface NodeMeta {
   schema?: string;
   name?: string;
   folder?: "tables" | "views";
+  groupPath?: string;
   searchText: string;
 }
 
@@ -32,6 +34,28 @@ type XNode = DataNode & { meta: NodeMeta; children?: XNode[] };
 
 function nodeKey(...parts: string[]): string {
   return parts.join(SEP);
+}
+
+function groupParts(path: string) {
+  return path.split("/").map((part) => part.trim()).filter(Boolean);
+}
+
+function inGroup(path: string, group: string) {
+  return path === group || path.startsWith(group + "/");
+}
+
+function remapGroupKeys(keys: string[], source: string, edit: GroupEdit, hasDirect: boolean) {
+  const prefix = nodeKey("group", "");
+  const parent = source.split("/").slice(0, -1);
+  const target = edit.kind === "rename" ? [...parent, edit.name.trim()] : parent;
+  const mapped = keys.flatMap((key) => {
+    const path = key.slice(prefix.length);
+    if (!key.startsWith(prefix) || !inGroup(path, source)) return [key];
+    if (path === source && edit.kind === "dissolve" && !hasDirect) return [];
+    const suffix = path.slice(source.length).split("/").filter(Boolean);
+    return [prefix + [...target, ...suffix].join("/")];
+  });
+  return [...new Set(mapped)];
 }
 
 export function Sidebar({ width }: { width: number }) {
@@ -49,10 +73,16 @@ export function Sidebar({ width }: { width: number }) {
   const [keyword, setKeyword] = useState("");
   const [cache, setCache] = useState<Record<string, XNode[]>>({});
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const loadedKeys = useMemo(() => Object.keys(cache), [cache]);
   const catalogRevisions = useRef<Record<string, number>>({});
   const previousProfiles = useRef(profiles);
   const [menu, setMenu] = useState<{ x: number; y: number; meta: NodeMeta } | null>(null);
+  const [groupDialog, setGroupDialog] = useState<{ path: string; edit: GroupEdit } | null>(null);
+  const [groupError, setGroupError] = useState("");
+  const [savingGroup, setSavingGroup] = useState(false);
+  const affectedCount = groupDialog
+    ? profiles.filter((p) => inGroup(groupParts(p.group).join("/"), groupDialog.path)).length : 0;
 
   function clearConnectionTree(id: string) {
     catalogRevisions.current[id] = (catalogRevisions.current[id] ?? 0) + 1;
@@ -63,7 +93,7 @@ export function Sidebar({ width }: { width: number }) {
   useEffect(() => {
     for (const previous of previousProfiles.current) {
       const next = profiles.find((profile) => profile.id === previous.id);
-      if (previous === next) continue;
+      if (sessionProfile(previous) === sessionProfile(next)) continue;
       // A successful initial handshake keeps its in-flight catalog read; edits and disconnects invalidate it.
       if (!next || (previous.connected && !next.connected)
         || JSON.stringify({ ...previous, connected: false }) !== JSON.stringify({ ...next, connected: false })) {
@@ -257,7 +287,45 @@ export function Sidebar({ width }: { width: number }) {
 
   const menuItems = menu ? actionsFor(menu.meta) : [];
 
+  function editGroup(path: string, edit: GroupEdit) {
+    setGroupError("");
+    setGroupDialog({ path, edit });
+  }
+
+  async function saveGroup() {
+    if (!groupDialog || savingGroup) return;
+    const { path, edit } = groupDialog;
+    setSavingGroup(true);
+    try {
+      const changes = await api.editConnectionGroup(path, edit);
+      const parent = path.split("/").slice(0, -1).join("/");
+      const hasDirect = Object.values(changes).includes(parent);
+      useConnectionStore.getState().applyGroups(changes);
+      setExpandedKeys((keys) => remapGroupKeys(keys, path, edit, hasDirect));
+      setSelectedKeys((keys) => remapGroupKeys(keys, path, edit, hasDirect));
+      setGroupDialog(null);
+      setStatus(edit.kind === "rename" ? "分组已重命名" : "分组已解散");
+    } catch (err) {
+      setGroupError(errorText(err));
+    } finally {
+      setSavingGroup(false);
+    }
+  }
+
   function actionsFor(meta: NodeMeta): { label: string; run: () => void }[] {
+    if (meta.kind === "group" && meta.groupPath !== undefined) {
+      const path = meta.groupPath;
+      const key = nodeKey("group", path);
+      return [
+        { label: "在此分组新建连接", run: () => openConnection(null, path) },
+        ...(path ? [
+          { label: "重命名分组", run: () => editGroup(path, { kind: "rename", name: path.split("/").pop()! }) },
+          { label: "解散分组", run: () => editGroup(path, { kind: "dissolve" }) },
+        ] : []),
+        { label: expandedKeys.includes(key) ? "收起分组" : "展开分组", run: () =>
+          setExpandedKeys((keys) => keys.includes(key) ? keys.filter((item) => item !== key) : [...keys, key]) },
+      ];
+    }
     if (meta.kind === "connection" && meta.connectionId) {
       const id = meta.connectionId;
       return [
@@ -359,9 +427,12 @@ export function Sidebar({ width }: { width: number }) {
             className="xb-tree"
             blockNode
             showIcon
+            // Keep the clicked row under the pointer between the two clicks of a double-click.
+            motion={false}
             treeData={treeData}
             expandedKeys={expandedKeys}
             loadedKeys={loadedKeys}
+            selectedKeys={selectedKeys}
             onExpand={(keys) => setExpandedKeys(keys.map(String))}
             loadData={onLoad}
             onDoubleClick={(_, node) => {
@@ -382,6 +453,12 @@ export function Sidebar({ width }: { width: number }) {
             }}
             onSelect={(_, info) => {
               const meta = (info.node as XNode).meta;
+              const key = String(info.node.key);
+              setSelectedKeys([key]);
+              // Keyboard arrows use onExpand. A double-click has already toggled on its first click.
+              if (info.nativeEvent?.type === "click" && info.nativeEvent.detail <= 1 && !info.node.isLeaf) {
+                setExpandedKeys((keys) => keys.includes(key) ? keys.filter((item) => item !== key) : [...keys, key]);
+              }
               if (meta.searchText) setStatus(meta.searchText);
             }}
           />
@@ -402,6 +479,33 @@ export function Sidebar({ width }: { width: number }) {
             </button>
           ))}
         </div>
+      )}
+      {groupDialog && (
+        <Modal
+          open
+          title={groupDialog.edit.kind === "rename" ? "重命名分组" : "解散分组"}
+          okText={groupDialog.edit.kind === "rename" ? "保存" : "解散"}
+          cancelText="取消"
+          okButtonProps={{ danger: groupDialog.edit.kind === "dissolve" }}
+          confirmLoading={savingGroup}
+          onOk={() => void saveGroup()}
+          onCancel={() => { if (!savingGroup) setGroupDialog(null); }}
+        >
+          <p>分组“{groupDialog.path}”及其子分组共包含 {affectedCount} 个连接。</p>
+          {groupDialog.edit.kind === "rename" ? (
+            <Input
+              aria-label="分组名称"
+              autoFocus
+              disabled={savingGroup}
+              value={groupDialog.edit.name}
+              onChange={(event) => editGroup(groupDialog.path, { kind: "rename", name: event.target.value })}
+              onPressEnter={() => void saveGroup()}
+            />
+          ) : (
+            <p>解散后，直接连接将移至“{groupDialog.path.split("/").slice(0, -1).join("/") || "未分组"}”，子分组上移一级。</p>
+          )}
+          {groupError && <Alert className="mt-2" type="error" showIcon message={groupError} />}
+        </Modal>
       )}
     </aside>
   );
@@ -445,7 +549,8 @@ function folderPair(connectionId: string, engine: Engine, database: string, sche
 function buildTree(profiles: ConnectionPublic[], cache: Record<string, XNode[]>, keyword: string): XNode[] {
   const root: GroupNode = { name: "", children: new Map(), profiles: [] };
   for (const profile of profiles) {
-    const parts = (profile.group.trim() || "未分组").split("/").map((part) => part.trim()).filter(Boolean);
+    const parts = groupParts(profile.group);
+    if (!parts.length) parts.push("");
     let cursor = root;
     for (const part of parts) {
       const next = cursor.children.get(part) ?? { name: part, children: new Map(), profiles: [] };
@@ -478,9 +583,8 @@ function groupNode(node: GroupNode, parent: string, cache: Record<string, XNode[
     .filter((item) => !keyword || treeMatches(item, keyword));
   return {
     key: nodeKey("group", path),
-    title: node.name,
-    selectable: false,
-    meta: { kind: "group", searchText: path },
+    title: path === "未分组" ? "未分组（自定义）" : node.name || "未分组",
+    meta: { kind: "group", groupPath: path, searchText: path || "未分组" },
     children: [...folders, ...connections].filter((item) => !keyword || treeMatches(item, keyword) || (item.children?.length ?? 0) > 0),
   };
 }

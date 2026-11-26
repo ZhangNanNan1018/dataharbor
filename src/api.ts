@@ -1,6 +1,7 @@
 import type { CommandName, CommitRequest, ExportTableRequest, ExportSqlRequest, ImportCsvRequest, ExecuteSqlRequest, RunRecord, AiAskRequest, AiSettingsPublic as AiSettings, AiSettingsRequest, BackupRequest, Dashboard, DataModel, DebugCell, DebugReport, DebugSnapshot, DiffResult, ErGraph, Favorite, FileExportResult, ForeignKeyRef, GridResult, Job, MailSettings, ObjectRef, OperationSnapshot, PairRequest, PlanNode, RestoreRequest, Snippet, SyncResult, SyncStatement } from "./generated/contracts";
 export type { RunRecord, AiAskRequest, AiSettings, AiSettingsRequest, BackupRequest, Dashboard, DataModel, DebugCell, DebugReport, DebugSnapshot, DiffResult, ErGraph, Favorite, FileExportResult, ForeignKeyRef, GridResult, Job, MailSettings, ObjectRef, OperationSnapshot, PairRequest, PlanNode, RestoreRequest, Snippet, SyncResult, SyncStatement };
 import { invoke } from "@tauri-apps/api/core";
+import type { GroupEdit } from "./generated/contracts";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AppInfo,
@@ -57,6 +58,8 @@ export const api = {
   releaseOperation: (id: string) => call<void>("release_operation", { id }),
   appInfo: () => call<AppInfo>("app_info"),
   listConnections: () => call<ConnectionPublic[]>("list_connections"),
+  editConnectionGroup: (path: string, edit: GroupEdit) =>
+    call<Record<string, string>>("edit_connection_group", { path, edit }),
   saveConnection: (request: SaveConnectionRequest) =>
     call<SaveConnectionResult>("save_connection", { request }),
   deleteConnection: (id: string) => call<void>("delete_connection", { id }),

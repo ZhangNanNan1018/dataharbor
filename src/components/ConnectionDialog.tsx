@@ -60,6 +60,7 @@ export function ConnectionDialog() {
   const { message } = App.useApp();
   const open = useUiStore((state) => state.connectionOpen);
   const editingId = useUiStore((state) => state.editingId);
+  const initialGroup = useUiStore((state) => state.initialGroup);
   const close = useUiStore((state) => state.closeConnection);
   const setStatus = useUiStore((state) => state.setStatus);
   const profiles = useConnectionStore((state) => state.profiles);
@@ -113,7 +114,7 @@ export function ConnectionDialog() {
       setColor(COLORS[0]);
       form.setFieldsValue({
         name: "",
-        group: "",
+        group: initialGroup,
         engine: "mysql",
         host: "127.0.0.1",
         port: 3306,
@@ -139,7 +140,7 @@ export function ConnectionDialog() {
         addressMap: "",
       });
     }
-  }, [open, editing, form]);
+  }, [open, editing, initialGroup, form]);
 
   function buildRequest(values: FormValues): SaveConnectionRequest {
     return {

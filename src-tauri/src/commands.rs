@@ -97,6 +97,15 @@ pub async fn save_connection(
 }
 
 #[tauri::command]
+pub async fn edit_connection_group(
+    app: tauri::AppHandle,
+    path: String,
+    edit: crate::models::GroupEdit,
+) -> AppResult<std::collections::HashMap<String, String>> {
+    run_blocking(move || app.state::<AppState>().edit_connection_group(&path, edit)).await
+}
+
+#[tauri::command]
 pub async fn delete_connection(app: tauri::AppHandle, id: String) -> AppResult<()> {
     run_blocking(move || {
         let state = app.state::<AppState>();

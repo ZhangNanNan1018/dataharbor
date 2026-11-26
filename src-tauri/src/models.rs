@@ -233,6 +233,14 @@ pub struct ConnectionPublic {
     pub placeholder: bool,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub enum GroupEdit {
+    Rename { name: String },
+    Dissolve,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(test, derive(ts_rs::TS))]

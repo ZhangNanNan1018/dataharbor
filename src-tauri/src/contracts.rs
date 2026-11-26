@@ -20,6 +20,7 @@ fn typescript_contracts_match_rust() {
     emit!(crate::models::Engine);
     emit!(crate::models::ColumnMeta);
     emit!(crate::models::ConnectionPublic);
+    emit!(crate::models::GroupEdit);
     emit!(crate::models::SaveConnectionRequest);
     emit!(crate::models::SaveConnectionResult);
     emit!(crate::models::TestResult);

@@ -2,7 +2,7 @@ import { App, Input, Select, Space, Table } from "antd";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, errorText, isOperationCancelled, type GridResult, type PairRequest } from "../../api";
 import { engineLabel, usesSchema } from "../../engines";
-import { useConnectionStore } from "../../stores/useConnectionStore";
+import { sessionProfile, useConnectionStore } from "../../stores/useConnectionStore";
 import { type ConnectionPublic, type JsonValue, type StudioContext } from "../../types";
 import { ensureConnection } from "../../connectionReady";
 
@@ -34,7 +34,7 @@ export function ConnFields({
 }) {
   const { message } = App.useApp();
   const profiles = useProfiles();
-  const profile = profiles.find((item) => item.id === id);
+  const profile = sessionProfile(profiles.find((item) => item.id === id));
   const schemaEngine = usesSchema(profile?.engine);
   const showTable = table !== undefined;
   const seed = useContext(StudioSeedContext);
@@ -48,7 +48,7 @@ export function ConnFields({
   const [schemas, setSchemas] = useState<string[]>([]);
   const [tables, setTables] = useState<string[]>([]);
   const [tableLoaded, setTableLoaded] = useState(false);
-  const [readyProfile, setReadyProfile] = useState<ConnectionPublic | null>(null);
+  const [readyProfile, setReadyProfile] = useState<typeof profile | null>(null);
   const ready = profile?.connected === true && readyProfile === profile;
   const seedKey = applySeed && seed ? `${seed.connectionId}|${seed.database}|${seed.schema}|${seed.table}` : "";
 
@@ -76,7 +76,7 @@ export function ConnFields({
         await ensureConnection(id);
         if (cancelled) return;
         const connected = useConnectionStore.getState().profiles.find((item) => item.id === id)!;
-        setReadyProfile(connected);
+        setReadyProfile(sessionProfile(connected));
         if (profile.engine === "sqlite") {
           if (database !== "main" || schema !== "main") onChangeRef.current({ database: "main", schema: "main" });
           return;

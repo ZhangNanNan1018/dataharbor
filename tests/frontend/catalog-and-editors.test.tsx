@@ -13,11 +13,12 @@ import { invalidateSqlCatalog, watchSqlCatalog } from "../../src/sqlCatalog";
 import { ensureConnection } from "../../src/connectionReady";
 import { useConnectionStore } from "../../src/stores/useConnectionStore";
 import { useTabStore } from "../../src/stores/useTabStore";
+import { useUiStore } from "../../src/stores/useUiStore";
 import type { ColumnMeta, ConnectionPublic, JsonValue } from "../../src/types";
 
 vi.mock("../../src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/api")>();
-  return { ...actual, api: { ...actual.api, connect: vi.fn(), listDatabases: vi.fn(), listSchemas: vi.fn(), listTables: vi.fn(), listViews: vi.fn(), listColumns: vi.fn(), fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn() } };
+  return { ...actual, api: { ...actual.api, editConnectionGroup: vi.fn(), connect: vi.fn(), listDatabases: vi.fn(), listSchemas: vi.fn(), listTables: vi.fn(), listViews: vi.fn(), listColumns: vi.fn(), fetchRows: vi.fn(), foreignKeys: vi.fn(), commitChanges: vi.fn() } };
 });
 const column: ColumnMeta = { name: "payload", dataType: "bson", nullable: true, primaryKey: false, autoIncrement: false };
 const fixture: ConnectionPublic = {
@@ -154,6 +155,18 @@ it.each(["valid", "invalid"])("单元格保持焦点时快捷键保存会同步�
   }
 });
 
+it("分组变更保留进行中的握手，多个请求仍共用一次连接", async () => {
+  useConnectionStore.setState({ profiles: [{ ...fixture, connected: false }] });
+  const handshake = deferred<{ version: string }>();
+  vi.mocked(api.connect).mockReturnValueOnce(handshake.promise);
+  const first = ensureConnection(fixture.id);
+  useConnectionStore.getState().applyGroups({ [fixture.id]: "新组" });
+  expect(ensureConnection(fixture.id)).toBe(first);
+  handshake.resolve({ version: "test" });
+  await first;
+  expect(useConnectionStore.getState().profiles[0]).toMatchObject({ group: "新组", connected: true });
+});
+
 it("连接参数变更后，旧握手不能把新配置标记为已连接", async () => {
   const oldConnection = deferred<any>();
   const newConnection = deferred<any>();
@@ -242,6 +255,101 @@ async function expand(label: string) {
   const row = (await screen.findByText(label)).closest(".ant-tree-treenode")!;
   fireEvent.click(row.querySelector(".ant-tree-switcher")!);
 }
+
+async function groupAction(group: string, action: string) {
+  fireEvent.contextMenu(await screen.findByText(group, { exact: true }));
+  fireEvent.click(await screen.findByRole("button", { name: action }));
+}
+
+it("单击树行选中并切换展开状态，叶节点只选中，右键和双击不重复展开", async () => {
+  const columns = deferred<ColumnMeta[]>();
+  vi.mocked(api.listColumns).mockReturnValueOnce(columns.promise);
+  mount(<Sidebar width={260} />);
+  const group = screen.getByText("测试组");
+  const groupRow = group.closest('[role="treeitem"]')!;
+  const groupBody = group.closest(".ant-tree-node-content-wrapper")!;
+  fireEvent.click(group);
+  expect(groupRow).toHaveClass("ant-tree-treenode-selected");
+  expect(groupRow).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(groupBody);
+  expect(groupRow).toHaveAttribute("aria-expanded", "false");
+  expect(groupRow).toHaveClass("ant-tree-treenode-selected");
+  fireEvent.click(groupBody);
+  for (const label of ["目录测试", "fixture", "dbo", "表"]) {
+    fireEvent.click(await screen.findByText(label, { exact: true }));
+  }
+  const table = await screen.findByText("books");
+  const row = table.closest('[role="treeitem"]')!;
+  fireEvent.contextMenu(table);
+  expect(screen.getByRole("button", { name: "打开数据" })).toBeInTheDocument();
+  expect(row).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(table, { detail: 1 });
+  expect(row).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(table, { detail: 2 });
+  fireEvent.doubleClick(table, { detail: 2 });
+  expect(row).toHaveAttribute("aria-expanded", "true");
+  expect(useTabStore.getState().tabs).toHaveLength(1);
+  expect(useTabStore.getState().tabs[0]).toMatchObject({ kind: "data", table: "books" });
+  await act(async () => columns.resolve([column]));
+  const field = await screen.findByText("payload");
+  fireEvent.click(field);
+  expect(field.closest('[role="treeitem"]')).toHaveClass("ant-tree-treenode-selected");
+  expect(row).not.toHaveClass("ant-tree-treenode-selected");
+  expect(row).toHaveAttribute("aria-expanded", "true");
+  expect(api.listColumns).toHaveBeenCalledTimes(1);
+});
+
+it("筛选时重命名整组，保留展开的连接和已加载的数据库", async () => {
+  const hidden = { ...fixture, id: "hidden", name: "隐藏", group: "测试组/子组" };
+  useConnectionStore.setState({ profiles: [fixture, hidden] });
+  mount(<Sidebar width={260} />);
+  await expand("测试组");
+  await expand("目录测试");
+  await screen.findByText("fixture");
+  await groupAction("测试组", "收起分组");
+  await groupAction("测试组", "展开分组");
+  await screen.findByText("fixture");
+  fireEvent.change(screen.getByPlaceholderText("过滤连接或已加载对象"), { target: { value: "目录测试" } });
+  await groupAction("测试组", "重命名分组");
+  expect(screen.getByText(/共包含 2 个连接/)).toBeInTheDocument();
+  fireEvent.change(screen.getByRole("textbox", { name: "分组名称" }), { target: { value: "新组" } });
+  vi.mocked(api.editConnectionGroup).mockResolvedValue({ [fixture.id]: "新组", hidden: "新组/子组" });
+  fireEvent.click(screen.getByRole("button", { name: /^保\s*存$/ }));
+  await screen.findByText("新组", { exact: true });
+  expect(screen.getByText("fixture")).toBeInTheDocument();
+  expect(api.listDatabases).toHaveBeenCalledTimes(1);
+  expect(useConnectionStore.getState().profiles[1]).toMatchObject({ group: "新组/子组", connected: true });
+});
+
+it("解散可取消，保存失败保留原树，再次提交后展开上移的子组和未分组", async () => {
+  const child = { ...fixture, id: "child", name: "隐藏", group: "测试组/子组" };
+  useConnectionStore.setState({ profiles: [fixture, child] });
+  mount(<Sidebar width={260} />);
+  await expand("测试组");
+  await expand("子组");
+  await groupAction("子组", "在此分组新建连接");
+  expect(useUiStore.getState().initialGroup).toBe("测试组/子组");
+  act(() => useUiStore.getState().closeConnection());
+  await groupAction("测试组", "解散分组");
+  fireEvent.click(screen.getByRole("button", { name: /^取\s*消$/ }));
+  expect(api.editConnectionGroup).not.toHaveBeenCalled();
+  await groupAction("测试组", "解散分组");
+  vi.mocked(api.editConnectionGroup).mockRejectedValueOnce(new Error("保存失败"))
+    .mockResolvedValueOnce({ [fixture.id]: "", child: "子组" });
+  fireEvent.click(screen.getByRole("button", { name: /^解\s*散$/ }));
+  await screen.findByText("保存失败");
+  expect(screen.getByText("目录测试")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /^解\s*散$/ }));
+  await screen.findByText("未分组");
+  expect(screen.getByText("目录测试")).toBeInTheDocument();
+  expect(screen.getByText("隐藏")).toBeInTheDocument();
+  fireEvent.contextMenu(screen.getByText("未分组"));
+  expect(screen.queryByRole("button", { name: "重命名分组" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "解散分组" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "在此分组新建连接" }));
+  expect(useUiStore.getState().initialGroup).toBe("");
+  act(() => useUiStore.getState().closeConnection());
+});
 
 it("刷新对象清理整个连接的加载状态和子级缓存，新建查询交由后端分页", async () => {
   vi.mocked(api.listTables).mockResolvedValueOnce(["old_table"]).mockResolvedValue(["new_table"]);

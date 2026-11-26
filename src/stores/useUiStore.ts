@@ -8,6 +8,7 @@ interface UiState {
   sidebarWidth: number;
   connectionOpen: boolean;
   editingId: string | null;
+  initialGroup: string;
   aboutOpen: boolean;
   focusMode: boolean;
   sidebarCollapsed: boolean;
@@ -17,7 +18,7 @@ interface UiState {
   toggleTheme: () => void;
   setStatus: (status: string) => void;
   setSidebarWidth: (width: number) => void;
-  openConnection: (id: string | null) => void;
+  openConnection: (id: string | null, group?: string) => void;
   closeConnection: () => void;
   setAboutOpen: (open: boolean) => void;
   toggleFocus: () => void;
@@ -39,6 +40,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   sidebarWidth: 292,
   connectionOpen: false,
   editingId: null,
+  initialGroup: "",
   aboutOpen: false,
   focusMode: false,
   sidebarCollapsed: false,
@@ -55,8 +57,8 @@ export const useUiStore = create<UiState>((set, get) => ({
   },
   setStatus: (status) => set({ status }),
   setSidebarWidth: (width) => set({ sidebarWidth: width }),
-  openConnection: (id) => set({ connectionOpen: true, editingId: id }),
-  closeConnection: () => set({ connectionOpen: false, editingId: null }),
+  openConnection: (id, group = "") => set({ connectionOpen: true, editingId: id, initialGroup: group }),
+  closeConnection: () => set({ connectionOpen: false, editingId: null, initialGroup: "" }),
   setAboutOpen: (open) => set({ aboutOpen: open }),
   toggleFocus: () => set({ focusMode: !get().focusMode }),
   toggleSidebar: () => set({ sidebarCollapsed: !get().sidebarCollapsed }),

@@ -36,7 +36,7 @@ mod server_tests;
 use commands::{
     create_operation, operation_status, cancel_operation, release_operation, reconnect_query_session, close_query_session, list_run_history,
     ai_ask, ai_settings, analyze_schema, app_info, backup_sql, bind_sql, commit_changes, connect,
-    create_sample_database, data_dictionary, delete_connection, delete_dashboard, delete_favorite,
+    create_sample_database, data_dictionary, delete_connection, delete_dashboard, delete_favorite, edit_connection_group,
     delete_job, delete_model, delete_snippet, diff_structure, disconnect, er_diagram, execute_sql,
     explain_query, execute_read_query, export_project, export_sql_csv, export_table_csv, export_table_file, fetch_rows,
     format_sql, forward_sql, generate_rows, import_project, import_table_csv, import_table_file,
@@ -89,6 +89,7 @@ pub fn run() {
             app_info,
             list_connections,
             save_connection,
+            edit_connection_group,
             delete_connection,
             test_connection,
             connect,

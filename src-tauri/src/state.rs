@@ -16,6 +16,7 @@ use crate::models::{
 use crate::store;
 use crate::tunnel::TunnelGuard;
 
+mod groups;
 mod sessions;
 pub(crate) use sessions::{IsolatedSession, Transport};
 use sessions::{ConnectionLocks, QuerySessions, SessionSlot};

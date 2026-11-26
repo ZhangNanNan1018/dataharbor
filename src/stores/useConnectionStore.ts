@@ -3,6 +3,15 @@ import { api, errorText } from "../api";
 import type { AppInfo, ConnectionPublic } from "../types";
 import { invalidateSqlCatalog } from "../sqlCatalog";
 
+// Group edits replace the tree's display profile while retaining the identity
+// used by pending handshakes and catalog subscriptions.
+export type SessionProfile = Omit<ConnectionPublic, "group">;
+const sessionProfiles = new WeakMap<ConnectionPublic, SessionProfile>();
+
+export function sessionProfile(profile: ConnectionPublic | undefined) {
+  return profile && (sessionProfiles.get(profile) ?? profile);
+}
+
 interface ConnectionState {
   profiles: ConnectionPublic[];
   info: AppInfo | null;
@@ -11,6 +20,7 @@ interface ConnectionState {
   load: () => Promise<void>;
   upsert: (profile: ConnectionPublic) => void;
   remove: (id: string) => void;
+  applyGroups: (groups: Record<string, string>) => void;
   markConnected: (id: string, connected: boolean) => void;
 }
 
@@ -44,6 +54,14 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
     invalidateSqlCatalog(id, false);
     set((state) => ({ profiles: state.profiles.filter((item) => item.id !== id) }));
   },
+  applyGroups: (groups) => set((state) => ({
+    profiles: state.profiles.map((profile) => {
+      if (!Object.hasOwn(groups, profile.id) || groups[profile.id] === profile.group) return profile;
+      const updated = { ...profile, group: groups[profile.id] };
+      sessionProfiles.set(updated, sessionProfiles.get(profile) ?? profile);
+      return updated;
+    }),
+  })),
   markConnected: (id, connected) => {
     if (!connected) invalidateSqlCatalog(id, false);
     set((state) => ({

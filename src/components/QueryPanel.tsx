@@ -9,7 +9,7 @@ import { TaskProgress } from "./TaskProgress";
 import { engineCapabilities, engineLabel } from "../engines";
 import { applyEditorTheme, editorFont } from "../monacoTheme";
 import { clearSqlSchema, refreshSqlMarkers, registerSqlIntelligence, setSqlSchema } from "../sqlIntelligence";
-import { useConnectionStore } from "../stores/useConnectionStore";
+import { sessionProfile, useConnectionStore } from "../stores/useConnectionStore";
 import { useTabStore } from "../stores/useTabStore";
 import { useUiStore } from "../stores/useUiStore";
 import type { ExecuteSqlResponse, QueryTab, StatementResult } from "../types";
@@ -66,7 +66,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
 
   const result = storedResult?.context.connectionId === tab.connectionId && storedResult.context.database === tab.database ? storedResult : null;
   const statement = result?.statements[active] ?? null;
-  const profile = profiles.find((item) => item.id === tab.connectionId);
+  const profile = sessionProfile(profiles.find((item) => item.id === tab.connectionId));
 
   const persistent = engineCapabilities(profile?.engine)?.persistentConsole;
   const stale = Boolean(result && result.context.sessionId !== lease.id);
@@ -144,7 +144,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
       setDatabases([]);
       return;
     }
-    const current = useConnectionStore.getState().profiles.find((item) => item.id === id);
+    const current = profile;
     if (!current || current.engine === "sqlite") {
       setDatabases(["main"]);
       return;
@@ -165,7 +165,7 @@ export function QueryPanel({ tab }: { tab: QueryTab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.connectionId, profiles]);
+  }, [tab.connectionId, profile]);
 
   async function ensure(id: string) {
     const current = useConnectionStore.getState().profiles.find((item) => item.id === id);
@@ -644,8 +644,8 @@ function PlanBranch({ node, max }: { node: PlanNode; max: number }) {
   const ratio = Math.min(1, (node.cost ?? 0) / max);
   const tone = ratio > 0.66 ? "var(--xb-danger)" : ratio > 0.33 ? "var(--xb-warning)" : "var(--xb-ok)";
   return (
-    <div className="ml-3 border-l border-[var(--xb-line)] pl-2">
-      <div className="mb-1 rounded px-2 py-1" style={{ background: `color-mix(in srgb, ${tone} 14%, transparent)`, borderLeft: `3px solid ${tone}` }}>
+    <div className="ml-3">
+      <div className="mb-1 rounded px-2 py-1" style={{ background: `color-mix(in srgb, ${tone} 14%, transparent)` }}>
         <strong>{node.label}</strong>
         {node.detail ? <span className="ml-2 text-[var(--xb-muted)]">{node.detail}</span> : null}
         {node.cost != null ? <span className="ml-2">成本 {node.cost}</span> : null}

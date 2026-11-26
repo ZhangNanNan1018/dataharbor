@@ -214,7 +214,6 @@ select {
 .xb-activity button.active {
   background: var(--xb-accent-soft);
   color: var(--xb-accent-text);
-  box-shadow: inset 2px 0 0 var(--xb-accent);
 }
 
 .xb-activity .xb-activity-spacer {
@@ -268,23 +267,68 @@ select {
 }
 
 .xb-tree.ant-tree {
+  --xb-tree-arrow-width: 16px;
   background: transparent;
   font-size: 13px;
 }
 
+.xb-tree .ant-tree-indent-unit {
+  width: 16px;
+}
+
+.xb-tree .ant-tree-switcher {
+  display: grid;
+  place-items: center;
+  width: var(--xb-tree-arrow-width);
+  margin-inline-end: 0;
+  line-height: 28px;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.xb-tree .ant-tree-switcher::before {
+  content: none;
+}
+
+.xb-tree .ant-tree-node-content-wrapper .ant-tree-iconEle {
+  display: inline-flex;
+  align-items: center;
+  width: 14px;
+  margin-inline-end: 5px;
+  vertical-align: middle;
+}
+
+.xb-tree .ant-tree-node-content-wrapper .ant-tree-iconEle:empty {
+  display: none;
+}
+
 .xb-tree .ant-tree-node-content-wrapper {
+  display: flex;
+  align-items: center;
+  /* The row's hit area and focus ring include the arrow, leaving the indent outside. */
+  margin-inline-start: calc(-1 * var(--xb-tree-arrow-width));
+  padding-inline-start: var(--xb-tree-arrow-width);
   min-height: 28px;
   line-height: 28px;
   border-radius: 6px;
+}
+
+.xb-tree .ant-tree-title {
+  display: inline-flex;
+  align-items: center;
 }
 
 .xb-tree .ant-tree-node-content-wrapper:hover {
   background: var(--xb-hover);
 }
 
+.xb-tree:has(:focus-visible) .ant-tree-treenode-active .ant-tree-node-content-wrapper {
+  outline: 2px solid var(--xb-accent);
+  outline-offset: 0;
+}
+
 .xb-tree .ant-tree-node-content-wrapper.ant-tree-node-selected {
   background: var(--xb-accent-soft) !important;
-  box-shadow: inset 2px 0 0 var(--xb-accent);
   color: var(--xb-text);
 }
 
@@ -582,10 +626,6 @@ select {
   background: var(--xb-accent-soft) !important;
 }
 
-.xb-grid-wrap .ant-table-tbody > tr.ant-table-row-selected > td:first-child {
-  box-shadow: inset 2px 0 0 var(--xb-accent);
-}
-
 .xb-cell {
   display: flex;
   align-items: center;
@@ -631,7 +671,6 @@ select {
 }
 
 .xb-cell-dirty {
-  box-shadow: inset 2px 0 0 var(--xb-warning);
   background: var(--xb-warning-soft);
 }
 
@@ -832,7 +871,6 @@ select {
 
 .xb-palette-item.active {
   background: var(--xb-accent-soft);
-  box-shadow: inset 2px 0 0 var(--xb-accent);
 }
 
 .xb-hint {

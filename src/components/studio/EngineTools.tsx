@@ -2,6 +2,7 @@ import { App, Alert, Button, Input, InputNumber, Select, Space, Table } from "an
 import { useEffect, useState } from "react";
 import { api, errorText } from "../../api";
 import { useTabStore } from "../../stores/useTabStore";
+import { sessionProfile } from "../../stores/useConnectionStore";
 import { useProfiles, defaultDb } from "./shared";
 
 export function RedisPubSub() {
@@ -64,7 +65,7 @@ export function MongoBuilder() {
   const [collections, setCollections] = useState<string[]>([]);
   const [filter, setFilter] = useState('{ "price": { "$gt": 10 } }');
   const [pipeline, setPipeline] = useState('[{ "$match": { "price": { "$gt": 10 } } }, { "$limit": 20 }]');
-  const profile = profiles.find((item) => item.id === id);
+  const profile = sessionProfile(profiles.find((item) => item.id === id));
 
   useEffect(() => {
     if (!id || !profile) return;
