@@ -158,6 +158,6 @@ playwright-cli -s=dataharbor-test detach
 Stop-Process -Id $desktopProcess.Id
 ```
 
-确认 1420 和 9224 端口没有被其他应用使用。脚本只接受独立测试目录中的 SQLite 连接，会重置测试标记表并生成截图；关闭窗口进入托盘不等于测试进程退出。
+确认 4317 和 9224 端口没有被其他应用使用。脚本只接受独立测试目录中的 SQLite 连接，会重置测试标记表并生成截图；关闭窗口进入托盘不等于测试进程退出。
 
 CI 继续仅手动触发。本轮未执行远程工作流、正式签名安装包、macOS/Linux 桌面或 SQL Server/Oracle/达梦/Snowflake 的实机验收。生产构建仍有 Monaco 等大块提示，实际冷启动与完整应用多标签内存尚未建立统一基准。
